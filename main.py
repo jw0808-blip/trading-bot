@@ -28,7 +28,7 @@ def get_kalshi_headers(method, path):
     path_for_signing = path.split('?')[0]
     timestamp = str(int(time.time() * 1000))
     msg = timestamp + method + path_for_signing
-    print(f"Signing message: {msg[:50]}...")
+    print(f"Signing message: {msg}")
     try:
         private_key = serialization.load_pem_private_key(KALSHI_PEM.encode(), password=None)
         if not isinstance(private_key, rsa.RSAPrivateKey):
@@ -60,7 +60,7 @@ def fetch_kalshi(path):
     try:
         r = requests.get(f"https://trading-api.kalshi.com{path}", headers=headers, timeout=15)
         print(f"Status code: {r.status_code}")
-        print(f"Response preview: {r.text[:500]}...")
+        print(f"Full response: {r.text}")
         return r.json() if r.status_code == 200 else None
     except Exception as e:
         print(f"Request error: {type(e).__name__}: {e}")
