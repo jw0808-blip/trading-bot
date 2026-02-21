@@ -19,6 +19,7 @@ print("=== BOT STARTING ===")
 print(f"TOKEN length: {len(TOKEN) if TOKEN else 0}")
 print(f"KALSHI_KEY_ID present: {bool(KALSHI_KEY_ID)}")
 print(f"KALSHI_PEM length: {len(KALSHI_PEM) if KALSHI_PEM else 0}")
+print(f"KALSHI_PEM starts with -----BEGIN: {KALSHI_PEM.startswith('-----BEGIN PRIVATE KEY-----') if KALSHI_PEM else False}")
 
 def get_kalshi_headers(method, path):
     if not KALSHI_KEY_ID or not KALSHI_PEM:
@@ -27,6 +28,7 @@ def get_kalshi_headers(method, path):
     path_for_signing = path.split('?')[0]
     timestamp = str(int(time.time() * 1000))
     msg = timestamp + method + path_for_signing
+    print(f"Signing message: {msg[:50]}...")  # Debug
     try:
         private_key = serialization.load_pem_private_key(KALSHI_PEM.encode(), password=None)
         if not isinstance(private_key, rsa.RSAPrivateKey):
@@ -38,6 +40,7 @@ def get_kalshi_headers(method, path):
             hashes.SHA256()
         )
         signature = base64.b64encode(signature_bytes).decode()
+        print("Signing successful")
         return {
             "KALSHI-ACCESS-KEY": KALSHI_KEY_ID,
             "KALSHI-ACCESS-SIGNATURE": signature,
@@ -45,14 +48,18 @@ def get_kalshi_headers(method, path):
             "Content-Type": "application/json"
         }
     except Exception as e:
-        print(f"Signing error: {e}")
+        print(f"Signing error: {type(e).__name__}: {e}")
         return None
 
 def fetch_kalshi(path):
     headers = get_kalshi_headers("GET", path)
     if not headers:
+        print("Failed to get headers")
         return None
+    print(f"Fetching {path}")
     r = requests.get(f"https://trading-api.kalshi.com{path}", headers=headers)
+    print(f"Status code: {r.status_code}")
+    print(f"Response: {r.text[:300]}...")
     return r.json() if r.status_code == 200 else None
 
 @bot.event
@@ -69,10 +76,5 @@ async def portfolio(ctx):
     data = fetch_kalshi("/trade-api/v2/portfolio/balance")
     balance = data.get('balance', 0) / 100.0 if data else 0.0
     await ctx.send(f"📊 **Portfolio Snapshot**\n**Kalshi Cash:** ${balance:,.2f}")
-
-@bot.command()
-async def cycle(ctx):
-    print("[DEBUG] Starting !cycle market scan")
-    await ctx.send("🔎 Scanning Kalshi for high EV opportunities... (real scan coming soon)")
 
 bot.run(TOKEN)
