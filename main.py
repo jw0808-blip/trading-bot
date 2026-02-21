@@ -19,7 +19,6 @@ print("=== BOT STARTING ===")
 print(f"TOKEN length: {len(TOKEN) if TOKEN else 0}")
 print(f"KALSHI_KEY_ID present: {bool(KALSHI_KEY_ID)}")
 print(f"KALSHI_PEM length: {len(KALSHI_PEM) if KALSHI_PEM else 0}")
-print(f"KALSHI_PEM starts with -----BEGIN: {KALSHI_PEM.startswith('-----BEGIN PRIVATE KEY-----') if KALSHI_PEM else False}")
 
 def get_kalshi_headers(method, path):
     if not KALSHI_KEY_ID or not KALSHI_PEM:
@@ -77,4 +76,21 @@ async def portfolio(ctx):
     balance = data.get('balance', 0) / 100.0 if data else 0.0
     await ctx.send(f"📊 **Portfolio Snapshot**\n**Kalshi Cash:** ${balance:,.2f}")
 
-bot.run(TOKEN)
+@bot.command()
+async def cycle(ctx):
+    print("[DEBUG] Starting !cycle market scan")
+    await ctx.send("🔎 Scanning Kalshi for high EV opportunities...")
+    data = fetch_kalshi("/trade-api/v2/markets?status=open&limit=100")
+    if not data or 'markets' not in data:
+        await ctx.send("❌ Failed to fetch markets.")
+        return
+
+    opportunities = []
+    blacklist = ['combo', 'multi-game', 'parlay']
+
+    for m in data['markets']:
+        ticker = m.get('ticker', 'UNKNOWN')
+        title = m.get('title', '').lower()
+        if any(word in title for word in blacklist):
+            continue
+        yes_price_c
