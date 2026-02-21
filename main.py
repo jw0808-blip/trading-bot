@@ -28,7 +28,7 @@ def get_kalshi_headers(method, path):
     path_for_signing = path.split('?')[0]
     timestamp = str(int(time.time() * 1000))
     msg = timestamp + method + path_for_signing
-    print(f"Signing message: {msg[:50]}...")  # Debug
+    print(f"Signing message: {msg[:50]}...")
     try:
         private_key = serialization.load_pem_private_key(KALSHI_PEM.encode(), password=None)
         if not isinstance(private_key, rsa.RSAPrivateKey):
