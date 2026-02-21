@@ -19,6 +19,7 @@ print("=== BOT STARTING ===")
 print(f"TOKEN length: {len(TOKEN) if TOKEN else 0}")
 print(f"KALSHI_KEY_ID present: {bool(KALSHI_KEY_ID)}")
 print(f"KALSHI_PEM length: {len(KALSHI_PEM) if KALSHI_PEM else 0}")
+print(f"KALSHI_PEM starts with -----BEGIN PRIVATE KEY----- : {KALSHI_PEM.startswith('-----BEGIN PRIVATE KEY-----') if KALSHI_PEM else False}")
 
 def get_kalshi_headers(method, path):
     if not KALSHI_KEY_ID or not KALSHI_PEM:
@@ -57,9 +58,9 @@ def fetch_kalshi(path):
         return None
     print(f"Fetching {path}")
     try:
-        r = requests.get(f"https://trading-api.kalshi.com{path}", headers=headers, timeout=10)
+        r = requests.get(f"https://trading-api.kalshi.com{path}", headers=headers, timeout=15)
         print(f"Status code: {r.status_code}")
-        print(f"Response preview: {r.text[:300]}...")
+        print(f"Response preview: {r.text[:500]}...")
         return r.json() if r.status_code == 200 else None
     except Exception as e:
         print(f"Request error: {type(e).__name__}: {e}")
@@ -76,27 +77,18 @@ async def ping(ctx):
 @bot.command()
 async def portfolio(ctx):
     print("[DEBUG] Running !portfolio")
-    try:
-        data = fetch_kalshi("/trade-api/v2/portfolio/balance")
-        balance = data.get('balance', 0) / 100.0 if data else 0.0
-        await ctx.send(f"📊 **Portfolio Snapshot**\n**Kalshi Cash:** ${balance:,.2f}")
-    except Exception as e:
-        print(f"Portfolio command error: {e}")
-        await ctx.send("❌ Error fetching portfolio. Check logs.")
+    data = fetch_kalshi("/trade-api/v2/portfolio/balance")
+    balance = data.get('balance', 0) / 100.0 if data else 0.0
+    await ctx.send(f"📊 **Portfolio Snapshot**\n**Kalshi Cash:** ${balance:,.2f}")
 
 @bot.command()
 async def cycle(ctx):
     print("[DEBUG] Starting !cycle market scan")
     await ctx.send("🔎 Scanning Kalshi for high EV opportunities...")
-    try:
-        data = fetch_kalshi("/trade-api/v2/markets?status=open&limit=100")
-        if not data or 'markets' not in data:
-            await ctx.send("❌ Failed to fetch markets.")
-            return
-        # Simple mock for now - real scan will be added next
-        await ctx.send("Top 5 EV Opportunities (mock for testing):\n1. HOUSEUSDT @ $0.015 (EV 0.18)")
-    except Exception as e:
-        print(f"Cycle command error: {e}")
-        await ctx.send("❌ Error during scan. Check logs.")
+    data = fetch_kalshi("/trade-api/v2/markets?status=open&limit=100")
+    if not data or 'markets' not in data:
+        await ctx.send("❌ Failed to fetch markets.")
+        return
+    await ctx.send("Top 5 EV Opportunities (mock for now)")
 
 bot.run(TOKEN)
