@@ -7,8 +7,6 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-print("=== BOT STARTING ===")
-
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
@@ -17,6 +15,7 @@ KALSHI_KEY_ID = os.getenv('KALSHI_API_KEY_ID')
 KALSHI_PEM = os.getenv('KALSHI_PRIVATE_KEY_PEM')
 TOKEN = os.getenv('DISCORD_TOKEN')
 
+print("=== BOT STARTING ===")
 print(f"TOKEN length: {len(TOKEN) if TOKEN else 0}")
 print(f"KALSHI_KEY_ID present: {bool(KALSHI_KEY_ID)}")
 print(f"KALSHI_PEM length: {len(KALSHI_PEM) if KALSHI_PEM else 0}")
@@ -49,6 +48,13 @@ def get_kalshi_headers(method, path):
         print(f"Signing error: {e}")
         return None
 
+def fetch_kalshi(path):
+    headers = get_kalshi_headers("GET", path)
+    if not headers:
+        return None
+    r = requests.get(f"https://trading-api.kalshi.com{path}", headers=headers)
+    return r.json() if r.status_code == 200 else None
+
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user}')
@@ -56,5 +62,19 @@ async def on_ready():
 @bot.command()
 async def ping(ctx):
     await ctx.send("Pong! Bot is alive on Render Background Worker.")
+
+@bot.command()
+async def portfolio(ctx):
+    print("[DEBUG] Running !portfolio")
+    data = fetch_kalshi("/trade-api/v2/portfolio/balance")
+    balance = data.get('balance', 0) / 100.0 if data else 0.0
+    await ctx.send(f"📊 **Portfolio Snapshot**\n**Kalshi Cash:** ${balance:,.2f}")
+
+@bot.command()
+async def cycle(ctx):
+    print("[DEBUG] Starting !cycle market scan")
+    await ctx.send("🔎 Scanning Kalshi for high EV opportunities...")
+    # Real market scan will be added in next update
+    await ctx.send("Top 5 EV Opportunities (mock for testing):\n1. HOUSEUSDT @ $0.015 (EV 0.18)")
 
 bot.run(TOKEN)
