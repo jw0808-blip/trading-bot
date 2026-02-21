@@ -73,8 +73,6 @@ async def portfolio(ctx):
 @bot.command()
 async def cycle(ctx):
     print("[DEBUG] Starting !cycle market scan")
-    await ctx.send("🔎 Scanning Kalshi for high EV opportunities...")
-    # Real market scan will be added in next update
-    await ctx.send("Top 5 EV Opportunities (mock for testing):\n1. HOUSEUSDT @ $0.015 (EV 0.18)")
+    await ctx.send("🔎 Scanning Kalshi for high EV opportunities... (real scan coming soon)")
 
 bot.run(TOKEN)
