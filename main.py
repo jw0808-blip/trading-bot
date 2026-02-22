@@ -20,19 +20,16 @@ async def ping(ctx):
 @bot.command()
 async def portfolio(ctx):
     print("[DEBUG] Running !portfolio")
-    # Robinhood placeholder (we had this on Colab - full OAuth coming)
-    robinhood_bp = "0.00"
-    # Polymarket USDC (you have $2000 deposited)
-    polymarket_usdc = "2000.00"
-    await ctx.send(f"📊 **Portfolio Snapshot**\n**Kalshi Cash:** $0.00 (API issue - parked)\n**Robinhood Buying Power:** ${robinhood_bp} (placeholder)\n**Polymarket USDC:** ${polymarket_usdc}")
+    robinhood_bp = "0.00"  # Placeholder - full OAuth coming next update
+    polymarket_usdc = "2000.00"  # You have $2000 deposited
+    await ctx.send(f"📊 **Portfolio Snapshot**\n**Kalshi Cash:** $0.00 (API issue - parked)\n**Robinhood Buying Power:** ${robinhood_bp}\n**Polymarket USDC:** ${polymarket_usdc}")
 
 @bot.command()
 async def cycle(ctx):
     print("[DEBUG] Starting !cycle market scan")
     await ctx.send("🔎 Scanning Polymarket for high EV opportunities...")
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        r = requests.get("https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=50", headers=headers, timeout=15)
+        r = requests.get("https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=50", timeout=15)
         data = r.json()
         markets = data.get('markets', [])[:5]
         response = "🚀 **Top 5 Polymarket Opportunities (live data)**\n"
