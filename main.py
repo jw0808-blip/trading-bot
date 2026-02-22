@@ -27,7 +27,7 @@ async def cycle(ctx):
     print("[DEBUG] Starting !cycle market scan")
     await ctx.send("🔎 Scanning Polymarket for high EV opportunities...")
     try:
-        r = requests.get("https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=50")
+        r = requests.get("https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=50", timeout=15)
         data = r.json()
         markets = data.get('markets', [])[:5]
         response = "🚀 **Top 5 Polymarket Opportunities (live data)**\n"
@@ -37,6 +37,6 @@ async def cycle(ctx):
         await ctx.send(response)
     except Exception as e:
         print(f"Polymarket error: {e}")
-        await ctx.send("❌ Failed to fetch Polymarket markets.")
+        await ctx.send("❌ Failed to fetch Polymarket markets. Trying again next time.")
 
 bot.run(TOKEN)
