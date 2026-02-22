@@ -20,7 +20,7 @@ async def ping(ctx):
 @bot.command()
 async def portfolio(ctx):
     print("[DEBUG] Running !portfolio")
-    await ctx.send("📊 **Portfolio Snapshot**\n**Kalshi Cash:** $0.00 (API issue - parked)\n**Robinhood Buying Power:** $0.00 (placeholder - add OAuth later)\n**Polymarket USDC:** $2,000 (deposited)")
+    await ctx.send("📊 **Portfolio Snapshot**\n**Kalshi Cash:** $0.00 (API issue - parked)\n**Robinhood Buying Power:** $0.00 (placeholder - OAuth coming)\n**Polymarket USDC:** $2,000 (deposited)")
 
 @bot.command()
 async def cycle(ctx):
