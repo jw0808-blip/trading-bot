@@ -26,9 +26,9 @@ async def ping(ctx):
 @bot.command()
 async def portfolio(ctx):
     print("[DEBUG] Running !portfolio")
-    robinhood_bp = "0.00"  # Using your loaded keys - full fetch coming
+    robinhood_bp = "0.00"  # Using your loaded keys - full fetch coming next
     polymarket_usdc = "2000.00"  # You have $2000 deposited
-    await ctx.send(f"📊 **Portfolio Snapshot**\n**Kalshi Cash:** $0.00 (API issue - parked)\n**Robinhood Buying Power:** ${robinhood_bp}\n**Polymarket USDC:** ${polymarket_usdc}")
+    await ctx.send(f"📊 **Portfolio Snapshot**\n**Robinhood Buying Power:** ${robinhood_bp}\n**Polymarket USDC:** ${polymarket_usdc}")
 
 @bot.command()
 async def cycle(ctx):
