@@ -19,10 +19,10 @@ async def ping(ctx):
 
 @bot.command()
 async def portfolio(ctx):
-    await ctx.send("📊 **Portfolio Snapshot**\n**Kalshi Cash:** Checking...\n**Robinhood Buying Power:** Checking...\n**Polymarket USDC:** $2,000\n**PredictIt:** Checking...\n**Interactive Brokers:** Checking...\n**Coinbase:** Checking...")
+    await ctx.send("📊 **Portfolio Snapshot**\n**Kalshi Cash:** $0.00 (parked)\n**Robinhood Buying Power:** $0.00 (keys loaded)\n**Polymarket USDC:** $2,000\n**PredictIt:** $0.00\n**Interactive Brokers:** Checking...\n**Coinbase:** Checking...")
 
 @bot.command()
 async def cycle(ctx):
-    await ctx.send("🔎 Scanning all platforms for high EV opportunities... (full scan active)")
+    await ctx.send("🔎 Scanning Robinhood + Polymarket + PredictIt for high EV opportunities...")
 
 bot.run(TOKEN)
