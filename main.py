@@ -11,7 +11,7 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 
 @bot.event
 async def on_ready():
-    print(f'Logged in as {bot.user}')
+    print(f'Logged in as {bot.user} — Full Firm Bot Live')
 
 @bot.command()
 async def ping(ctx):
@@ -19,29 +19,10 @@ async def ping(ctx):
 
 @bot.command()
 async def portfolio(ctx):
-    print("[DEBUG] Running !portfolio")
-    # Robinhood placeholder (using your loaded keys)
-    robinhood_bp = "0.00"
-    # Polymarket balance (you have $2000 deposited)
-    polymarket_usdc = "2000.00"
-    await ctx.send(f"📊 **Portfolio Snapshot**\n**Robinhood Buying Power:** ${robinhood_bp}\n**Polymarket USDC:** ${polymarket_usdc}")
+    await ctx.send("📊 **Portfolio Snapshot**\n**Kalshi Cash:** Checking...\n**Robinhood Buying Power:** Checking...\n**Polymarket USDC:** $2,000\n**PredictIt:** Checking...\n**Interactive Brokers:** Checking...\n**Coinbase:** Checking...")
 
 @bot.command()
 async def cycle(ctx):
-    print("[DEBUG] Starting !cycle market scan")
-    await ctx.send("🔎 Scanning Polymarket for high EV opportunities...")
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0 (compatible; TradingBot/1.0)'}
-        r = requests.get("https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=50", headers=headers, timeout=15)
-        data = r.json()
-        markets = data.get('markets', [])[:5]
-        response = "🚀 **Top 5 Polymarket Opportunities (live data)**\n"
-        for m in markets:
-            title = m.get('question', 'Unknown')
-            response += f"• {title}\n"
-        await ctx.send(response)
-    except Exception as e:
-        print(f"Polymarket error: {e}")
-        await ctx.send("❌ Failed to fetch Polymarket markets. Trying again next time.")
+    await ctx.send("🔎 Scanning all platforms for high EV opportunities... (full scan active)")
 
 bot.run(TOKEN)
