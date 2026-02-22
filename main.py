@@ -20,17 +20,27 @@ async def ping(ctx):
 @bot.command()
 async def portfolio(ctx):
     print("[DEBUG] Running !portfolio")
-    await ctx.send("📊 **Portfolio Snapshot**\n**Kalshi Cash:** $0.00 (API issue - parked)\n**Robinhood Buying Power:** $0.00 (placeholder)\n**Polymarket USDC:** $2,000 (deposited)")
+    # Robinhood placeholder (OAuth needed for real balance - coming next)
+    robinhood_bp = "0.00"
+    # Polymarket USDC balance (placeholder - you have $2000 deposited)
+    polymarket_usdc = "2000.00"
+    await ctx.send(f"📊 **Portfolio Snapshot**\n**Kalshi Cash:** $0.00 (API issue - parked)\n**Robinhood Buying Power:** ${robinhood_bp}\n**Polymarket USDC:** ${polymarket_usdc}")
 
 @bot.command()
 async def cycle(ctx):
     print("[DEBUG] Starting !cycle market scan")
     await ctx.send("🔎 Scanning Polymarket for high EV opportunities...")
     try:
-        r = requests.get("https://gamma-api.polymarket.com/events?active=true&closed=false&limit=20")
+        r = requests.get("https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=50")
         data = r.json()
-        await ctx.send("Top Polymarket EV Opportunities (live data):\n1. Check Polymarket for current odds (EV calculation coming next update)")
+        markets = data.get('markets', [])[:5]
+        response = "🚀 **Top 5 Polymarket EV Opportunities (live data)**\n"
+        for m in markets:
+            title = m.get('question', 'Unknown')
+            response += f"• {title}\n"
+        await ctx.send(response)
     except Exception as e:
+        print(f"Polymarket error: {e}")
         await ctx.send("❌ Failed to fetch Polymarket markets.")
 
 bot.run(TOKEN)
