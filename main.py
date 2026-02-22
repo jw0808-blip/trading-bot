@@ -8,6 +8,8 @@ intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 TOKEN = os.getenv('DISCORD_TOKEN')
+
+# Your loaded keys
 ROBINHOOD_PUBLIC_KEY = os.getenv('ROBINHOOD_PUBLIC_KEY')
 ROBINHOOD_API_KEY = os.getenv('ROBINHOOD_API_KEY')
 ROBINHOOD_PRIVATE_KEY = os.getenv('ROBINHOOD_PRIVATE_KEY')
@@ -26,7 +28,8 @@ async def ping(ctx):
 @bot.command()
 async def portfolio(ctx):
     print("[DEBUG] Running !portfolio")
-    robinhood_bp = "0.00"  # Using your loaded keys - full fetch coming next
+    # Robinhood placeholder using your loaded keys
+    robinhood_bp = "0.00"  # Full fetch with your keys coming next
     polymarket_usdc = "2000.00"  # You have $2000 deposited
     await ctx.send(f"📊 **Portfolio Snapshot**\n**Robinhood Buying Power:** ${robinhood_bp}\n**Polymarket USDC:** ${polymarket_usdc}")
 
@@ -35,7 +38,8 @@ async def cycle(ctx):
     print("[DEBUG] Starting !cycle market scan")
     await ctx.send("🔎 Scanning Polymarket for high EV opportunities...")
     try:
-        r = requests.get("https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=50", timeout=15)
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        r = requests.get("https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=50", headers=headers, timeout=15)
         data = r.json()
         markets = data.get('markets', [])[:5]
         response = "🚀 **Top 5 Polymarket Opportunities (live data)**\n"
