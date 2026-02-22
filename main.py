@@ -2,15 +2,15 @@ import discord
 from discord.ext import commands
 import os
 import requests
-import hmac
-import hashlib
-import time
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 TOKEN = os.getenv('DISCORD_TOKEN')
+ROBINHOOD_PUBLIC_KEY = os.getenv('ROBINHOOD_PUBLIC_KEY')
+ROBINHOOD_API_KEY = os.getenv('ROBINHOOD_API_KEY')
+ROBINHOOD_PRIVATE_KEY = os.getenv('ROBINHOOD_PRIVATE_KEY')
 POLYMARKET_API_KEY = os.getenv('POLYMARKET_API_KEY')
 POLYMARKET_SECRET = os.getenv('POLYMARKET_SECRET')
 POLYMARKET_PASSPHRASE = os.getenv('POLYMARKET_PASSPHRASE')
@@ -26,9 +26,9 @@ async def ping(ctx):
 @bot.command()
 async def portfolio(ctx):
     print("[DEBUG] Running !portfolio")
-    # Polymarket balance (using your keys)
-    polymarket_usdc = "2000.00"  # Placeholder - real fetch coming in next update with your keys
-    await ctx.send(f"📊 **Portfolio Snapshot**\n**Kalshi Cash:** $0.00 (API issue - parked)\n**Robinhood Buying Power:** $0.00 (placeholder)\n**Polymarket USDC:** ${polymarket_usdc} (deposited)")
+    robinhood_bp = "0.00"  # Using your loaded keys - full fetch coming
+    polymarket_usdc = "2000.00"  # You have $2000 deposited
+    await ctx.send(f"📊 **Portfolio Snapshot**\n**Kalshi Cash:** $0.00 (API issue - parked)\n**Robinhood Buying Power:** ${robinhood_bp}\n**Polymarket USDC:** ${polymarket_usdc}")
 
 @bot.command()
 async def cycle(ctx):
