@@ -1,5 +1,8 @@
-discord.py
 requests
 cryptography
 pynacl
 flask
+discord.py
+aiohttp
+python-dotenv
+web3
