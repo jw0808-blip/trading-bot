@@ -1,200 +1,340 @@
-import discord
-from discord.ext import commands
 import os
+import discord
 import requests
-import base64
 import hashlib
 import hmac
 import time
-from nacl.signing import SigningKey
+import json
+import base64
+import asyncio
+from datetime import datetime
+from discord.ext import commands
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.backends import default_backend
 
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
+# ─── CONFIG ────────────────────────────────────────────────────────────────────
+DISCORD_TOKEN        = os.environ.get("DISCORD_TOKEN")
+KALSHI_API_KEY_ID    = os.environ.get("KALSHI_API_KEY_ID")
+KALSHI_PRIVATE_KEY   = os.environ.get("KALSHI_PRIVATE_KEY", "")
+POLY_API_KEY         = os.environ.get("POLYMARKET_API_KEY")
+POLY_SECRET          = os.environ.get("POLYMARKET_SECRET")
+POLY_PASSPHRASE      = os.environ.get("POLYMARKET_PASSPHRASE")
+POLY_ADDRESS         = os.environ.get("POLY_ADDRESS")
+ROBINHOOD_TOKEN      = os.environ.get("ROBINHOOD_TOKEN")
+PREDICTIT_TOKEN      = os.environ.get("PREDICTIT_TOKEN")
+COINBASE_API_KEY     = os.environ.get("COINBASE_API_KEY")
+COINBASE_API_SECRET  = os.environ.get("COINBASE_API_SECRET")
+GITHUB_TOKEN         = os.environ.get("GITHUB_TOKEN")
+DISCORD_LOG_CHANNEL  = os.environ.get("DISCORD_LOG_CHANNEL_ID")
 
-TOKEN = os.getenv('DISCORD_TOKEN')
+# ─── KALSHI ─────────────────────────────────────────────────────────────────── 
+# FIX #1: correct domain  api.elections.kalshi.com
+# FIX #2: PSS padding instead of PKCS1v15
+KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
-# --- API Keys ---
-RH_API_KEY = os.getenv('ROBINHOOD_API_KEY')
-RH_PRIVATE_KEY = os.getenv('ROBINHOOD_PRIVATE_KEY')
+def kalshi_request(method, path, body=None):
+    """Sign and execute a Kalshi API request using RSA-PSS."""
+    timestamp_ms = str(int(time.time() * 1000))
+    body_str = json.dumps(body) if body else ""
+    msg = timestamp_ms + method.upper() + path + body_str
 
-POLY_API_KEY = os.getenv('POLYMARKET_API_KEY')
-POLY_PASSPHRASE = os.getenv('POLYMARKET_PASSPHRASE')
-POLY_SECRET = os.getenv('POLYMARKET_SECRET')
-
-KALSHI_API_KEY_ID = os.getenv('KALSHI_API_KEY_ID')
-KALSHI_PRIVATE_KEY_PEM = os.getenv('KALSHI_PRIVATE_KEY_PEM')
-
-
-def get_robinhood_buying_power():
     try:
-        timestamp = str(int(time.time()))
-        path = "/api/v1/crypto/trading/accounts/"
-        method = "GET"
-        body = ""
-        message = RH_API_KEY + timestamp + path + method + body
-        private_key_bytes = base64.b64decode(RH_PRIVATE_KEY)
-        signing_key = SigningKey(private_key_bytes)
-        signed = signing_key.sign(message.encode("utf-8"))
-        signature = base64.b64encode(signed.signature).decode("utf-8")
-        headers = {
-            "x-api-key": RH_API_KEY,
-            "x-signature": signature,
-            "x-timestamp": timestamp,
-        }
-        r = requests.get(
-            "https://trading.robinhood.com/api/v1/crypto/trading/accounts/",
-            headers=headers,
-            timeout=10
+        pem = KALSHI_PRIVATE_KEY.replace("\\n", "\n").encode()
+        private_key = serialization.load_pem_private_key(pem, password=None, backend=default_backend())
+        sig = private_key.sign(
+            msg.encode("utf-8"),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=hashes.SHA256.digest_size
+            ),
+            hashes.SHA256()
         )
-        print("[DEBUG] Robinhood status: " + str(r.status_code) + " - " + r.text[:200])
-        data = r.json()
-        buying_power = data.get('buying_power', 'N/A')
-        currency = data.get('buying_power_currency', 'USD')
-        return "$" + str(buying_power) + " " + currency
+        sig_b64 = base64.b64encode(sig).decode()
     except Exception as e:
-        return "Error: " + str(e)
+        return {"error": f"Signing failed: {e}"}
 
-
-def get_polymarket_balance():
+    headers = {
+        "Content-Type": "application/json",
+        "KALSHI-ACCESS-KEY": KALSHI_API_KEY_ID,
+        "KALSHI-ACCESS-SIGNATURE": sig_b64,
+        "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
+    }
+    url = KALSHI_BASE + path
     try:
-        timestamp = str(int(time.time()))
-        method = "GET"
-        path = "/balance"
-        secret_bytes = base64.b64decode(POLY_SECRET)
-        message = timestamp + method + path
-        sig = hmac.new(secret_bytes, message.encode("utf-8"), hashlib.sha256).digest()
-        sig_b64 = base64.b64encode(sig).decode("utf-8")
-        headers = {
-            "POLY_ADDRESS": POLY_API_KEY,
-            "POLY_SIGNATURE": sig_b64,
-            "POLY_TIMESTAMP": timestamp,
-            "POLY_PASSPHRASE": POLY_PASSPHRASE,
-            "Content-Type": "application/json"
-        }
-        r = requests.get("https://clob.polymarket.com/balance", headers=headers, timeout=10)
-        print("[DEBUG] Polymarket status: " + str(r.status_code) + " - " + r.text[:200])
-        if r.status_code == 200:
-            data = r.json()
-            balance = data.get('balance', 'N/A')
-            return "$" + str(balance) + " USDC"
+        if method.upper() == "GET":
+            resp = requests.get(url, headers=headers, timeout=10)
         else:
-            return "Error " + str(r.status_code) + ": " + r.text[:100]
+            resp = requests.post(url, headers=headers, json=body, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.HTTPError as e:
+        return {"error": f"HTTP {resp.status_code}: {resp.text}"}
     except Exception as e:
-        return "Error: " + str(e)
+        return {"error": str(e)}
 
 
 def get_kalshi_balance():
+    """Get Kalshi balance in dollars."""
+    data = kalshi_request("GET", "/portfolio/balance")
+    if "error" in data:
+        return None, data["error"]
+    cents = data.get("balance", 0)
+    return cents / 100.0, None
+
+
+# ─── POLYMARKET ──────────────────────────────────────────────────────────────
+# FIX: CLOB has no /balance endpoint — balance lives on Polygon blockchain
+# Query USDC balance via Polygon RPC
+
+USDC_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC on Polygon
+POLYGON_RPC   = "https://polygon-rpc.com"
+
+def get_polymarket_balance():
+    """Get Polymarket USDC balance from Polygon blockchain."""
+    if not POLY_ADDRESS:
+        return None, "POLY_ADDRESS not set"
     try:
-        if not KALSHI_API_KEY_ID or not KALSHI_PRIVATE_KEY_PEM:
-            return "Error: Kalshi keys not loaded in env"
-        private_key = serialization.load_pem_private_key(
-            KALSHI_PRIVATE_KEY_PEM.encode('utf-8'),
-            password=None
-        )
-        timestamp_ms = str(int(time.time() * 1000))
-        method = "GET"
-        path = "/trade-api/v2/portfolio/balance"
-        msg_string = timestamp_ms + method + path
-        signature = private_key.sign(
-            msg_string.encode('utf-8'),
-            padding.PKCS1v15(),
-            hashes.SHA256()
-        )
-        sig_b64 = base64.b64encode(signature).decode('utf-8')
-        headers = {
-            "KALSHI-ACCESS-KEY": KALSHI_API_KEY_ID,
-            "KALSHI-ACCESS-SIGNATURE": sig_b64,
-            "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
-            "Content-Type": "application/json"
+        # ERC-20 balanceOf call
+        addr_padded = POLY_ADDRESS.lower().replace("0x", "").zfill(64)
+        data = "0x70a08231" + addr_padded  # balanceOf(address)
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{"to": USDC_CONTRACT, "data": data}, "latest"],
+            "id": 1
         }
-        r = requests.get(
-            "https://trading.kalshi.com/trade-api/v2/portfolio/balance",
-            headers=headers,
-            timeout=10
-        )
-        print("[DEBUG] Kalshi status: " + str(r.status_code) + " - " + r.text[:200])
+        resp = requests.post(POLYGON_RPC, json=payload, timeout=10)
+        result = resp.json().get("result", "0x0")
+        balance_raw = int(result, 16)
+        balance_usdc = balance_raw / 1e6  # USDC has 6 decimals
+        return balance_usdc, None
+    except Exception as e:
+        return None, str(e)
+
+
+# ─── ROBINHOOD ───────────────────────────────────────────────────────────────
+def get_robinhood_balance():
+    if not ROBINHOOD_TOKEN:
+        return None, "No token"
+    try:
+        headers = {"Authorization": f"Bearer {ROBINHOOD_TOKEN}"}
+        resp = requests.get("https://api.robinhood.com/accounts/", headers=headers, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            results = data.get("results", [])
+            if results:
+                cash = float(results[0].get("cash", 0))
+                return cash, None
+        return None, f"HTTP {resp.status_code}"
+    except Exception as e:
+        return None, str(e)
+
+
+# ─── PREDICTIT ───────────────────────────────────────────────────────────────
+def get_predictit_balance():
+    if not PREDICTIT_TOKEN:
+        return None, "No token"
+    try:
+        headers = {"Authorization": f"Bearer {PREDICTIT_TOKEN}"}
+        resp = requests.get("https://www.predictit.org/api/account/wallet/balance",
+                            headers=headers, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            return float(data.get("balance", 0)), None
+        return None, f"HTTP {resp.status_code}"
+    except Exception as e:
+        return None, str(e)
+
+
+# ─── COINBASE ────────────────────────────────────────────────────────────────
+def get_coinbase_balance():
+    if not COINBASE_API_KEY or not COINBASE_API_SECRET:
+        return None, "No keys"
+    try:
+        timestamp = str(int(time.time()))
+        message = timestamp + "GET" + "/v2/accounts" + ""
+        sig = hmac.new(
+            COINBASE_API_SECRET.encode(),
+            message.encode(),
+            hashlib.sha256
+        ).hexdigest()
+        headers = {
+            "CB-ACCESS-KEY": COINBASE_API_KEY,
+            "CB-ACCESS-SIGN": sig,
+            "CB-ACCESS-TIMESTAMP": timestamp,
+            "CB-VERSION": "2016-02-18",
+        }
+        resp = requests.get("https://api.coinbase.com/v2/accounts",
+                            headers=headers, timeout=10)
+        if resp.status_code == 200:
+            accounts = resp.json().get("data", [])
+            usd = sum(float(a["balance"]["amount"])
+                      for a in accounts
+                      if a.get("currency") in ("USD", "USDC"))
+            return usd, None
+        return None, f"HTTP {resp.status_code}"
+    except Exception as e:
+        return None, str(e)
+
+
+# ─── GITHUB LOGGER ───────────────────────────────────────────────────────────
+def log_to_github(entry: str):
+    """Append an entry to conversations.md in the GitHub repo."""
+    if not GITHUB_TOKEN:
+        return
+    try:
+        api = "https://api.github.com/repos/jw0808-blip/trading-bot/contents/conversations.md"
+        headers = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        r = requests.get(api, headers=headers, timeout=10)
         if r.status_code == 200:
             data = r.json()
-            balance = data.get('balance', 0)
-            return "$" + str(round(balance / 100, 2)) + " USD"
+            current = base64.b64decode(data["content"]).decode("utf-8")
+            sha = data["sha"]
         else:
-            return "Error " + str(r.status_code) + ": " + r.text[:100]
-    except Exception as e:
-        return "Error: " + str(e)
+            current = "# TraderJoes AI Conversation Log\n\nAll bot activity is automatically logged here.\n\n---\n\n"
+            sha = None
+
+        new_content = current + entry + "\n"
+        encoded = base64.b64encode(new_content.encode()).decode()
+        payload = {
+            "message": f"Bot log: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}",
+            "content": encoded
+        }
+        if sha:
+            payload["sha"] = sha
+        requests.put(api, headers=headers, json=payload, timeout=15)
+    except Exception:
+        pass
 
 
-def get_polymarket_opportunities():
-    try:
-        r = requests.get(
-            "https://clob.polymarket.com/markets?active=true&closed=false",
-            timeout=10
-        )
-        markets = r.json().get('data', [])
-        results = []
-        for m in markets[:15]:
-            question = m.get('question', 'Unknown')
-            tokens = m.get('tokens', [])
-            yes_price = None
-            no_price = None
-            for t in tokens:
-                if t.get('outcome') == 'Yes':
-                    yes_price = float(t.get('price', 0))
-                elif t.get('outcome') == 'No':
-                    no_price = float(t.get('price', 0))
-            if yes_price is not None and no_price is not None:
-                edge = abs(yes_price - (1 - no_price))
-                ev = round(edge * 100, 2)
-                if ev > 1:
-                    results.append(
-                        "**" + question + "**\nYes: " + str(round(yes_price, 2)) +
-                        " | No: " + str(round(no_price, 2)) + " | Edge: " + str(ev) + "%"
-                    )
-        if results:
-            return "\n\n".join(results[:5])
-        return "No high EV opportunities found right now."
-    except Exception as e:
-        return "Error: " + str(e)
+# ─── DISCORD BOT ─────────────────────────────────────────────────────────────
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 @bot.event
 async def on_ready():
-    print('[BOT] Logged in as ' + str(bot.user) + ' - TraderJoes Firm Bot LIVE')
+    print(f"✅ TraderJoes bot online as {bot.user}")
+    await log_event("🤖 Bot started", "TraderJoes Trading Firm bot is online and ready.")
 
 
-@bot.command()
+async def log_event(title: str, detail: str):
+    """Log an event to Discord #ai-logs and GitHub."""
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    md_entry = f"### {ts} — {title}\n{detail}\n"
+    
+    # GitHub
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, log_to_github, md_entry)
+    
+    # Discord
+    if DISCORD_LOG_CHANNEL:
+        try:
+            ch = bot.get_channel(int(DISCORD_LOG_CHANNEL))
+            if ch:
+                embed = discord.Embed(title=title, description=detail,
+                                      color=0x00ff88, timestamp=datetime.utcnow())
+                await ch.send(embed=embed)
+        except Exception:
+            pass
+
+
+@bot.command(name="ping")
 async def ping(ctx):
-    await ctx.send('Pong! TraderJoes Bot is alive on Render.')
+    await ctx.send("🏓 Pong! TraderJoes bot is live.")
 
 
-@bot.command()
+@bot.command(name="portfolio")
 async def portfolio(ctx):
-    print('[DEBUG] Running !portfolio')
-    await ctx.send('Fetching live portfolio data...')
-    rh = get_robinhood_buying_power()
-    poly = get_polymarket_balance()
-    kalshi = get_kalshi_balance()
-    msg = (
-        '**TraderJoes Live Portfolio Snapshot**\n'
-        '**Kalshi Cash:** ' + kalshi + '\n'
-        '**Robinhood Buying Power:** ' + rh + '\n'
-        '**Polymarket USDC:** ' + poly + '\n'
-        '**PredictIt:** Pending integration\n'
-        '**Interactive Brokers:** Pending API access\n'
-        '**Coinbase:** Keys needed\n'
-        '**Phemex:** Keys needed'
+    """Show live portfolio balances across all platforms."""
+    msg = await ctx.send("⏳ Fetching live balances...")
+    
+    balances = {}
+    errors = {}
+
+    kalshi_bal, kalshi_err = get_kalshi_balance()
+    if kalshi_bal is not None:
+        balances["Kalshi"] = f"${kalshi_bal:,.2f}"
+    else:
+        errors["Kalshi"] = kalshi_err
+
+    poly_bal, poly_err = get_polymarket_balance()
+    if poly_bal is not None:
+        balances["Polymarket"] = f"${poly_bal:,.2f} USDC"
+    else:
+        errors["Polymarket"] = poly_err
+
+    rh_bal, rh_err = get_robinhood_balance()
+    if rh_bal is not None:
+        balances["Robinhood"] = f"${rh_bal:,.2f}"
+    else:
+        errors["Robinhood"] = rh_err
+
+    pi_bal, pi_err = get_predictit_balance()
+    if pi_bal is not None:
+        balances["PredictIt"] = f"${pi_bal:,.2f}"
+    else:
+        errors["PredictIt"] = pi_err
+
+    cb_bal, cb_err = get_coinbase_balance()
+    if cb_bal is not None:
+        balances["Coinbase"] = f"${cb_bal:,.2f}"
+    else:
+        errors["Coinbase"] = cb_err
+
+    embed = discord.Embed(
+        title="💼 TraderJoes Portfolio",
+        color=0x00ff88,
+        timestamp=datetime.utcnow()
     )
-    await ctx.send(msg)
+    
+    total = 0.0
+    for platform, bal in balances.items():
+        embed.add_field(name=platform, value=f"✅ {bal}", inline=True)
+        try:
+            total += float(bal.replace("$","").replace(",","").replace(" USDC",""))
+        except Exception:
+            pass
+
+    for platform, err in errors.items():
+        embed.add_field(name=platform, value=f"❌ {err}", inline=True)
+
+    embed.add_field(name="─────────────", value=f"**Total: ${total:,.2f}**", inline=False)
+    embed.set_footer(text="TraderJoes Trading Firm | 21 Sub-Bots")
+
+    await msg.edit(content="", embed=embed)
+
+    # Log to GitHub and #ai-logs
+    detail = "\n".join([f"- {k}: {v}" for k, v in balances.items()])
+    if errors:
+        detail += "\n**Errors:**\n" + "\n".join([f"- {k}: {v}" for k, v in errors.items()])
+    await log_event("📊 Portfolio Snapshot", detail)
 
 
-@bot.command()
+@bot.command(name="log")
+async def manual_log(ctx, *, message: str):
+    """Manually log a conversation snippet to GitHub and #ai-logs."""
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    entry = f"### {ts} — Manual Log by {ctx.author.name}\n{message}\n"
+    
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, log_to_github, entry)
+    
+    await ctx.send(f"✅ Logged to conversations.md and GitHub!")
+    await log_event(f"📝 Manual Log by {ctx.author.name}", message)
+
+
+@bot.command(name="cycle")
 async def cycle(ctx):
-    print('[DEBUG] Starting !cycle market scan')
-    await ctx.send('Scanning Polymarket for high EV opportunities...')
-    opps = get_polymarket_opportunities()
-    await ctx.send('**Top Polymarket Opportunities:**\n\n' + opps)
+    """Run EV scan across all platforms."""
+    await ctx.send("🔄 Running EV cycle scan across all platforms... (stub - connect your 21 sub-bots here)")
+    await log_event("🔄 EV Cycle Scan", f"Triggered by {ctx.author.name}")
 
 
-bot.run(TOKEN)
+if __name__ == "__main__":
+    bot.run(DISCORD_TOKEN)
