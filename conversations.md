@@ -6,16 +6,16 @@ All conversations with Grok and Claude in the "TraderJoes Trading Firm" project 
 
 ## How to Log Conversations
 
-**Discord command:** `!log <your message>` in any channel  
-**Webhook:** `POST https://<ai-logger>.onrender.com/log`
-
-```json
-{
-  "source": "Claude",
-  "author": "TraderJoe", 
-  "content": "Your conversation text here...",
-  "secret": "traderjoes2024"
-}
+**Option 1  Discord command:** `!log <message>` in any channel  
+**Option 2  Webhook POST:**
+```
+POST https://ai-logger.onrender.com/log
+{"source":"Claude","author":"TraderJoe","content":"...","secret":"traderjoes2024"}
+```
+**Option 3  Log bot activity:**
+```
+POST https://ai-logger.onrender.com/log/bot
+{"bot_name":"Bot1","action":"BUY","details":"...","secret":"traderjoes2024"}
 ```
 
 ---
