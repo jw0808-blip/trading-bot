@@ -1,5 +1,5 @@
 """
-TraderJoes Trading Firm — Discord Bot
+TraderJoes Trading Firm â Discord Bot
 =====================================
 Multi-platform portfolio viewer and EV scanner.
 Platforms: Kalshi, Polymarket, Robinhood (Crypto), Coinbase (Advanced Trade), Phemex
@@ -16,9 +16,10 @@ import hmac
 import hashlib
 import uuid
 import logging
+import jwt as pyjwt
 from datetime import datetime, timezone
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, ed25519
+from cryptography.hazmat.primitives.asymmetric import padding, ed25519, ec
 from cryptography.hazmat.backends import default_backend
 
 # ---------------------------------------------------------------------------
@@ -40,47 +41,50 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # ---------------------------------------------------------------------------
 # Environment variables
 # ---------------------------------------------------------------------------
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
-DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")
+DISCORD_TOKEN       = os.environ.get("DISCORD_TOKEN")
+DISCORD_CHANNEL_ID  = os.environ.get("DISCORD_CHANNEL_ID", "")
 
 # Kalshi
-KALSHI_API_KEY_ID = os.environ.get("KALSHI_API_KEY_ID", "")
-KALSHI_PRIVATE_KEY = os.environ.get("KALSHI_PRIVATE_KEY", "")
-KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+KALSHI_API_KEY_ID   = os.environ.get("KALSHI_API_KEY_ID", "")
+KALSHI_PRIVATE_KEY  = os.environ.get("KALSHI_PRIVATE_KEY", "")
+KALSHI_BASE         = "https://api.elections.kalshi.com/trade-api/v2"
 
 # Polymarket
-POLY_WALLET_ADDRESS = os.environ.get("POLY_WALLET_ADDRESS", "")
-POLYMARKET_API_KEY = os.environ.get("POLYMARKET_API_KEY", "")
-POLYMARKET_SECRET = os.environ.get("POLYMARKET_SECRET", "")
-POLYMARKET_PASSPHRASE = os.environ.get("POLYMARKET_PASSPHRASE", "")
+POLY_WALLET_ADDRESS     = os.environ.get("POLY_WALLET_ADDRESS", "")
+POLYMARKET_API_KEY      = os.environ.get("POLYMARKET_API_KEY", "")
+POLYMARKET_SECRET       = os.environ.get("POLYMARKET_SECRET", "")
+POLYMARKET_PASSPHRASE   = os.environ.get("POLYMARKET_PASSPHRASE", "")
 
 # Robinhood Crypto API
-ROBINHOOD_API_KEY = os.environ.get("ROBINHOOD_API_KEY", "")
-ROBINHOOD_PRIVATE_KEY = os.environ.get("ROBINHOOD_PRIVATE_KEY", "")
-ROBINHOOD_PUBLIC_KEY = os.environ.get("ROBINHOOD_PUBLIC_KEY", "")
-ROBINHOOD_BASE = "https://trading.robinhood.com"
+ROBINHOOD_API_KEY       = os.environ.get("ROBINHOOD_API_KEY", "")
+ROBINHOOD_PRIVATE_KEY   = os.environ.get("ROBINHOOD_PRIVATE_KEY", "")
+ROBINHOOD_PUBLIC_KEY    = os.environ.get("ROBINHOOD_PUBLIC_KEY", "")
+ROBINHOOD_BASE          = "https://trading.robinhood.com"
 
-# Coinbase Advanced Trade
-COINBASE_API_KEY = os.environ.get("COINBASE_API_KEY", "")
-COINBASE_API_SECRET = os.environ.get("COINBASE_API_SECRET", "")
+# Coinbase Advanced Trade (CDP API Keys - JWT auth)
+COINBASE_API_KEY        = os.environ.get("COINBASE_API_KEY", "")
+COINBASE_API_SECRET     = os.environ.get("COINBASE_API_SECRET", "")
 
 # Phemex
-PHEMEX_API_KEY = os.environ.get("PHEMEX_API_KEY", "")
-PHEMEX_API_SECRET = os.environ.get("PHEMEX_API_SECRET", "")
-PHEMEX_BASE = "https://api.phemex.com"
+PHEMEX_API_KEY      = os.environ.get("PHEMEX_API_KEY", "")
+PHEMEX_API_SECRET   = os.environ.get("PHEMEX_API_SECRET", "")
+PHEMEX_BASE         = "https://api.phemex.com"
 
 # GitHub logging
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-GITHUB_REPO = os.environ.get("GITHUB_REPO", "jw0808-blip/trading-bot")
+GITHUB_TOKEN    = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO     = os.environ.get("GITHUB_REPO", "jw0808-blip/trading-bot")
 
 
 # ============================================================================
-#  KALSHI
+# KALSHI  (RSA-PSS signing â path MUST include /trade-api/v2 prefix)
 # ============================================================================
 
 def kalshi_sign(method, path):
+    """Sign a Kalshi API request. path should NOT include the base URL prefix."""
     ts = str(int(time.time() * 1000))
-    msg = ts + method.upper() + path
+    # The signature message is: timestamp + METHOD + /trade-api/v2 + path
+    full_path = "/trade-api/v2" + path
+    msg = ts + method.upper() + full_path
     try:
         key_pem = KALSHI_PRIVATE_KEY.replace("\\n", "\n")
         private_key = serialization.load_pem_private_key(
@@ -90,7 +94,7 @@ def kalshi_sign(method, path):
             msg.encode(),
             padding.PSS(
                 mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=hashes.SHA256().digest_size,
+                salt_length=padding.PSS.DIGEST_LENGTH,
             ),
             hashes.SHA256(),
         )
@@ -168,7 +172,7 @@ def get_kalshi_markets_for_event(event_ticker):
 
 
 # ============================================================================
-#  POLYMARKET
+# POLYMARKET
 # ============================================================================
 
 def get_polymarket_balance():
@@ -210,7 +214,7 @@ def get_polymarket_markets(limit=20):
 
 
 # ============================================================================
-#  ROBINHOOD (Crypto Trading API - Ed25519 auth)
+# ROBINHOOD (Crypto Trading API - Ed25519 auth)
 # ============================================================================
 
 def _robinhood_sign(method, path, body=""):
@@ -269,7 +273,7 @@ def get_robinhood_holdings():
             lines = []
             for h in results:
                 code = h.get("asset_code", "?")
-                qty = h.get("total_quantity", "0")
+                qty  = h.get("total_quantity", "0")
                 lines.append(f"  {code}: {qty}")
             return "\n".join(lines)
     except Exception:
@@ -278,39 +282,48 @@ def get_robinhood_holdings():
 
 
 # ============================================================================
-#  COINBASE ADVANCED TRADE
+# COINBASE ADVANCED TRADE (CDP API Keys - JWT / ES256 auth)
 # ============================================================================
 
-def _coinbase_sign(method, path, body=""):
+def _coinbase_build_jwt(method, path):
+    """Build a JWT for Coinbase Advanced Trade using CDP API keys (ES256)."""
     if not COINBASE_API_KEY or not COINBASE_API_SECRET:
-        return {}
-    ts = str(int(time.time()))
-    message = ts + method.upper() + path + body
+        return None
     try:
-        secret = COINBASE_API_SECRET
-        signature = hmac.new(
-            secret.encode("utf-8"),
-            message.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        return {
-            "CB-ACCESS-KEY": COINBASE_API_KEY,
-            "CB-ACCESS-SIGN": signature,
-            "CB-ACCESS-TIMESTAMP": ts,
-            "Content-Type": "application/json",
+        uri = f"{method.upper()} api.coinbase.com{path}"
+        now = int(time.time())
+        payload = {
+            "sub": COINBASE_API_KEY,
+            "iss": "coinbase-cloud",
+            "aud": ["cdp_service"],
+            "nbf": now,
+            "exp": now + 120,
+            "uri": uri,
         }
+        secret = COINBASE_API_SECRET.replace("\\n", "\n")
+        headers = {
+            "kid": COINBASE_API_KEY,
+            "nonce": hashlib.sha256(os.urandom(16)).hexdigest(),
+            "typ": "JWT",
+        }
+        token = pyjwt.encode(payload, secret, algorithm="ES256", headers=headers)
+        return token
     except Exception as exc:
-        log.warning("Coinbase sign error: %s", exc)
-        return {}
+        log.warning("Coinbase JWT build error: %s", exc)
+        return None
 
 
 def get_coinbase_balance():
     if not COINBASE_API_KEY:
         return "Keys not configured"
     path = "/api/v3/brokerage/accounts"
-    headers = _coinbase_sign("GET", path)
-    if not headers:
-        return "Signing failed"
+    token = _coinbase_build_jwt("GET", path)
+    if not token:
+        return "JWT build failed"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
     try:
         r = requests.get(
             "https://api.coinbase.com" + path, headers=headers, timeout=10
@@ -340,9 +353,13 @@ def get_coinbase_holdings_detail():
     if not COINBASE_API_KEY:
         return ""
     path = "/api/v3/brokerage/accounts"
-    headers = _coinbase_sign("GET", path)
-    if not headers:
+    token = _coinbase_build_jwt("GET", path)
+    if not token:
         return ""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
     try:
         r = requests.get(
             "https://api.coinbase.com" + path, headers=headers, timeout=10
@@ -363,7 +380,7 @@ def get_coinbase_holdings_detail():
 
 
 # ============================================================================
-#  PHEMEX
+# PHEMEX  (HMAC-SHA256 - try multiple balance endpoints)
 # ============================================================================
 
 def _phemex_sign(path, query_string="", body=""):
@@ -391,35 +408,73 @@ def _phemex_sign(path, query_string="", body=""):
 def get_phemex_balance():
     if not PHEMEX_API_KEY:
         return "Keys not configured"
-    path = "/g/accounts/accountPositions"
-    query = "currency=USDT"
-    headers = _phemex_sign(path, query)
-    if not headers:
-        return "Signing failed"
-    try:
-        r = requests.get(
-            f"{PHEMEX_BASE}{path}?{query}", headers=headers, timeout=10
-        )
-        if r.status_code == 200:
-            data = r.json()
-            if data.get("code") == 0:
-                acct = data.get("data", {}).get("account", {})
-                total = acct.get("totalBalanceRv", acct.get("accountBalanceEv", 0))
-                try:
-                    total_f = float(total)
-                except (ValueError, TypeError):
-                    total_f = 0.0
-                if "accountBalanceEv" in acct and "totalBalanceRv" not in acct:
-                    total_f = total_f / 1e8
-                return f"${total_f:,.2f} USDT"
-            return f"API code {data.get('code')}: {data.get('msg', '')[:100]}"
-        return f"HTTP {r.status_code}: {r.text[:120]}"
-    except Exception as exc:
-        return f"Error: {exc}"
+
+    # Try multiple endpoints - Phemex has different paths for different account types
+    endpoints = [
+        ("/g-accounts/accountPositions", "currency=USDT"),
+        ("/accounts/accountPositions", "currency=USDT"),
+        ("/accounts/positions", "currency=USDT"),
+        ("/spot/wallets", "currency=USDT"),
+    ]
+
+    last_error = ""
+    for path, query in endpoints:
+        headers = _phemex_sign(path, query)
+        if not headers:
+            return "Signing failed"
+        url = f"{PHEMEX_BASE}{path}"
+        if query:
+            url += f"?{query}"
+        try:
+            r = requests.get(url, headers=headers, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("code") == 0:
+                    acct = data.get("data", {})
+
+                    # Format: {"data": {"account": {"totalBalanceRv": "..."}}}
+                    if isinstance(acct, dict) and "account" in acct:
+                        account = acct["account"]
+                        total = account.get("totalBalanceRv",
+                                account.get("accountBalanceRv",
+                                account.get("accountBalanceEv", 0)))
+                        try:
+                            total_f = float(total)
+                        except (ValueError, TypeError):
+                            total_f = 0.0
+                        if "accountBalanceEv" in account and "totalBalanceRv" not in account:
+                            total_f = total_f / 1e8
+                        return f"${total_f:,.2f} USDT"
+
+                    # Format: {"data": [{"balanceEv": ..., "currency": "USDT"}]}
+                    if isinstance(acct, list):
+                        for wallet in acct:
+                            if wallet.get("currency") == "USDT":
+                                bal = wallet.get("balanceRv", wallet.get("balanceEv", 0))
+                                try:
+                                    bal_f = float(bal)
+                                except (ValueError, TypeError):
+                                    bal_f = 0.0
+                                if "balanceEv" in wallet and "balanceRv" not in wallet:
+                                    bal_f = bal_f / 1e8
+                                return f"${bal_f:,.2f} USDT"
+
+                    return f"Connected (raw: {json.dumps(data)[:100]})"
+
+            if r.status_code == 404:
+                last_error = f"404 on {path}"
+                continue
+            last_error = f"HTTP {r.status_code}: {r.text[:80]}"
+        except Exception as exc:
+            log.warning("Phemex endpoint %s error: %s", path, exc)
+            last_error = str(exc)
+            continue
+
+    return f"Endpoints failed: {last_error}"
 
 
 # ============================================================================
-#  GITHUB CONVERSATION LOGGER
+# GITHUB CONVERSATION LOGGER
 # ============================================================================
 
 def log_to_github(entry):
@@ -439,7 +494,6 @@ def log_to_github(entry):
         else:
             current = "# TraderJoes Conversation Log\n\n---\n\n"
             sha = None
-
         new_content = current + entry
         payload = {
             "message": f"Log {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC",
@@ -455,7 +509,7 @@ def log_to_github(entry):
 
 
 # ============================================================================
-#  EV CALCULATION HELPERS
+# EV CALCULATION HELPERS
 # ============================================================================
 
 def calc_ev(yes_price, implied_prob):
@@ -466,18 +520,22 @@ def calc_ev(yes_price, implied_prob):
 
 def find_kalshi_opportunities():
     opportunities = []
+    if not KALSHI_API_KEY_ID or not KALSHI_PRIVATE_KEY:
+        return opportunities
     try:
         events = get_kalshi_events(limit=10)
         for event in events[:5]:
             ticker = event.get("event_ticker", "")
-            title = event.get("title", ticker)
+            title  = event.get("title", ticker)
             markets = get_kalshi_markets_for_event(ticker)
             for mkt in markets:
                 yes_price = mkt.get("yes_ask", 0) / 100.0 if mkt.get("yes_ask") else 0
-                no_price = mkt.get("no_ask", 0) / 100.0 if mkt.get("no_ask") else 0
-                yes_bid = mkt.get("yes_bid", 0) / 100.0 if mkt.get("yes_bid") else 0
+                no_price  = mkt.get("no_ask", 0)  / 100.0 if mkt.get("no_ask") else 0
+                yes_bid   = mkt.get("yes_bid", 0)  / 100.0 if mkt.get("yes_bid") else 0
+
                 if yes_price <= 0 or no_price <= 0:
                     continue
+
                 total = yes_price + no_price
                 if total < 0.98:
                     spread_ev = 1.0 - total
@@ -489,6 +547,7 @@ def find_kalshi_opportunities():
                         "ev": spread_ev,
                         "detail": f"Yes ${yes_price:.2f} + No ${no_price:.2f} = ${total:.2f}",
                     })
+
                 if yes_bid > 0 and yes_price > 0:
                     spread = yes_price - yes_bid
                     if spread >= 0.05:
@@ -511,16 +570,19 @@ def find_polymarket_opportunities():
     try:
         markets = get_polymarket_markets(limit=20)
         for mkt in markets:
-            tokens = mkt.get("tokens", [])
+            tokens   = mkt.get("tokens", [])
             question = mkt.get("question", mkt.get("title", "Unknown"))[:60]
             condition_id = mkt.get("condition_id", "")
+
             if len(tokens) >= 2:
                 yes_token = tokens[0]
-                no_token = tokens[1]
+                no_token  = tokens[1]
                 yes_price = float(yes_token.get("price", 0))
-                no_price = float(no_token.get("price", 0))
+                no_price  = float(no_token.get("price", 0))
+
                 if yes_price <= 0 or no_price <= 0:
                     continue
+
                 total = yes_price + no_price
                 if total < 0.98:
                     opportunities.append({
@@ -531,6 +593,7 @@ def find_polymarket_opportunities():
                         "ev": 1.0 - total,
                         "detail": f"Yes ${yes_price:.3f} + No ${no_price:.3f} = ${total:.3f}",
                     })
+
                 if 0.02 < yes_price < 0.10:
                     opportunities.append({
                         "platform": "Polymarket",
@@ -546,7 +609,7 @@ def find_polymarket_opportunities():
 
 
 # ============================================================================
-#  DISCORD BOT COMMANDS
+# DISCORD BOT COMMANDS
 # ============================================================================
 
 @bot.event
@@ -565,11 +628,11 @@ async def portfolio(ctx):
     msg = await ctx.send("Fetching balances from all platforms...")
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    kalshi = get_kalshi_balance()
-    poly = get_polymarket_balance()
+    kalshi   = get_kalshi_balance()
+    poly     = get_polymarket_balance()
     robinhood = get_robinhood_balance()
-    coinbase = get_coinbase_balance()
-    phemex = get_phemex_balance()
+    coinbase  = get_coinbase_balance()
+    phemex    = get_phemex_balance()
 
     rh_holdings = get_robinhood_holdings()
     cb_holdings = get_coinbase_holdings_detail()
@@ -583,9 +646,11 @@ async def portfolio(ctx):
     )
     if rh_holdings:
         report += f"{rh_holdings}\n"
+
     report += f"**Coinbase:** {coinbase}\n"
     if cb_holdings:
         report += f"{cb_holdings}\n"
+
     report += (
         f"**Phemex:** {phemex}\n"
         f"================================\n"
@@ -611,9 +676,9 @@ async def cycle(ctx):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     kalshi_opps = find_kalshi_opportunities()
-    poly_opps = find_polymarket_opportunities()
-    all_opps = kalshi_opps + poly_opps
+    poly_opps   = find_polymarket_opportunities()
 
+    all_opps = kalshi_opps + poly_opps
     all_opps.sort(key=lambda x: x.get("ev", 0), reverse=True)
 
     if not all_opps:
@@ -635,7 +700,6 @@ async def cycle(ctx):
             f"   {opp['market']}\n"
             f"   {opp['detail']}\n\n"
         )
-
     report += (
         f"================================\n"
         f"Total: {len(all_opps)} opportunities | "
@@ -678,13 +742,13 @@ async def manual_log(ctx, *, message: str):
 @bot.command()
 async def status(ctx):
     checks = {
-        "Kalshi": bool(KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY),
-        "Polymarket": bool(POLY_WALLET_ADDRESS),
-        "Robinhood": bool(ROBINHOOD_API_KEY and ROBINHOOD_PRIVATE_KEY),
-        "Coinbase": bool(COINBASE_API_KEY and COINBASE_API_SECRET),
-        "Phemex": bool(PHEMEX_API_KEY and PHEMEX_API_SECRET),
-        "GitHub Logger": bool(GITHUB_TOKEN),
-        "Discord Channel": bool(DISCORD_CHANNEL_ID),
+        "Kalshi":           bool(KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY),
+        "Polymarket":       bool(POLY_WALLET_ADDRESS),
+        "Robinhood":        bool(ROBINHOOD_API_KEY and ROBINHOOD_PRIVATE_KEY),
+        "Coinbase":         bool(COINBASE_API_KEY and COINBASE_API_SECRET),
+        "Phemex":           bool(PHEMEX_API_KEY and PHEMEX_API_SECRET),
+        "GitHub Logger":    bool(GITHUB_TOKEN),
+        "Discord Channel":  bool(DISCORD_CHANNEL_ID),
     }
     lines = ["**TraderJoes Integration Status**\n"]
     for name, ok in checks.items():
@@ -694,7 +758,7 @@ async def status(ctx):
 
 
 # ============================================================================
-#  ENTRY POINT
+# ENTRY POINT
 # ============================================================================
 
 if __name__ == "__main__":

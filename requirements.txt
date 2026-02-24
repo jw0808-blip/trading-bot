@@ -6,3 +6,4 @@ discord.py
 aiohttp
 python-dotenv
 web3
+PyJWT
