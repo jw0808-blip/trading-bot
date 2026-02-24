@@ -1,17 +1,10 @@
 # TraderJoes AI Conversation Log
 
-All conversations in the TraderJoes Trading Firm project are logged here.
-
----
+All conversations with Grok and Claude in the TraderJoes Trading Firm project are automatically saved here.
 
 ## How to Log Conversations
 
-**Discord command:** `!log <your message>` in any Discord channel
-
-**Webhook POST** to ai-logger /log endpoint:
-```json
-{"source": "Claude", "author": "TraderJoe", "content": "...", "secret": "traderjoes2024"}
-```
+**Webhook:** POST to https://ai-logger.onrender.com/log with JSON: {"source":"Claude","author":"TraderJoe","content":"...","secret":"traderjoes2024"}
 
 ---
 
