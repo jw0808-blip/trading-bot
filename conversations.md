@@ -8,7 +8,7 @@ All conversations in the TraderJoes Trading Firm project are logged here.
 
 **Discord command:** `!log <your message>` in any Discord channel
 
-**Webhook** (POST to your ai-logger service /log endpoint):
+**Webhook POST** to ai-logger /log endpoint:
 ```json
 {"source": "Claude", "author": "TraderJoe", "content": "...", "secret": "traderjoes2024"}
 ```
