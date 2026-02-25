@@ -175,10 +175,10 @@ def get_kalshi_markets_for_event(event_ticker):
 # POLYMARKET
 # ============================================================================
 
-def get_polymarket_balance():
+def _get_polymarket_usdc_onchain():
+    """Check on-chain USDC balance (cash not in positions)."""
     if not POLY_WALLET_ADDRESS:
-        return "Wallet not configured"
-    # Check both USDC.e (bridged) and native USDC on Polygon
+        return 0.0, []
     usdc_contracts = [
         ("USDC.e", "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
         ("USDC",   "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"),
@@ -187,8 +187,6 @@ def get_polymarket_balance():
     rpcs = ["https://polygon-rpc.com", "https://rpc.ankr.com/polygon"]
     total = 0.0
     details = []
-    rpc_errors = []
-    contracts_checked = 0
     for label, contract in usdc_contracts:
         call_data = "0x70a08231" + addr_padded
         payload = {
@@ -197,7 +195,6 @@ def get_polymarket_balance():
             "params": [{"to": contract, "data": call_data}, "latest"],
             "id": 1,
         }
-        checked = False
         for rpc in rpcs:
             try:
                 r = requests.post(rpc, json=payload, timeout=10)
@@ -209,26 +206,93 @@ def get_polymarket_balance():
                         total += bal
                         if bal > 0.01:
                             details.append(f"{label}: ${bal:,.2f}")
-                        contracts_checked += 1
-                        checked = True
-                        log.info("Polymarket %s balance via %s: $%.2f", label, rpc, bal)
                         break
-                    else:
-                        log.warning("Polymarket %s returned empty result from %s", label, rpc)
-                else:
-                    rpc_errors.append(f"{rpc} HTTP {r.status_code}")
-            except Exception as exc:
-                rpc_errors.append(f"{rpc}: {exc}")
+            except Exception:
                 continue
-        if not checked:
-            log.warning("Polymarket %s: all RPCs failed — %s", label, rpc_errors)
-    # If no contracts were successfully checked, it's a connection issue
-    if contracts_checked == 0 and rpc_errors:
-        log.error("Polymarket balance: ALL RPC calls failed — %s", rpc_errors)
-        return f"⚠️ RPC error (wallet: {POLY_WALLET_ADDRESS[:10]}...)"
-    if details:
-        return f"${total:,.2f} ({', '.join(details)})"
+    return total, details
+
+
+def _get_polymarket_positions():
+    """Fetch trading positions from Polymarket Data API."""
+    if not POLY_WALLET_ADDRESS:
+        return 0.0, []
+    try:
+        r = requests.get(
+            "https://data-api.polymarket.com/positions",
+            params={
+                "user": POLY_WALLET_ADDRESS,
+                "sizeThreshold": 0.01,
+                "limit": 100,
+                "sortBy": "CURRENT",
+                "sortDirection": "DESC",
+            },
+            timeout=15,
+        )
+        if r.status_code == 200:
+            positions = r.json()
+            if not isinstance(positions, list):
+                positions = []
+            total_value = 0.0
+            pos_details = []
+            for p in positions:
+                size = float(p.get("size", 0))
+                cur_price = float(p.get("curPrice", 0))
+                current_val = float(p.get("currentValue", 0))
+                title = p.get("title", "Unknown")
+                outcome = p.get("outcome", "?")
+                cash_pnl = float(p.get("cashPnl", 0))
+                pct_pnl = float(p.get("percentPnl", 0))
+                if size > 0.01:
+                    total_value += current_val
+                    pnl_str = f"+${cash_pnl:,.2f}" if cash_pnl >= 0 else f"-${abs(cash_pnl):,.2f}"
+                    pct_str = f"+{pct_pnl:.1f}%" if pct_pnl >= 0 else f"{pct_pnl:.1f}%"
+                    # Truncate long titles
+                    short_title = title[:45] + "..." if len(title) > 45 else title
+                    pos_details.append(
+                        f"  {outcome} {short_title}\n"
+                        f"    {size:,.1f} shares @ ${cur_price:.3f} = ${current_val:,.2f} ({pnl_str} / {pct_str})"
+                    )
+            log.info("Polymarket Data API: %d positions, total value $%.2f", len(positions), total_value)
+            return total_value, pos_details
+        else:
+            log.warning("Polymarket Data API HTTP %d: %s", r.status_code, r.text[:200])
+    except Exception as exc:
+        log.warning("Polymarket Data API error: %s", exc)
+    return 0.0, []
+
+
+def get_polymarket_balance():
+    if not POLY_WALLET_ADDRESS:
+        return "Wallet not configured"
+
+    # 1) Fetch positions value from Data API
+    positions_value, _ = _get_polymarket_positions()
+
+    # 2) Fetch on-chain USDC (uninvested cash)
+    cash_value, cash_details = _get_polymarket_usdc_onchain()
+
+    total = positions_value + cash_value
+    parts = []
+    if positions_value > 0.01:
+        parts.append(f"positions: ${positions_value:,.2f}")
+    if cash_value > 0.01:
+        parts.append(f"cash: ${cash_value:,.2f}")
+
+    if parts:
+        return f"${total:,.2f} ({', '.join(parts)})"
+    if total < 0.01 and positions_value == 0 and cash_value == 0:
+        return "$0.00 (no positions or cash)"
     return f"${total:,.2f}"
+
+
+def get_polymarket_positions_detail():
+    """Return formatted position details for portfolio display."""
+    if not POLY_WALLET_ADDRESS:
+        return ""
+    _, pos_details = _get_polymarket_positions()
+    if pos_details:
+        return "\n".join(pos_details)
+    return ""
 
 
 def get_polymarket_markets(limit=20):
@@ -743,14 +807,18 @@ async def portfolio(ctx):
 
     rh_holdings = get_robinhood_holdings()
     cb_holdings = get_coinbase_holdings_detail()
+    poly_holdings = get_polymarket_positions_detail()
 
     report = (
         f"**TraderJoes Portfolio** | {ts}\n"
         f"================================\n"
         f"**Kalshi:** {kalshi}\n"
         f"**Polymarket:** {poly}\n"
-        f"**Robinhood Crypto:** {robinhood}\n"
     )
+    if poly_holdings:
+        report += f"{poly_holdings}\n"
+
+    report += f"**Robinhood Crypto:** {robinhood}\n"
     if rh_holdings:
         report += f"{rh_holdings}\n"
 
