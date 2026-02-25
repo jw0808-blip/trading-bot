@@ -187,6 +187,8 @@ def get_polymarket_balance():
     rpcs = ["https://polygon-rpc.com", "https://rpc.ankr.com/polygon"]
     total = 0.0
     details = []
+    rpc_errors = []
+    contracts_checked = 0
     for label, contract in usdc_contracts:
         call_data = "0x70a08231" + addr_padded
         payload = {
@@ -195,27 +197,44 @@ def get_polymarket_balance():
             "params": [{"to": contract, "data": call_data}, "latest"],
             "id": 1,
         }
+        checked = False
         for rpc in rpcs:
             try:
                 r = requests.post(rpc, json=payload, timeout=10)
                 if r.status_code == 200:
-                    raw = int(r.json().get("result", "0x0"), 16)
-                    bal = raw / 1_000_000
-                    total += bal
-                    if bal > 0.01:
-                        details.append(f"{label}: ${bal:,.2f}")
-                    break
-            except Exception:
+                    result = r.json().get("result", "0x0")
+                    if result and result != "0x":
+                        raw = int(result, 16)
+                        bal = raw / 1_000_000
+                        total += bal
+                        if bal > 0.01:
+                            details.append(f"{label}: ${bal:,.2f}")
+                        contracts_checked += 1
+                        checked = True
+                        log.info("Polymarket %s balance via %s: $%.2f", label, rpc, bal)
+                        break
+                    else:
+                        log.warning("Polymarket %s returned empty result from %s", label, rpc)
+                else:
+                    rpc_errors.append(f"{rpc} HTTP {r.status_code}")
+            except Exception as exc:
+                rpc_errors.append(f"{rpc}: {exc}")
                 continue
+        if not checked:
+            log.warning("Polymarket %s: all RPCs failed — %s", label, rpc_errors)
+    # If no contracts were successfully checked, it's a connection issue
+    if contracts_checked == 0 and rpc_errors:
+        log.error("Polymarket balance: ALL RPC calls failed — %s", rpc_errors)
+        return f"⚠️ RPC error (wallet: {POLY_WALLET_ADDRESS[:10]}...)"
     if details:
         return f"${total:,.2f} ({', '.join(details)})"
     return f"${total:,.2f}"
 
 
 def get_polymarket_markets(limit=20):
-    """Fetch current, active markets from the Polymarket Gamma API."""
+    """Fetch current, active markets from Polymarket Gamma API with CLOB fallback."""
+    # --- Primary: Gamma API ---
     try:
-        # Use Gamma API with closed=false to get only active, current markets
         r = requests.get(
             "https://gamma-api.polymarket.com/markets",
             params={
@@ -229,9 +248,29 @@ def get_polymarket_markets(limit=20):
         )
         if r.status_code == 200:
             data = r.json()
-            return data if isinstance(data, list) else []
+            markets = data if isinstance(data, list) else []
+            if markets:
+                log.info("Gamma API returned %d markets", len(markets))
+                return markets
+            log.warning("Gamma API returned empty list, trying CLOB fallback")
     except Exception as exc:
-        log.warning("Polymarket Gamma markets fetch error: %s", exc)
+        log.warning("Gamma API failed (%s), trying CLOB fallback", exc)
+
+    # --- Fallback: CLOB API ---
+    try:
+        log.info("Using CLOB API fallback for Polymarket markets")
+        r = requests.get(
+            "https://clob.polymarket.com/markets",
+            params={"limit": limit, "active": "true"},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            markets = data if isinstance(data, list) else data.get("data", [])
+            log.info("CLOB fallback returned %d markets", len(markets))
+            return markets
+    except Exception as exc:
+        log.warning("CLOB API fallback also failed: %s", exc)
     return []
 
 
@@ -623,25 +662,53 @@ def find_polymarket_opportunities():
             if yes_price <= 0 or no_price <= 0:
                 continue
 
+            # Extract volume and liquidity info
+            vol_24h = 0.0
+            total_vol = 0.0
+            liquidity = 0.0
+            try:
+                vol_24h = float(mkt.get("volume24hr", 0) or 0)
+                total_vol = float(mkt.get("volume", 0) or 0)
+                liquidity = float(mkt.get("liquidityClob", 0) or 0)
+            except (ValueError, TypeError):
+                pass
+
+            def _fmt_vol(v):
+                if v >= 1_000_000:
+                    return f"${v/1_000_000:.1f}M"
+                if v >= 1_000:
+                    return f"${v/1_000:.0f}K"
+                return f"${v:,.0f}"
+
+            vol_str = f"Vol 24h: {_fmt_vol(vol_24h)}" if vol_24h > 0 else ""
+            liq_str = f"Liq: {_fmt_vol(liquidity)}" if liquidity > 0 else ""
+            extra = " | ".join(filter(None, [vol_str, liq_str]))
+
             total = yes_price + no_price
             if total < 0.98:
+                detail = f"Yes ${yes_price:.3f} + No ${no_price:.3f} = ${total:.3f}"
+                if extra:
+                    detail += f" | {extra}"
                 opportunities.append({
                     "platform": "Polymarket",
                     "market": question,
                     "ticker": condition_id[:20],
                     "type": "Arb (Yes+No < $1)",
                     "ev": 1.0 - total,
-                    "detail": f"Yes ${yes_price:.3f} + No ${no_price:.3f} = ${total:.3f}",
+                    "detail": detail,
                 })
 
             if 0.02 < yes_price < 0.10:
+                detail = f"YES @ ${yes_price:.3f} / NO @ ${no_price:.3f}"
+                if extra:
+                    detail += f" | {extra}"
                 opportunities.append({
                     "platform": "Polymarket",
                     "market": question,
                     "ticker": condition_id[:20],
                     "type": "Low-Price YES",
                     "ev": yes_price,
-                    "detail": f"YES @ ${yes_price:.3f} -- high upside if correct",
+                    "detail": detail,
                 })
     except Exception as exc:
         log.warning("Polymarket scan error: %s", exc)
