@@ -1,5 +1,5 @@
 """
-TraderJoes Trading Firm â Discord Bot
+TraderJoes Trading Firm — Discord Bot
 =====================================
 Multi-platform portfolio viewer and EV scanner.
 Platforms: Kalshi, Polymarket, Robinhood (Crypto), Coinbase (Advanced Trade), Phemex
@@ -76,7 +76,7 @@ GITHUB_REPO     = os.environ.get("GITHUB_REPO", "jw0808-blip/trading-bot")
 
 
 # ============================================================================
-# KALSHI  (RSA-PSS signing â path MUST include /trade-api/v2 prefix)
+# KALSHI  (RSA-PSS signing — path MUST include /trade-api/v2 prefix)
 # ============================================================================
 
 def kalshi_sign(method, path):
@@ -178,38 +178,60 @@ def get_kalshi_markets_for_event(event_ticker):
 def get_polymarket_balance():
     if not POLY_WALLET_ADDRESS:
         return "Wallet not configured"
-    usdc_contract = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    # Check both USDC.e (bridged) and native USDC on Polygon
+    usdc_contracts = [
+        ("USDC.e", "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
+        ("USDC",   "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"),
+    ]
     addr_padded = POLY_WALLET_ADDRESS.lower().replace("0x", "").zfill(64)
-    call_data = "0x70a08231" + addr_padded
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "eth_call",
-        "params": [{"to": usdc_contract, "data": call_data}, "latest"],
-        "id": 1,
-    }
     rpcs = ["https://polygon-rpc.com", "https://rpc.ankr.com/polygon"]
-    for rpc in rpcs:
-        try:
-            r = requests.post(rpc, json=payload, timeout=10)
-            if r.status_code == 200:
-                raw = int(r.json().get("result", "0x0"), 16)
-                return f"${raw / 1_000_000:,.2f}"
-        except Exception:
-            continue
-    return "RPC unavailable"
+    total = 0.0
+    details = []
+    for label, contract in usdc_contracts:
+        call_data = "0x70a08231" + addr_padded
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{"to": contract, "data": call_data}, "latest"],
+            "id": 1,
+        }
+        for rpc in rpcs:
+            try:
+                r = requests.post(rpc, json=payload, timeout=10)
+                if r.status_code == 200:
+                    raw = int(r.json().get("result", "0x0"), 16)
+                    bal = raw / 1_000_000
+                    total += bal
+                    if bal > 0.01:
+                        details.append(f"{label}: ${bal:,.2f}")
+                    break
+            except Exception:
+                continue
+    if details:
+        return f"${total:,.2f} ({', '.join(details)})"
+    return f"${total:,.2f}"
 
 
 def get_polymarket_markets(limit=20):
+    """Fetch current, active markets from the Polymarket Gamma API."""
     try:
+        # Use Gamma API with closed=false to get only active, current markets
         r = requests.get(
-            "https://clob.polymarket.com/markets",
-            params={"limit": limit, "active": True},
+            "https://gamma-api.polymarket.com/markets",
+            params={
+                "limit": limit,
+                "closed": "false",
+                "order": "volume24hr",
+                "ascending": "false",
+                "active": "true",
+            },
             timeout=15,
         )
         if r.status_code == 200:
-            return r.json() if isinstance(r.json(), list) else r.json().get("data", [])
+            data = r.json()
+            return data if isinstance(data, list) else []
     except Exception as exc:
-        log.warning("Polymarket markets fetch error: %s", exc)
+        log.warning("Polymarket Gamma markets fetch error: %s", exc)
     return []
 
 
@@ -568,41 +590,59 @@ def find_kalshi_opportunities():
 def find_polymarket_opportunities():
     opportunities = []
     try:
-        markets = get_polymarket_markets(limit=20)
+        markets = get_polymarket_markets(limit=30)
         for mkt in markets:
-            tokens   = mkt.get("tokens", [])
             question = mkt.get("question", mkt.get("title", "Unknown"))[:60]
             condition_id = mkt.get("condition_id", "")
 
-            if len(tokens) >= 2:
-                yes_token = tokens[0]
-                no_token  = tokens[1]
-                yes_price = float(yes_token.get("price", 0))
-                no_price  = float(no_token.get("price", 0))
+            # Gamma API returns outcomePrices as a JSON string like "[\"0.95\",\"0.05\"]"
+            outcome_prices_raw = mkt.get("outcomePrices", "")
+            tokens = mkt.get("tokens", [])
 
-                if yes_price <= 0 or no_price <= 0:
-                    continue
+            yes_price = 0.0
+            no_price = 0.0
 
-                total = yes_price + no_price
-                if total < 0.98:
-                    opportunities.append({
-                        "platform": "Polymarket",
-                        "market": question,
-                        "ticker": condition_id[:20],
-                        "type": "Arb (Yes+No < $1)",
-                        "ev": 1.0 - total,
-                        "detail": f"Yes ${yes_price:.3f} + No ${no_price:.3f} = ${total:.3f}",
-                    })
+            # Try outcomePrices first (Gamma API format)
+            if outcome_prices_raw:
+                try:
+                    if isinstance(outcome_prices_raw, str):
+                        prices = json.loads(outcome_prices_raw)
+                    else:
+                        prices = outcome_prices_raw
+                    if len(prices) >= 2:
+                        yes_price = float(prices[0])
+                        no_price = float(prices[1])
+                except (json.JSONDecodeError, ValueError, IndexError):
+                    pass
 
-                if 0.02 < yes_price < 0.10:
-                    opportunities.append({
-                        "platform": "Polymarket",
-                        "market": question,
-                        "ticker": condition_id[:20],
-                        "type": "Low-Price YES",
-                        "ev": yes_price,
-                        "detail": f"YES @ ${yes_price:.3f} -- high upside if correct",
-                    })
+            # Fall back to tokens array (CLOB API format)
+            if yes_price <= 0 and len(tokens) >= 2:
+                yes_price = float(tokens[0].get("price", 0))
+                no_price = float(tokens[1].get("price", 0))
+
+            if yes_price <= 0 or no_price <= 0:
+                continue
+
+            total = yes_price + no_price
+            if total < 0.98:
+                opportunities.append({
+                    "platform": "Polymarket",
+                    "market": question,
+                    "ticker": condition_id[:20],
+                    "type": "Arb (Yes+No < $1)",
+                    "ev": 1.0 - total,
+                    "detail": f"Yes ${yes_price:.3f} + No ${no_price:.3f} = ${total:.3f}",
+                })
+
+            if 0.02 < yes_price < 0.10:
+                opportunities.append({
+                    "platform": "Polymarket",
+                    "market": question,
+                    "ticker": condition_id[:20],
+                    "type": "Low-Price YES",
+                    "ev": yes_price,
+                    "detail": f"YES @ ${yes_price:.3f} -- high upside if correct",
+                })
     except Exception as exc:
         log.warning("Polymarket scan error: %s", exc)
     return opportunities
