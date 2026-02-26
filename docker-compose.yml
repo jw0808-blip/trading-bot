@@ -1,0 +1,52 @@
+version: "3.9"
+
+services:
+  traderjoes-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: traderjoes-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - bot-logs:/app/logs
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  openclaw:
+    image: node:22-slim
+    container_name: traderjoes-openclaw
+    restart: unless-stopped
+    working_dir: /root
+    command: >
+      bash -c "npm install -g openclaw@latest 2>/dev/null; openclaw gateway"
+    env_file:
+      - .env
+    volumes:
+      - openclaw-data:/root/.openclaw
+      - ./skills:/root/.openclaw/skills
+      - skills-venv:/root/traderjoes-skills
+    ports:
+      - "127.0.0.1:3000:3000"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --interval 3600 --cleanup
+
+volumes:
+  bot-logs:
+  openclaw-data:
+  skills-venv:
