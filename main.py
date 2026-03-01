@@ -2719,48 +2719,70 @@ async def global_rate_check(ctx):
 # ============================================================================
 
 async def execute_kalshi_order(action, ticker, amount):
-    """Place a real order on Kalshi. Returns (success, message)."""
+    """Place a real order on Kalshi using RSA-PSS auth. Returns (success, message)."""
     if not KALSHI_API_KEY_ID or not KALSHI_PRIVATE_KEY:
         return False, "Kalshi API keys not configured"
-    # DRY_RUN_MODE check
     if DRY_RUN_MODE:
-        log.info("DRY RUN: %s %s — order NOT sent", action, ticker if 'ticker' in dir() else symbol if 'symbol' in dir() else amount)
+        log.info("DRY RUN: Kalshi %s %s $%.2f", action, ticker, amount)
         return True, f"DRY RUN: {action} order logged but not sent (dry-run mode)"
     try:
-        # Get auth token
-        ts = str(int(time.time()))
+        import base64, datetime as _dt
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding as _padding
+        from cryptography.hazmat.backends import default_backend
+        
+        # Load private key
+        pk_str = KALSHI_PRIVATE_KEY
+        if "BEGIN" in pk_str:
+            private_key = serialization.load_pem_private_key(pk_str.encode(), password=None, backend=default_backend())
+        else:
+            der = base64.b64decode(pk_str)
+            private_key = serialization.load_der_private_key(der, password=None, backend=default_backend())
+        
+        # Timestamp in milliseconds
+        ts_ms = str(int(_dt.datetime.now().timestamp() * 1000))
+        
         method = "POST"
         path = "/trade-api/v2/portfolio/orders"
-        msg = ts + "\n" + method + "\n" + path + "\n"
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import padding, utils
-        pk_bytes = KALSHI_PRIVATE_KEY.encode()
-        if "BEGIN" in KALSHI_PRIVATE_KEY:
-            private_key = serialization.load_pem_private_key(pk_bytes, password=None)
-        else:
-            import base64
-            der = base64.b64decode(KALSHI_PRIVATE_KEY)
-            private_key = serialization.load_der_private_key(der, password=None)
-        sig = private_key.sign(msg.encode(), padding.PKCS1v15(), hashes.SHA256())
-        import base64
-        sig_b64 = base64.b64encode(sig).decode()
-
+        
+        # Sign: timestamp + method + path (RSA-PSS with SHA256)
+        msg_string = ts_ms + method + path
+        signature = private_key.sign(
+            msg_string.encode(),
+            _padding.PSS(
+                mgf=_padding.MGF1(hashes.SHA256()),
+                salt_length=_padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
+        )
+        sig_b64 = base64.b64encode(signature).decode()
+        
+        # Build order
         side = "yes" if action.upper() == "BUY" else "no"
+        count = max(int(amount), 1)  # Minimum 1 contract
+        
         order_data = {
             "ticker": ticker,
             "type": "market",
-            "action": action.lower(),
+            "action": "buy" if action.upper() == "BUY" else "sell",
             "side": side,
-            "count": int(amount / 0.50),  # approximate shares
+            "count": count,
         }
-
+        
         headers = {
-            "Authorization": f"Bearer {KALSHI_API_KEY_ID}",
+            "KALSHI-ACCESS-KEY": KALSHI_API_KEY_ID,
+            "KALSHI-ACCESS-SIGNATURE": sig_b64,
+            "KALSHI-ACCESS-TIMESTAMP": ts_ms,
             "Content-Type": "application/json",
+            "Accept": "application/json",
         }
+        
         r = requests.post(f"https://api.elections.kalshi.com{path}", json=order_data, headers=headers, timeout=15)
+        
         if r.status_code in (200, 201):
-            return True, f"Kalshi order placed: {action} {ticker} ${amount:.2f}"
+            data = r.json()
+            order_id = data.get("order", {}).get("order_id", "unknown")
+            return True, f"Kalshi order placed: {action} {ticker} x{count} (ID: {order_id})"
         else:
             return False, f"Kalshi API error: {r.status_code} {r.text[:200]}"
     except Exception as exc:
@@ -2768,141 +2790,57 @@ async def execute_kalshi_order(action, ticker, amount):
 
 
 async def execute_phemex_order(action, symbol, amount):
-    """Place a real order on Phemex. Returns (success, message)."""
+    """Place an order on Phemex. Returns (success, message)."""
     if not PHEMEX_API_KEY or not PHEMEX_API_SECRET:
         return False, "Phemex API keys not configured"
-    # DRY_RUN_MODE check
     if DRY_RUN_MODE:
-        log.info("DRY RUN: %s %s — order NOT sent", action, ticker if 'ticker' in dir() else symbol if 'symbol' in dir() else amount)
+        log.info("DRY RUN: Phemex %s %s $%.2f", action, symbol, amount)
         return True, f"DRY RUN: {action} order logged but not sent (dry-run mode)"
     try:
-        ts = str(int(time.time()))
-        path = "/orders"
-        query = f"symbol={symbol}&side={action.title()}&orderQty={amount}&ordType=Market"
-        msg = path + query + ts
-        import hmac, hashlib
+        import hmac, hashlib, time as _time
+        
+        expiry = str(int(_time.time()) + 60)
+        
+        # Phemex spot order
+        path = "/spot/orders"
+        side = "Buy" if action.upper() == "BUY" else "Sell"
+        
+        order_data = {
+            "symbol": symbol if "s" in symbol.lower() else f"s{symbol}",
+            "side": side,
+            "ordType": "Market",
+            "quoteQtyEv": int(amount * 100000000),  # Scale to Phemex value scale
+        }
+        
+        import json
+        body_str = json.dumps(order_data, separators=(",", ":"))
+        
+        # Sign: path + queryString + expiry + body
+        msg = path + expiry + body_str
         sig = hmac.new(PHEMEX_API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
-
+        
         headers = {
             "x-phemex-access-token": PHEMEX_API_KEY,
+            "x-phemex-request-expiry": expiry,
             "x-phemex-request-signature": sig,
-            "x-phemex-request-expiry": ts,
             "Content-Type": "application/json",
         }
-        r = requests.post(f"https://api.phemex.com{path}?{query}", headers=headers, timeout=15)
+        
+        r = requests.post(f"https://api.phemex.com{path}", json=order_data, headers=headers, timeout=15)
+        
         if r.status_code == 200:
-            return True, f"Phemex order placed: {action} {symbol} ${amount:.2f}"
+            data = r.json()
+            if data.get("code") == 0:
+                order_id = data.get("data", {}).get("orderID", "unknown")
+                return True, f"Phemex order: {side} {symbol} ${amount:.2f} (ID: {order_id})"
+            else:
+                return False, f"Phemex error: {data.get('msg', 'unknown')}"
         else:
             return False, f"Phemex API error: {r.status_code} {r.text[:200]}"
     except Exception as exc:
         return False, f"Phemex execution error: {exc}"
 
 
-
-
-def fetch_historical_prices(coin="bitcoin", days=90):
-    """Fetch real historical daily prices from CoinGecko."""
-    try:
-        url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days={days}&interval=daily"
-        r = requests.get(url, timeout=15, headers={"User-Agent": "TraderJoes/1.0"})
-        if r.status_code == 200:
-            data = r.json()
-            prices = [p[1] for p in data.get("prices", [])]
-            return prices
-        else:
-            log.warning("CoinGecko historical: %s", r.status_code)
-            return []
-    except Exception as exc:
-        log.warning("Historical price fetch error: %s", exc)
-        return []
-
-
-def calculate_returns(prices):
-    """Calculate daily returns from price series."""
-    if len(prices) < 2:
-        return []
-    return [(prices[i] - prices[i-1]) / prices[i-1] for i in range(1, len(prices))]
-
-
-def real_backtest_strategy(prices, strategy="momentum"):
-    """Run a real backtest on historical price data."""
-    if len(prices) < 20:
-        return None
-    
-    returns = calculate_returns(prices)
-    
-    # Simple momentum strategy: buy when 5-day return > 0, sell otherwise
-    position = 0  # 0 = flat, 1 = long
-    equity = 10000.0
-    peak_equity = 10000.0
-    max_dd = 0.0
-    trades = []
-    daily_pnl = []
-    
-    for i in range(5, len(returns)):
-        # 5-day momentum signal
-        momentum = sum(returns[i-5:i])
-        
-        if strategy == "mean-reversion":
-            # Mean reversion: buy on dips, sell on rips
-            signal = -1 if momentum > 0.02 else (1 if momentum < -0.02 else 0)
-        elif strategy == "trend-following":
-            # Trend following: follow the momentum
-            signal = 1 if momentum > 0.01 else (-1 if momentum < -0.01 else 0)
-        else:  # momentum (default)
-            signal = 1 if momentum > 0 else 0
-        
-        # Execute
-        daily_ret = returns[i]
-        if position == 1:
-            pnl = equity * daily_ret
-            equity += pnl
-            daily_pnl.append(pnl)
-        else:
-            daily_pnl.append(0)
-        
-        # Update position
-        old_pos = position
-        position = max(0, min(1, signal))
-        if old_pos != position:
-            trades.append({"day": i, "action": "BUY" if position == 1 else "SELL", "equity": equity})
-        
-        # Track drawdown
-        if equity > peak_equity:
-            peak_equity = equity
-        dd = (peak_equity - equity) / peak_equity * 100
-        if dd > max_dd:
-            max_dd = dd
-    
-    total_return = (equity - 10000) / 10000 * 100
-    
-    # Calculate Sharpe
-    import statistics
-    if len(daily_pnl) > 1 and any(p != 0 for p in daily_pnl):
-        mean_pnl = statistics.mean(daily_pnl)
-        std_pnl = statistics.stdev(daily_pnl) or 1
-        sharpe = (mean_pnl / std_pnl) * (252 ** 0.5)
-    else:
-        sharpe = 0
-    
-    winning = len([p for p in daily_pnl if p > 0])
-    losing = len([p for p in daily_pnl if p < 0])
-    win_rate = winning / max(winning + losing, 1) * 100
-    
-    return {
-        "total_return": total_return,
-        "sharpe": sharpe,
-        "max_drawdown": max_dd,
-        "win_rate": win_rate,
-        "trades": len(trades),
-        "final_equity": equity,
-        "daily_pnl": daily_pnl,
-        "winning": winning,
-        "losing": losing,
-    }
-
-
-@bot.command(name="backtest-real")
 async def backtest_real(ctx, *, args: str = ""):
     """Backtest with REAL historical data from CoinGecko.
     Usage: !backtest-real bitcoin momentum 90
