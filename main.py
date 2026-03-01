@@ -1278,79 +1278,142 @@ async def paper_trade(ctx, side: str = "", *, args: str = ""):
 # ============================================================================
 
 @bot.command()
-async def backtest(ctx, *, strategy: str = ""):
-    """Run backtest on a strategy using historical data."""
-    if not strategy:
-        await ctx.send("Usage: `!backtest momentum-crypto` or `!backtest mean-reversion BTC`")
-        return
+async def backtest(ctx, *, strategy: str = "momentum-crypto"):
+    """Run a walk-forward backtest. Uses real CoinGecko data when possible.
+    Usage: !backtest momentum-crypto  or  !backtest mean-reversion
+    """
+    msg = await ctx.send(f"Running backtest: **{strategy}**... fetching real data from CoinGecko")
     
-    msg = await ctx.send(f"Running backtest: *{strategy[:60]}*...")
+    # Use real data when available
+    coin_map = {
+        "momentum-crypto": "bitcoin",
+        "mean-reversion": "ethereum",
+        "trend-following": "bitcoin",
+        "momentum": "bitcoin",
+        "btc": "bitcoin",
+        "eth": "ethereum",
+        "sol": "solana",
+    }
+    coin = coin_map.get(strategy.lower(), "bitcoin")
     
-    try:
-        import random
-        # Simulate backtest results with realistic metrics
-        n_trades = random.randint(50, 500)
-        win_rate = random.uniform(0.45, 0.68)
-        avg_win = random.uniform(2.0, 8.0)
-        avg_loss = random.uniform(1.5, 5.0)
-        sharpe = random.uniform(0.3, 2.8)
-        max_dd = random.uniform(5.0, 35.0)
-        total_return = random.uniform(-15.0, 85.0)
-        calmar = total_return / max_dd if max_dd > 0 else 0
+    prices = fetch_historical_prices(coin, 365)
+    
+    if prices and len(prices) >= 30:
+        # Real data backtest
+        returns = calculate_returns(prices)
+        result = real_backtest_strategy(prices, strategy.split("-")[0] if "-" in strategy else strategy)
         
-        # Monte Carlo simulation (1000 paths)
-        mc_median = total_return * random.uniform(0.7, 1.1)
-        mc_5th = total_return * random.uniform(0.2, 0.6)
-        mc_95th = total_return * random.uniform(1.2, 1.8)
-        
-        # Walk-forward efficiency
-        wf_efficiency = random.uniform(0.3, 0.9)
-        oos_degradation = random.uniform(5, 40)
-        
-        # Robustness verdict
-        robust = sharpe > 1.0 and win_rate > 0.50 and max_dd < 25 and wf_efficiency > 0.5
-        verdict = "PASS - Strategy approved" if robust else "FAIL - Strategy rejected"
-        icon = "✅" if robust else "❌"
-        
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        
-        report = (
-            f"**Backtest Results** | {ts}\n"
-            f"Strategy: *{strategy[:60]}*\n"
-            f"================================\n"
-            f"**Performance:**\n"
-            f"  Total Return: {total_return:+.1f}%\n"
-            f"  Sharpe Ratio: {sharpe:.2f}\n"
-            f"  Max Drawdown: -{max_dd:.1f}%\n"
-            f"  Calmar Ratio: {calmar:.2f}\n"
-            f"  Trades: {n_trades} | Win Rate: {win_rate:.1%}\n"
-            f"  Avg Win: +{avg_win:.1f}% | Avg Loss: -{avg_loss:.1f}%\n"
-            f"\n**Walk-Forward Analysis:**\n"
-            f"  In-sample vs OOS efficiency: {wf_efficiency:.1%}\n"
-            f"  OOS degradation: {oos_degradation:.0f}%\n"
-            f"\n**Monte Carlo (1000 paths):**\n"
-            f"  5th pct: {mc_5th:+.1f}% | Median: {mc_median:+.1f}% | 95th pct: {mc_95th:+.1f}%\n"
-            f"\n**Verdict:** {icon} {verdict}\n"
-            f"================================"
-        )
-        
-        if len(report) > 1900:
-            report = report[:1900] + "\n*...truncated*"
-        await msg.edit(content=report)
-        
-    except Exception as exc:
-        await msg.edit(content=f"Backtest error: {exc}")
+        if result:
+            # Walk-forward: split into 5 windows
+            window_size = len(prices) // 5
+            wf_results = []
+            for i in range(5):
+                start = i * window_size
+                end = start + window_size
+                if end > len(prices):
+                    end = len(prices)
+                window_prices = prices[start:end]
+                if len(window_prices) >= 10:
+                    wr = real_backtest_strategy(window_prices, strategy.split("-")[0] if "-" in strategy else strategy)
+                    if wr:
+                        wf_results.append(wr)
+            
+            wf_returns = [w["total_return"] for w in wf_results] if wf_results else [0]
+            
+            # Monte Carlo
+            import random, statistics
+            mc_results = []
+            for _ in range(1000):
+                shuffled = random.sample(returns, len(returns))
+                eq = 10000.0
+                for r in shuffled:
+                    eq += eq * r
+                mc_results.append((eq - 10000) / 10000 * 100)
+            mc_results.sort()
+            
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            
+            checks = [
+                result["sharpe"] > 1.0,
+                result["win_rate"] > 48,
+                result["max_drawdown"] < 30,
+                result["total_return"] > 0,
+                len([w for w in wf_results if w["total_return"] > 0]) >= 3,
+            ]
+            passed = sum(checks)
+            verdict = f"PASS ({passed}/5)" if passed >= 3 else f"FAIL ({passed}/5)"
+            
+            report = (
+                f"**Walk-Forward Backtest** | {ts}\n"
+                f"Strategy: {strategy} | Data: {coin} ({len(prices)} days, REAL)\n"
+                f"================================\n"
+                f"**Full Period:**\n"
+                f"  Return: {result['total_return']:+.1f}% | Sharpe: {result['sharpe']:.2f}\n"
+                f"  Max DD: -{result['max_drawdown']:.1f}% | Win Rate: {result['win_rate']:.1f}%\n"
+                f"  Trades: {result['trades']}\n"
+                f"\n**Walk-Forward ({len(wf_results)} windows):**\n"
+                f"  Returns: {', '.join(f'{r:+.1f}%' for r in wf_returns)}\n"
+                f"  Profitable windows: {len([r for r in wf_returns if r > 0])}/{len(wf_returns)}\n"
+                f"\n**Monte Carlo (1K paths):**\n"
+                f"  5th: {mc_results[50]:+.1f}% | Median: {mc_results[500]:+.1f}% | 95th: {mc_results[950]:+.1f}%\n"
+                f"\n**Verdict:** [{verdict}]\n"
+                f"================================"
+            )
+            await msg.edit(content=report)
+            return
+    
+    # Fallback to simulated if no real data
+    import random, statistics
+    random.seed(42)
+    num_days = 252
+    returns = [random.gauss(0.0003, 0.015) for _ in range(num_days)]
+    equity = 10000.0
+    peak = equity
+    max_dd = 0
+    wins = losses = 0
+    daily_pnl = []
+    
+    for r in returns:
+        pnl = equity * r
+        equity += pnl
+        daily_pnl.append(pnl)
+        if equity > peak:
+            peak = equity
+        dd = (peak - equity) / peak * 100
+        if dd > max_dd:
+            max_dd = dd
+        if pnl > 0:
+            wins += 1
+        elif pnl < 0:
+            losses += 1
+    
+    total_ret = (equity - 10000) / 10000 * 100
+    mean_pnl = statistics.mean(daily_pnl)
+    std_pnl = statistics.stdev(daily_pnl) or 1
+    sharpe = (mean_pnl / std_pnl) * (252 ** 0.5)
+    win_rate = wins / max(wins + losses, 1) * 100
+    
+    mc_results = []
+    for _ in range(1000):
+        shuffled = random.sample(returns, len(returns))
+        eq = 10000.0
+        for r in shuffled:
+            eq += eq * r
+        mc_results.append((eq - 10000) / 10000 * 100)
+    mc_results.sort()
+    
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    report = (
+        f"**Walk-Forward Backtest** | {ts}\n"
+        f"Strategy: {strategy} | Data: SIMULATED (252 days)\n"
+        f"================================\n"
+        f"Return: {total_ret:+.1f}% | Sharpe: {sharpe:.2f}\n"
+        f"Max DD: -{max_dd:.1f}% | Win Rate: {win_rate:.1f}% ({wins}W/{losses}L)\n"
+        f"MC 5th: {mc_results[50]:+.1f}% | Median: {mc_results[500]:+.1f}% | 95th: {mc_results[950]:+.1f}%\n"
+        f"================================"
+    )
+    await msg.edit(content=report)
 
-
-
-
-# ============================================================================
-# LIVE TRADING WITH SAFETY
-# ============================================================================
-PENDING_TRADES = {}
-DAILY_LOSS_LIMIT = -500.0
-DAILY_PNL = 0.0
-MAX_POSITION_PCT = 0.01
 
 @bot.command()
 async def trade(ctx, action: str = "", asset: str = "", amount: str = ""):
@@ -1824,109 +1887,62 @@ async def forecast(ctx, *, topic: str = "markets"):
 
 @bot.command(name="help-tj")
 async def help_tj(ctx):
-    """Show all TraderJoes commands."""
-    help_text = (
+    """Full command reference."""
+    p1 = (
         "**TraderJoes Trading Firm — Command Reference**\n"
         "================================\n"
         "**Portfolio & Balances:**\n"
-        "  `!portfolio` — Live balances across all 5 platforms\n"
+        "  `!portfolio` — Live balances (5 platforms + USD totals)\n"
         "  `!status` — Integration health check\n"
+        "  `!ping` — Bot health check\n"
         "\n**Scanning & Analysis:**\n"
         "  `!cycle` — EV scan: Kalshi + Polymarket + Crypto\n"
         "  `!analyze <question>` — AI market analysis\n"
         "  `!forecast [topic]` — News sentiment + market forecast\n"
-        "\n**Trading:**\n"
+    )
+    await ctx.send(p1)
+    p2 = (
+        "**Trading:**\n"
         "  `!trade buy/sell <asset> <amount>` — Propose trade\n"
         "  `!confirm-trade` / `!cancel-trade` — Execute or cancel\n"
         "  `!paper-status` — Paper portfolio\n"
         "  `!paper-trade buy/sell <market> @ <price> x<size>` — Simulated trade\n"
-        "  `!switch-mode paper/live` — Toggle mode\n"
+        "  `!auto-paper on/off` — Auto-execute high-EV in paper mode\n"
+        "  `!switch-mode paper/live` — Toggle trading mode\n"
         "\n**Backtesting:**\n"
-        "  `!backtest <strategy>` — Standard backtest\n"
-        "  `!backtest-advanced <strategy>` — Full MC + particle filter + copula\n"
-        "\n**Reporting:**\n"
+        "  `!backtest <strategy>` — Standard walk-forward backtest\n"
+        "  `!backtest-advanced <strategy>` — MC + particle filter + copula\n"
+        "  `!backtest-real <coin> <strategy> <days>` — Real CoinGecko data\n"
+    )
+    await ctx.send(p2)
+    p3 = (
+        "**Reporting & Analytics:**\n"
         "  `!daily` / `!report` — Full performance report\n"
+        "  `!analytics` — Equity curve, Sharpe, drawdown, PnL\n"
+        "  `!costs` — OpenAI spend + safety status\n"
+        "  `!signals [recent|stats|all]` — Signal history & learning\n"
+        "  `!resolve-signal <idx> win/loss` — Mark signal outcome\n"
         "  `!log <message>` — Log to GitHub\n"
-        "\n**System:**\n"
-        "  `!agents` — Multi-agent status\n"
+        "\n**System & Memory:**\n"
+        "  `!agents` — Multi-agent status (8 agents)\n"
         "  `!memory [view|add-rule|add-lesson|track]` — AgentKeeper\n"
         "  `!context [hot|domain|cold|all]` — 3-tier context memory\n"
+        "  `!save` / `!load` — Persist/restore all state\n"
+    )
+    await ctx.send(p3)
+    p4 = (
+        "**Safety & Config:**\n"
         "  `!security` — ClawJacked protection status\n"
+        "  `!alerts [on|off|threshold|cooldown]` — Auto-alert config\n"
+        "  `!kill-switch [on|off]` — Emergency trading halt\n"
         "  `!set-cycle <interval>` — Set scan interval (e.g. 5m)\n"
         "  `!pause-cycle` — Pause/resume auto-scan\n"
-        "  `!ping` — Bot health check\n"
+        "  `!studio` — OpenClaw Studio dashboard info\n"
         "  `!help-tj` — This help message\n"
-        "================================"
+        "================================\n"
+        "Dashboards: http://89.167.108.136:3000 | http://89.167.108.136:19999"
     )
-    await ctx.send(help_text)
-
-
-
-
-# ============================================================================
-# PERFORMANCE ANALYTICS + NETDATA METRICS
-# ============================================================================
-import socket as _socket
-
-ANALYTICS = {
-    "total_trades": 0,
-    "winning_trades": 0,
-    "losing_trades": 0,
-    "total_pnl": 0.0,
-    "peak_equity": 10000.0,
-    "current_equity": 10000.0,
-    "max_drawdown": 0.0,
-    "daily_pnl_history": [],
-    "platform_pnl": {"kalshi": 0.0, "polymarket": 0.0, "robinhood": 0.0, "coinbase": 0.0, "phemex": 0.0},
-    "openai_calls": 0,
-    "openai_tokens": 0,
-    "openai_cost_usd": 0.0,
-    "openai_monthly_limit": 10.0,
-}
-
-
-def push_netdata_metric(key, value):
-    """Push a metric to Netdata via StatsD (UDP)."""
-    try:
-        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
-        msg = f"traderjoes.{key}:{value}|g"
-        sock.sendto(msg.encode(), ("127.0.0.1", 8125))
-        sock.close()
-    except Exception:
-        pass
-
-
-def push_all_analytics():
-    """Push all analytics metrics to Netdata."""
-    a = ANALYTICS
-    push_netdata_metric("equity", a["current_equity"])
-    push_netdata_metric("pnl_total", a["total_pnl"])
-    push_netdata_metric("trades_total", a["total_trades"])
-    push_netdata_metric("win_rate", (a["winning_trades"] / max(a["total_trades"], 1)) * 100)
-    push_netdata_metric("max_drawdown", a["max_drawdown"])
-    push_netdata_metric("openai_cost", a["openai_cost_usd"])
-    push_netdata_metric("openai_calls", a["openai_calls"])
-    for platform, pnl in a["platform_pnl"].items():
-        push_netdata_metric(f"pnl_{platform}", pnl)
-
-    # Calculate Sharpe (annualized, simplified)
-    if len(a["daily_pnl_history"]) > 1:
-        import statistics
-        mean_pnl = statistics.mean(a["daily_pnl_history"])
-        std_pnl = statistics.stdev(a["daily_pnl_history"]) or 1
-        sharpe = (mean_pnl / std_pnl) * (252 ** 0.5)
-        push_netdata_metric("sharpe_ratio", round(sharpe, 2))
-
-
-def track_openai_usage(tokens_used, model="gpt-4o-mini"):
-    """Track OpenAI API usage and costs."""
-    ANALYTICS["openai_calls"] += 1
-    ANALYTICS["openai_tokens"] += tokens_used
-    # Pricing: gpt-4o-mini ~ $0.15/1M input + $0.60/1M output, estimate avg
-    cost_per_1k = 0.0004 if "mini" in model else 0.003
-    cost = (tokens_used / 1000) * cost_per_1k
-    ANALYTICS["openai_cost_usd"] += cost
-    push_netdata_metric("openai_cost", ANALYTICS["openai_cost_usd"])
+    await ctx.send(p4)
 
 
 @bot.command(name="analytics")
@@ -2614,6 +2630,10 @@ async def execute_kalshi_order(action, ticker, amount):
     """Place a real order on Kalshi. Returns (success, message)."""
     if not KALSHI_API_KEY_ID or not KALSHI_PRIVATE_KEY:
         return False, "Kalshi API keys not configured"
+    # DRY_RUN_MODE check
+    if DRY_RUN_MODE:
+        log.info("DRY RUN: %s %s — order NOT sent", action, ticker if 'ticker' in dir() else symbol if 'symbol' in dir() else amount)
+        return True, f"DRY RUN: {action} order logged but not sent (dry-run mode)"
     try:
         # Get auth token
         ts = str(int(time.time()))
@@ -2659,6 +2679,10 @@ async def execute_phemex_order(action, symbol, amount):
     """Place a real order on Phemex. Returns (success, message)."""
     if not PHEMEX_API_KEY or not PHEMEX_API_SECRET:
         return False, "Phemex API keys not configured"
+    # DRY_RUN_MODE check
+    if DRY_RUN_MODE:
+        log.info("DRY RUN: %s %s — order NOT sent", action, ticker if 'ticker' in dir() else symbol if 'symbol' in dir() else amount)
+        return True, f"DRY RUN: {action} order logged but not sent (dry-run mode)"
     try:
         ts = str(int(time.time()))
         path = "/orders"
@@ -2867,6 +2891,10 @@ async def execute_coinbase_order(action, symbol, amount):
     """Place an order on Coinbase Advanced Trade API. Returns (success, message)."""
     if not COINBASE_API_KEY or not COINBASE_API_SECRET:
         return False, "Coinbase API keys not configured"
+    # DRY_RUN_MODE check
+    if DRY_RUN_MODE:
+        log.info("DRY RUN: %s %s — order NOT sent", action, ticker if 'ticker' in dir() else symbol if 'symbol' in dir() else amount)
+        return True, f"DRY RUN: {action} order logged but not sent (dry-run mode)"
     try:
         import jwt as _jwt, time as _time, secrets as _secrets, uuid as _uuid
         
@@ -2916,6 +2944,10 @@ async def execute_robinhood_order(action, symbol, amount):
     """Place an order via Robinhood Crypto API. Returns (success, message)."""
     if not ROBINHOOD_API_KEY or not ROBINHOOD_PRIVATE_KEY:
         return False, "Robinhood API keys not configured"
+    # DRY_RUN_MODE check
+    if DRY_RUN_MODE:
+        log.info("DRY RUN: %s %s — order NOT sent", action, ticker if 'ticker' in dir() else symbol if 'symbol' in dir() else amount)
+        return True, f"DRY RUN: {action} order logged but not sent (dry-run mode)"
     try:
         import base64, time as _time, uuid as _uuid
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -2960,6 +2992,26 @@ async def execute_robinhood_order(action, symbol, amount):
             return False, f"Robinhood error: {r.status_code} {r.text[:200]}"
     except Exception as exc:
         return False, f"Robinhood execution error: {exc}"
+
+
+
+
+DRY_RUN_MODE = True  # When True, live orders are logged but not sent
+
+
+@bot.command(name="dry-run")
+async def dry_run_cmd(ctx, action: str = ""):
+    """Toggle dry-run mode. Usage: !dry-run on/off"""
+    global DRY_RUN_MODE
+    if action.lower() == "on":
+        DRY_RUN_MODE = True
+        await ctx.send("**Dry-run ON** — Live orders will be logged but NOT sent.")
+    elif action.lower() == "off":
+        DRY_RUN_MODE = False
+        await ctx.send("**Dry-run OFF** — Live orders WILL be sent to exchanges. Be careful!")
+    else:
+        status = "ON (safe)" if DRY_RUN_MODE else "OFF (live orders enabled)"
+        await ctx.send(f"Dry-run mode: **{status}**\nUsage: `!dry-run on` or `!dry-run off`")
 
 
 # ============================================================================
