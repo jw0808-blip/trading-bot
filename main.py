@@ -2344,6 +2344,278 @@ async def signals_cmd(ctx, action: str = "recent"):
         await ctx.send("\n".join(lines))
 
 
+
+
+# ============================================================================
+# PERSISTENT MEMORY — Save/Load to JSON files
+# ============================================================================
+import json as _json
+
+MEMORY_FILE = "/app/data/agent_memory.json"
+CONTEXT_FILE = "/app/data/context_memory.json"
+SIGNALS_FILE = "/app/data/signal_history.json"
+ANALYTICS_FILE = "/app/data/analytics.json"
+PAPER_FILE = "/app/data/paper_portfolio.json"
+
+
+def _ensure_data_dir():
+    """Ensure /app/data directory exists."""
+    import os
+    os.makedirs("/app/data", exist_ok=True)
+
+
+def save_all_state():
+    """Save all persistent state to JSON files."""
+    _ensure_data_dir()
+    try:
+        with open(MEMORY_FILE, "w") as f:
+            _json.dump(AGENT_MEMORY, f, indent=2, default=str)
+    except Exception as e:
+        log.warning("Save memory error: %s", e)
+    try:
+        with open(CONTEXT_FILE, "w") as f:
+            _json.dump(CONTEXT_MEMORY, f, indent=2, default=str)
+    except Exception as e:
+        log.warning("Save context error: %s", e)
+    try:
+        with open(SIGNALS_FILE, "w") as f:
+            _json.dump(SIGNAL_HISTORY, f, indent=2, default=str)
+    except Exception as e:
+        log.warning("Save signals error: %s", e)
+    try:
+        with open(ANALYTICS_FILE, "w") as f:
+            _json.dump(ANALYTICS, f, indent=2, default=str)
+    except Exception as e:
+        log.warning("Save analytics error: %s", e)
+    try:
+        with open(PAPER_FILE, "w") as f:
+            _json.dump(PAPER_PORTFOLIO, f, indent=2, default=str)
+    except Exception as e:
+        log.warning("Save paper error: %s", e)
+
+
+def load_all_state():
+    """Load all persistent state from JSON files."""
+    global AGENT_MEMORY, CONTEXT_MEMORY, SIGNAL_HISTORY, ANALYTICS, PAPER_PORTFOLIO
+    _ensure_data_dir()
+    try:
+        with open(MEMORY_FILE, "r") as f:
+            loaded = _json.load(f)
+            AGENT_MEMORY.update(loaded)
+            log.info("Loaded AgentKeeper memory (%d rules, %d lessons)", len(AGENT_MEMORY.get("risk_rules",[])), len(AGENT_MEMORY.get("lessons",[])))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("Load memory error: %s", e)
+    try:
+        with open(CONTEXT_FILE, "r") as f:
+            loaded = _json.load(f)
+            for tier in ["hot", "domain", "cold"]:
+                if tier in loaded:
+                    CONTEXT_MEMORY[tier].update(loaded[tier])
+            log.info("Loaded context memory")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("Load context error: %s", e)
+    try:
+        with open(SIGNALS_FILE, "r") as f:
+            loaded = _json.load(f)
+            SIGNAL_HISTORY.extend(loaded)
+            log.info("Loaded %d signals from history", len(loaded))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("Load signals error: %s", e)
+    try:
+        with open(ANALYTICS_FILE, "r") as f:
+            loaded = _json.load(f)
+            ANALYTICS.update(loaded)
+            log.info("Loaded analytics state")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("Load analytics error: %s", e)
+    try:
+        with open(PAPER_FILE, "r") as f:
+            loaded = _json.load(f)
+            PAPER_PORTFOLIO.update(loaded)
+            log.info("Loaded paper portfolio (cash: $%.2f, %d positions)", PAPER_PORTFOLIO.get("cash", 0), len(PAPER_PORTFOLIO.get("positions", [])))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("Load paper error: %s", e)
+
+
+@bot.command(name="save")
+async def save_cmd(ctx):
+    """Manually save all state to disk."""
+    save_all_state()
+    await ctx.send("All state saved to disk (memory, context, signals, analytics, paper portfolio).")
+
+
+@bot.command(name="load")
+async def load_cmd(ctx):
+    """Manually load all state from disk."""
+    load_all_state()
+    await ctx.send("All state loaded from disk.")
+
+
+
+
+@bot.command(name="resolve-signal")
+async def resolve_signal(ctx, index: int = -1, outcome: str = ""):
+    """Mark a signal as resolved with P&L. Usage: !resolve-signal 3 win or !resolve-signal 3 loss"""
+    if not SIGNAL_HISTORY:
+        await ctx.send("No signals to resolve.")
+        return
+    if index < 0 or index >= len(SIGNAL_HISTORY):
+        index = len(SIGNAL_HISTORY) - 1
+    if outcome.lower() not in ["win", "loss", "push"]:
+        await ctx.send("Usage: `!resolve-signal <index> win/loss/push`")
+        return
+
+    signal = SIGNAL_HISTORY[index]
+    ev = signal.get("ev", 0)
+    size = signal.get("size", 100)
+
+    if outcome.lower() == "win":
+        pnl = size * ev * 2  # simplified: won double the EV
+        signal["pnl"] = pnl
+        signal["outcome"] = "WIN"
+        ANALYTICS["winning_trades"] += 1
+        ANALYTICS["total_pnl"] += pnl
+    elif outcome.lower() == "loss":
+        pnl = -size * 0.5  # simplified: lost half the position
+        signal["pnl"] = pnl
+        signal["outcome"] = "LOSS"
+        ANALYTICS["losing_trades"] += 1
+        ANALYTICS["total_pnl"] += pnl
+    else:
+        signal["pnl"] = 0
+        signal["outcome"] = "PUSH"
+
+    save_all_state()
+    await ctx.send(f"Signal #{index} resolved: **{signal['outcome']}** | P&L: ${signal['pnl']:+,.2f}\n{signal['market'][:60]}")
+
+
+
+
+# ============================================================================
+# RATE LIMITING
+# ============================================================================
+from collections import defaultdict as _defaultdict
+
+RATE_LIMITS = _defaultdict(list)  # user_id -> [timestamps]
+RATE_LIMIT_MAX = 10  # max commands per minute
+RATE_LIMIT_WINDOW = 60  # seconds
+
+
+def check_rate_limit(user_id):
+    """Check if user is rate limited. Returns True if allowed."""
+    now = time.time()
+    # Clean old entries
+    RATE_LIMITS[user_id] = [t for t in RATE_LIMITS[user_id] if now - t < RATE_LIMIT_WINDOW]
+    if len(RATE_LIMITS[user_id]) >= RATE_LIMIT_MAX:
+        return False
+    RATE_LIMITS[user_id].append(now)
+    return True
+
+
+@bot.check
+async def global_rate_check(ctx):
+    """Global rate limiter for all commands."""
+    if not check_rate_limit(ctx.author.id):
+        await ctx.send(f"Rate limited — max {RATE_LIMIT_MAX} commands per minute. Please wait.")
+        return False
+    # Prompt injection check on command content
+    is_suspicious, pattern = check_prompt_injection(ctx.message.content)
+    if is_suspicious:
+        SECURITY_LOG.append(f"[{datetime.now(timezone.utc).strftime('%H:%M')}] Blocked injection: {pattern} from {ctx.author}")
+        BLOCKED_COMMANDS.append(ctx.message.content[:100])
+        await ctx.send(f"**BLOCKED:** Suspicious input detected (`{pattern}`)")
+        return False
+    return True
+
+
+
+
+# ============================================================================
+# LIVE EXECUTION FRAMEWORK
+# ============================================================================
+
+async def execute_kalshi_order(action, ticker, amount):
+    """Place a real order on Kalshi. Returns (success, message)."""
+    if not KALSHI_API_KEY_ID or not KALSHI_PRIVATE_KEY:
+        return False, "Kalshi API keys not configured"
+    try:
+        # Get auth token
+        ts = str(int(time.time()))
+        method = "POST"
+        path = "/trade-api/v2/portfolio/orders"
+        msg = ts + "\n" + method + "\n" + path + "\n"
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding, utils
+        pk_bytes = KALSHI_PRIVATE_KEY.encode()
+        if "BEGIN" in KALSHI_PRIVATE_KEY:
+            private_key = serialization.load_pem_private_key(pk_bytes, password=None)
+        else:
+            import base64
+            der = base64.b64decode(KALSHI_PRIVATE_KEY)
+            private_key = serialization.load_der_private_key(der, password=None)
+        sig = private_key.sign(msg.encode(), padding.PKCS1v15(), hashes.SHA256())
+        import base64
+        sig_b64 = base64.b64encode(sig).decode()
+
+        side = "yes" if action.upper() == "BUY" else "no"
+        order_data = {
+            "ticker": ticker,
+            "type": "market",
+            "action": action.lower(),
+            "side": side,
+            "count": int(amount / 0.50),  # approximate shares
+        }
+
+        headers = {
+            "Authorization": f"Bearer {KALSHI_API_KEY_ID}",
+            "Content-Type": "application/json",
+        }
+        r = requests.post(f"https://api.elections.kalshi.com{path}", json=order_data, headers=headers, timeout=15)
+        if r.status_code in (200, 201):
+            return True, f"Kalshi order placed: {action} {ticker} ${amount:.2f}"
+        else:
+            return False, f"Kalshi API error: {r.status_code} {r.text[:200]}"
+    except Exception as exc:
+        return False, f"Kalshi execution error: {exc}"
+
+
+async def execute_phemex_order(action, symbol, amount):
+    """Place a real order on Phemex. Returns (success, message)."""
+    if not PHEMEX_API_KEY or not PHEMEX_API_SECRET:
+        return False, "Phemex API keys not configured"
+    try:
+        ts = str(int(time.time()))
+        path = "/orders"
+        query = f"symbol={symbol}&side={action.title()}&orderQty={amount}&ordType=Market"
+        msg = path + query + ts
+        import hmac, hashlib
+        sig = hmac.new(PHEMEX_API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+
+        headers = {
+            "x-phemex-access-token": PHEMEX_API_KEY,
+            "x-phemex-request-signature": sig,
+            "x-phemex-request-expiry": ts,
+            "Content-Type": "application/json",
+        }
+        r = requests.post(f"https://api.phemex.com{path}?{query}", headers=headers, timeout=15)
+        if r.status_code == 200:
+            return True, f"Phemex order placed: {action} {symbol} ${amount:.2f}"
+        else:
+            return False, f"Phemex API error: {r.status_code} {r.text[:200]}"
+    except Exception as exc:
+        return False, f"Phemex execution error: {exc}"
+
+
 # ============================================================================
 # ENTRY POINT
 # ============================================================================

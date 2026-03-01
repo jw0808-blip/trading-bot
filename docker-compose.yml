@@ -1,4 +1,3 @@
-version: "3.9"
 
 services:
   traderjoes-bot:
@@ -11,6 +10,7 @@ services:
       - .env
     volumes:
       - bot-logs:/app/logs
+      - ./data:/app/data
     logging:
       driver: json-file
       options:
@@ -18,27 +18,20 @@ services:
         max-file: "3"
 
   openclaw:
-    image: node:22-slim
+    build:
+      context: .
+      dockerfile: Dockerfile.openclaw
     container_name: traderjoes-openclaw
     restart: unless-stopped
-    working_dir: /root
-    command: >
-      bash -c "npm install -g openclaw@latest 2>/dev/null; openclaw gateway"
-    env_file:
-      - .env
-    volumes:
-      - ./skills:/root/.openclaw/skills
-      - skills-venv:/root/traderjoes-skills
     ports:
       - "3000:3000"
+    volumes:
+      - ./data:/app/data
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
-
-
-
   netdata:
     image: netdata/netdata:stable
     container_name: traderjoes-netdata
@@ -62,7 +55,6 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
 
 volumes:
-  skills-venv:
   bot-logs:
   netdataconfig:
   netdatalib:
