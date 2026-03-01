@@ -1,0 +1,12 @@
+{
+  "strategies": {},
+  "risk_rules": [
+    "Max 1% portfolio per trade",
+    "Daily loss limit: $500",
+    "Never trade during first/last 5 min of session",
+    "Cut losses at 2x expected loss",
+    "No more than 3 correlated positions"
+  ],
+  "performance_log": [],
+  "lessons": []
+}

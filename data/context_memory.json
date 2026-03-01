@@ -1,0 +1,37 @@
+{
+  "hot": {
+    "max_position_pct": 0.01,
+    "daily_loss_limit": -500,
+    "trading_mode": "paper",
+    "risk_tolerance": "conservative",
+    "platforms": [
+      "kalshi",
+      "polymarket",
+      "robinhood",
+      "coinbase",
+      "phemex"
+    ]
+  },
+  "domain": {
+    "prediction_markets": {
+      "min_ev_threshold": 0.02,
+      "prefer_liquid_markets": true,
+      "arb_min_spread": 0.02
+    },
+    "crypto": {
+      "momentum_threshold_24h": 8.0,
+      "min_volume_usd": 10000000,
+      "prefer_large_cap": true
+    },
+    "analysis": {
+      "model": "gpt-4o-mini",
+      "fallback_model": "gpt-3.5-turbo",
+      "max_tokens": 600
+    }
+  },
+  "cold": {
+    "historical_performance": [],
+    "market_regimes": [],
+    "strategy_notes": []
+  }
+}
