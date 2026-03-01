@@ -31,25 +31,14 @@ services:
       - ./skills:/root/.openclaw/skills
       - skills-venv:/root/traderjoes-skills
     ports:
-      - "127.0.0.1:3000:3000"
+      - "3000:3000"
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
 
-  watchtower:
-    image: containrrr/watchtower
-    container_name: watchtower
-    restart: unless-stopped
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    command: --interval 3600 --cleanup
 
-volumes:
-  bot-logs:
-  openclaw-data:
-  skills-venv:
 
   netdata:
     image: netdata/netdata:stable
@@ -69,19 +58,14 @@ volumes:
       - netdatacache:/var/cache/netdata
       - /etc/passwd:/host/etc/passwd:ro
       - /etc/group:/host/etc/group:ro
-      - /etc/localtime:/etc/localtime:ro
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    environment:
-      - DOCKER_HOST=unix:///var/run/docker.sock
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:19999/api/v1/info"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
 
 volumes:
+  skills-venv:
+  bot-logs:
+  openclaw-data:
   netdataconfig:
   netdatalib:
   netdatacache:

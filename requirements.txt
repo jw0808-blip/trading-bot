@@ -7,3 +7,4 @@ aiohttp
 python-dotenv
 web3
 PyJWT
+py-clob-client

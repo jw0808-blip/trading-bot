@@ -1,34 +1,8 @@
-# Environment
 .env
-.env.local
-
-# Python
+*.bak
+*.bak.*
 __pycache__/
 *.pyc
-*.pyo
-.venv/
-venv/
-*.egg-info/
-
-# Node
 node_modules/
-package-lock.json
-
-# OS
-.DS_Store
-Thumbs.db
-
-# IDE
-.vscode/
-.idea/
-
-# Docker
-docker-compose.override.yml
-
-# Logs
-*.log
-
-# Secrets
-*.pem
-*.key
-id_*
+.venv/
+logs/
