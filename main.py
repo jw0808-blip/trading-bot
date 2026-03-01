@@ -931,7 +931,7 @@ def get_market_forecast():
     headlines = fetch_market_news("crypto markets economy")
     sentiment = score_sentiment(headlines)
     fng_val, fng_label = get_fear_greed()
-    detect_regime()  # Update regime
+
 
     # Composite score: 50% F&G + 50% news sentiment
     composite = int(fng_val * 0.5 + (sentiment + 50) * 0.5)
@@ -1056,7 +1056,7 @@ async def cycle(ctx):
     msg = await ctx.send("Running EV scan across ALL platforms...")
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     fng_val, fng_label = get_fear_greed()
-    detect_regime()  # Update regime
+
     kalshi_opps = find_kalshi_opportunities()
     poly_opps = find_polymarket_opportunities()
     crypto_opps = find_crypto_momentum()
@@ -1490,9 +1490,15 @@ async def report(ctx):
     await _send_daily_report(ctx.channel)
 
 async def _send_daily_report(channel):
+    # V9 OVERSIGHT
+    try:
+        oversight_report = await run_ai_oversight(channel)
+        await channel.send(oversight_report)
+    except Exception:
+        pass
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     fng_val, fng_label = get_fear_greed()
-    detect_regime()  # Update regime
+
     kalshi=get_kalshi_balance(); poly=get_polymarket_balance()
     rh=get_robinhood_balance(); cb=get_coinbase_balance(); ph=get_phemex_balance()
     pc=PAPER_PORTFOLIO["cash"]; pv=sum(p.get("value",0) for p in PAPER_PORTFOLIO["positions"])
@@ -2275,6 +2281,11 @@ async def alert_scan_task():
         if not CYCLE_PAUSED and not COST_CONFIG.get("kill_switch", False):
             await check_and_send_alerts()
             push_all_analytics()  # push metrics each cycle
+                    # V9 EXIT CHECK
+                    try:
+                        await check_and_manage_exits(ch)
+                    except Exception as eex:
+                        log.warning("Exit check error: %s", eex)
     except Exception as exc:
         log.warning("Alert scan error: %s", exc)
 
@@ -2312,7 +2323,7 @@ def record_signal(opp, executed=False, paper=True):
     }
     try:
         fng_val, fng_label = get_fear_greed()
-    detect_regime()  # Update regime
+
         signal["fng"] = fng_val
     except Exception:
         pass
@@ -2520,6 +2531,7 @@ def _ensure_data_dir():
 
 
 def save_all_state():
+    save_positions()  # V9: save positions too
     """Save all persistent state to JSON files."""
     _ensure_data_dir()
     try:
@@ -3342,7 +3354,7 @@ def detect_regime():
     """Detect market regime based on Fear & Greed Index."""
     try:
         fng_val, fng_label = get_fear_greed()
-    detect_regime()  # Update regime
+
     except Exception:
         fng_val = 50
         fng_label = "Neutral"
@@ -3774,6 +3786,601 @@ async def edge_analysis(ctx, *, query: str = ""):
     if len(report) > 1900:
         report = report[:1900] + "\n*...truncated*"
     await msg.edit(content=report)
+
+
+
+
+# ============================================================================
+# V9: FULL AUTONOMOUS EXECUTION ENGINE
+# ============================================================================
+import json as _json
+import os as _os
+
+AUTO_LIVE_CONFIG = {
+    "enabled": True,
+    "min_ev": 0.05,           # 5% minimum EV
+    "min_edge_score": 65,     # MEDIUM+ confidence
+    "max_position_pct": 0.0025,  # 0.25% max per trade (tiny start)
+    "max_daily_trades": 20,
+    "max_concurrent_positions": 10,
+    "daily_loss_halt": -200,  # Halt if daily P&L drops below this
+    "drawdown_halt_pct": 5.0, # Halt if drawdown exceeds 5%
+    "trades_today": 0,
+    "last_trade_reset": "",
+}
+
+# Position tracker for open trades
+OPEN_POSITIONS = []
+CLOSED_POSITIONS = []
+POSITION_FILE = "/app/data/positions.json"
+TRADE_AUDIT_LOG = []
+
+
+def save_positions():
+    """Save open and closed positions to disk."""
+    try:
+        data = {
+            "open": OPEN_POSITIONS,
+            "closed": CLOSED_POSITIONS[-100:],  # Keep last 100 closed
+            "audit_log": TRADE_AUDIT_LOG[-200:],
+            "config": AUTO_LIVE_CONFIG,
+        }
+        with open(POSITION_FILE, "w") as f:
+            _json.dump(data, f, indent=2, default=str)
+    except Exception as exc:
+        log.warning("Save positions error: %s", exc)
+
+
+def load_positions():
+    """Load positions from disk on startup."""
+    global OPEN_POSITIONS, CLOSED_POSITIONS, TRADE_AUDIT_LOG
+    try:
+        if _os.path.exists(POSITION_FILE):
+            with open(POSITION_FILE, "r") as f:
+                data = _json.load(f)
+            OPEN_POSITIONS = data.get("open", [])
+            CLOSED_POSITIONS = data.get("closed", [])
+            TRADE_AUDIT_LOG = data.get("audit_log", [])
+            saved_config = data.get("config", {})
+            for k, v in saved_config.items():
+                if k in AUTO_LIVE_CONFIG:
+                    AUTO_LIVE_CONFIG[k] = v
+            log.info("Loaded %d open positions, %d closed", len(OPEN_POSITIONS), len(CLOSED_POSITIONS))
+    except Exception as exc:
+        log.warning("Load positions error: %s", exc)
+
+
+def audit_log(action, details):
+    """Log every action for full audit trail."""
+    entry = {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "action": action,
+        "details": details,
+    }
+    TRADE_AUDIT_LOG.append(entry)
+    log.info("AUDIT: %s — %s", action, str(details)[:200])
+    # Keep manageable
+    while len(TRADE_AUDIT_LOG) > 500:
+        TRADE_AUDIT_LOG.pop(0)
+
+
+def reset_daily_counters():
+    """Reset daily trade counters at midnight UTC."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if AUTO_LIVE_CONFIG["last_trade_reset"] != today:
+        AUTO_LIVE_CONFIG["trades_today"] = 0
+        AUTO_LIVE_CONFIG["last_trade_reset"] = today
+        global DAILY_PNL
+        DAILY_PNL = 0.0
+        audit_log("DAILY_RESET", {"date": today})
+
+
+def check_safety_gates():
+    """Check all safety conditions before allowing a trade. Returns (ok, reason)."""
+    # Kill switch
+    if not AUTO_LIVE_CONFIG.get("enabled", True):
+        return False, "Auto-execution disabled"
+    
+    # Daily trade limit
+    if AUTO_LIVE_CONFIG["trades_today"] >= AUTO_LIVE_CONFIG["max_daily_trades"]:
+        return False, f"Daily trade limit reached ({AUTO_LIVE_CONFIG['max_daily_trades']})"
+    
+    # Max concurrent positions
+    if len(OPEN_POSITIONS) >= AUTO_LIVE_CONFIG["max_concurrent_positions"]:
+        return False, f"Max concurrent positions ({AUTO_LIVE_CONFIG['max_concurrent_positions']})"
+    
+    # Daily loss halt
+    if DAILY_PNL <= AUTO_LIVE_CONFIG["daily_loss_halt"]:
+        return False, f"Daily loss limit hit (${DAILY_PNL:,.2f})"
+    
+    # Drawdown halt
+    dd = ANALYTICS.get("max_drawdown", 0)
+    if dd >= AUTO_LIVE_CONFIG["drawdown_halt_pct"]:
+        return False, f"Drawdown halt ({dd:.1f}% >= {AUTO_LIVE_CONFIG['drawdown_halt_pct']}%)"
+    
+    return True, "All gates passed"
+
+
+async def auto_execute_opportunity(opp, channel):
+    """Automatically execute a trade for a high-scoring opportunity."""
+    reset_daily_counters()
+    
+    # Safety check
+    safe, reason = check_safety_gates()
+    if not safe:
+        audit_log("BLOCKED", {"reason": reason, "market": opp.get("market", "")[:50]})
+        return False
+    
+    # Score the opportunity
+    try:
+        edge_score, confidence, signals = calculate_edge_score(opp)
+    except Exception:
+        edge_score, confidence, signals = 0, "SKIP", []
+    
+    # Check minimum thresholds
+    ev = opp.get("ev", 0)
+    if ev < AUTO_LIVE_CONFIG["min_ev"]:
+        return False
+    if edge_score < AUTO_LIVE_CONFIG["min_edge_score"]:
+        return False
+    if confidence in ("LOW", "SKIP"):
+        return False
+    
+    # Calculate position size (quarter-Kelly with regime + tiny cap)
+    bankroll = ANALYTICS.get("current_equity", 10000)
+    size = suggest_position_size_v2(opp, bankroll)
+    
+    # Apply V9 tiny-start cap
+    max_size = bankroll * AUTO_LIVE_CONFIG["max_position_pct"]
+    size = min(size, max_size)
+    
+    if size < 1:
+        return False  # Too small to trade
+    
+    # Build position record
+    market = opp.get("market", "Unknown")[:80]
+    platform = opp.get("platform", "Unknown")
+    yes_price = opp.get("yes_price", 0)
+    
+    # Calculate stops and targets
+    entry_price = yes_price if yes_price > 0 else 0.5
+    stop_price = max(entry_price * 0.7, 0.01)  # 30% stop
+    target_price = min(entry_price * 1.6, 0.99)  # 60% target (2:1 R:R)
+    
+    position = {
+        "id": f"POS-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{len(OPEN_POSITIONS)}",
+        "market": market,
+        "platform": platform,
+        "action": "BUY",
+        "asset": opp.get("ticker", opp.get("slug", market[:20])),
+        "size_usd": size,
+        "entry_price": entry_price,
+        "stop_price": stop_price,
+        "target_price": target_price,
+        "trailing_stop": stop_price,
+        "ev": ev,
+        "edge_score": edge_score,
+        "confidence": confidence,
+        "signals": signals,
+        "opened_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "status": "OPEN",
+        "pnl": 0,
+    }
+    
+    # Execute the order
+    success = False
+    exec_msg = ""
+    
+    if TRADING_MODE == "live":
+        # Route to correct exchange
+        asset = position["asset"]
+        if platform == "Kalshi" or asset.startswith("KX"):
+            success, exec_msg = await execute_kalshi_order("BUY", asset, size)
+        elif platform == "Polymarket":
+            # Polymarket needs on-chain execution — log as pending
+            success = True
+            exec_msg = f"PAPER-ROUTED: Polymarket on-chain not yet automated. Logged for manual review."
+        elif asset in ("BTC", "ETH", "DOGE", "XRP", "SOL", "ALGO", "SHIB", "XLM", "HBAR"):
+            success, exec_msg = await execute_coinbase_order("BUY", asset, size)
+        elif asset.endswith("USDT") or asset.endswith("PERP"):
+            success, exec_msg = await execute_phemex_order("BUY", asset, size)
+        else:
+            success = True
+            exec_msg = f"PAPER-ROUTED: No direct execution path for {platform}. Logged."
+    else:
+        # Paper mode — always succeeds
+        success = True
+        exec_msg = "Paper trade executed"
+        PAPER_PORTFOLIO["trades"].append({
+            "action": "BUY",
+            "market": market,
+            "price": entry_price,
+            "size": size,
+            "timestamp": position["opened_at"],
+        })
+    
+    if success:
+        OPEN_POSITIONS.append(position)
+        AUTO_LIVE_CONFIG["trades_today"] += 1
+        ANALYTICS["total_trades"] += 1
+        
+        audit_log("TRADE_OPENED", {
+            "id": position["id"],
+            "market": market[:50],
+            "platform": platform,
+            "size": size,
+            "entry": entry_price,
+            "stop": stop_price,
+            "target": target_price,
+            "edge_score": edge_score,
+            "confidence": confidence,
+            "mode": TRADING_MODE,
+        })
+        
+        # Discord notification
+        ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
+        mode_tag = "LIVE" if TRADING_MODE == "live" else "PAPER"
+        try:
+            await channel.send(
+                f"**Auto-Trade [{mode_tag}]** | {ts}\n"
+                f"BUY {platform}: {market[:50]}\n"
+                f"Size: ${size:.2f} | Entry: ${entry_price:.3f}\n"
+                f"Stop: ${stop_price:.3f} | Target: ${target_price:.3f}\n"
+                f"Edge: {edge_score}/100 ({confidence}) | EV: +{ev*100:.1f}%\n"
+                f"{exec_msg[:100]}"
+            )
+        except Exception:
+            pass
+        
+        save_positions()
+        return True
+    
+    audit_log("TRADE_FAILED", {"market": market[:50], "error": exec_msg[:100]})
+    return False
+
+
+# ============================================================================
+# V9: AUTO-EXIT MANAGER
+# ============================================================================
+
+async def check_and_manage_exits(channel):
+    """Check all open positions and auto-exit when conditions are met."""
+    if not OPEN_POSITIONS:
+        return
+    
+    positions_to_close = []
+    
+    for pos in OPEN_POSITIONS:
+        if pos["status"] != "OPEN":
+            continue
+        
+        # For prediction markets: check current price
+        current_price = pos["entry_price"]  # Default to entry if can't fetch
+        
+        # Try to get current price from platform
+        platform = pos.get("platform", "")
+        market_title = pos.get("market", "")
+        
+        if platform == "Polymarket":
+            # Check Polymarket prices
+            try:
+                poly_markets = find_polymarket_markets_for_arb()
+                for pm in poly_markets:
+                    if pm["title"][:30].lower() in market_title[:30].lower() or market_title[:30].lower() in pm["title"][:30].lower():
+                        current_price = pm["yes_price"]
+                        break
+            except Exception:
+                pass
+        
+        # Calculate P&L
+        entry = pos["entry_price"]
+        if entry > 0:
+            pnl_pct = (current_price - entry) / entry * 100
+            pnl_usd = pos["size_usd"] * (current_price - entry) / entry
+        else:
+            pnl_pct = 0
+            pnl_usd = 0
+        
+        pos["current_price"] = current_price
+        pos["pnl"] = pnl_usd
+        
+        exit_reason = None
+        
+        # 1. Stop-loss hit
+        if current_price <= pos["stop_price"]:
+            exit_reason = f"STOP-LOSS hit (${pos['stop_price']:.3f})"
+        
+        # 2. Target hit
+        elif current_price >= pos["target_price"]:
+            exit_reason = f"TARGET hit (${pos['target_price']:.3f})"
+        
+        # 3. Trailing stop update
+        elif current_price > pos.get("trailing_stop", pos["stop_price"]):
+            # Move trailing stop up (ratchet only)
+            new_trail = current_price * 0.85  # 15% trailing stop
+            if new_trail > pos.get("trailing_stop", 0):
+                pos["trailing_stop"] = new_trail
+        
+        # 4. Check if trailing stop hit
+        if not exit_reason and current_price <= pos.get("trailing_stop", 0):
+            exit_reason = f"TRAILING STOP hit (${pos['trailing_stop']:.3f})"
+        
+        # 5. Time-based exit: close 24h before resolution (if we knew resolution time)
+        # For now, close positions older than 7 days
+        try:
+            opened = datetime.strptime(pos["opened_at"], "%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc)
+            age_hours = (datetime.now(timezone.utc) - opened).total_seconds() / 3600
+            if age_hours > 168:  # 7 days
+                exit_reason = "TIME EXIT: Position open >7 days"
+        except Exception:
+            pass
+        
+        if exit_reason:
+            positions_to_close.append((pos, exit_reason, pnl_usd))
+    
+    # Execute exits
+    for pos, reason, pnl in positions_to_close:
+        pos["status"] = "CLOSED"
+        pos["closed_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        pos["exit_reason"] = reason
+        pos["final_pnl"] = pnl
+        
+        # Update analytics
+        ANALYTICS["total_pnl"] += pnl
+        DAILY_PNL_TRACKER = globals().get("DAILY_PNL", 0)
+        if pnl > 0:
+            ANALYTICS["winning_trades"] += 1
+        else:
+            ANALYTICS["losing_trades"] += 1
+        
+        # Move to closed
+        OPEN_POSITIONS.remove(pos)
+        CLOSED_POSITIONS.append(pos)
+        
+        audit_log("TRADE_CLOSED", {
+            "id": pos["id"],
+            "market": pos["market"][:50],
+            "reason": reason,
+            "pnl": f"${pnl:+,.2f}",
+            "entry": pos["entry_price"],
+            "exit": pos.get("current_price", 0),
+        })
+        
+        # Discord notification
+        pnl_icon = "PROFIT" if pnl >= 0 else "LOSS"
+        mode_tag = "LIVE" if TRADING_MODE == "live" else "PAPER"
+        try:
+            await channel.send(
+                f"**Auto-Exit [{mode_tag}] [{pnl_icon}]**\n"
+                f"{pos['market'][:50]}\n"
+                f"Reason: {reason}\n"
+                f"P&L: ${pnl:+,.2f} | Entry: ${pos['entry_price']:.3f} → Exit: ${pos.get('current_price', 0):.3f}\n"
+                f"Position held: {pos['opened_at']} → {pos['closed_at']}"
+            )
+        except Exception:
+            pass
+    
+    if positions_to_close:
+        save_positions()
+
+
+@bot.command(name="positions")
+async def positions_cmd(ctx):
+    """Show all open positions with live P&L."""
+    if not OPEN_POSITIONS:
+        await ctx.send("No open positions.")
+        return
+    
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [f"**Open Positions** | {ts}", f"Mode: {TRADING_MODE.upper()}", "================================"]
+    
+    total_pnl = 0
+    for i, pos in enumerate(OPEN_POSITIONS):
+        pnl = pos.get("pnl", 0)
+        total_pnl += pnl
+        pnl_icon = "+" if pnl >= 0 else ""
+        lines.append(
+            f"**{i+1}. {pos['platform']}** | {pos['market'][:45]}\n"
+            f"  Size: ${pos['size_usd']:.2f} | Entry: ${pos['entry_price']:.3f}\n"
+            f"  Stop: ${pos['stop_price']:.3f} | Target: ${pos['target_price']:.3f} | Trail: ${pos.get('trailing_stop', 0):.3f}\n"
+            f"  P&L: ${pnl_icon}{pnl:.2f} | Edge: {pos.get('edge_score', 0)}/100 | {pos['opened_at']}"
+        )
+    
+    lines.append(f"\n**Total open P&L: ${total_pnl:+,.2f}** | Positions: {len(OPEN_POSITIONS)}")
+    lines.append("================================")
+    
+    report = "\n".join(lines)
+    if len(report) > 1900:
+        report = report[:1900] + "\n*...truncated*"
+    await ctx.send(report)
+
+
+@bot.command(name="closed")
+async def closed_cmd(ctx):
+    """Show recently closed positions."""
+    recent = CLOSED_POSITIONS[-10:]
+    if not recent:
+        await ctx.send("No closed positions yet.")
+        return
+    
+    lines = ["**Recently Closed Positions**", "================================"]
+    total_pnl = sum(p.get("final_pnl", 0) for p in recent)
+    wins = sum(1 for p in recent if p.get("final_pnl", 0) > 0)
+    
+    for pos in reversed(recent):
+        pnl = pos.get("final_pnl", 0)
+        icon = "WIN" if pnl > 0 else "LOSS"
+        lines.append(
+            f"[{icon}] ${pnl:+,.2f} | {pos['platform']}: {pos['market'][:40]}\n"
+            f"  {pos.get('exit_reason', 'N/A')} | {pos.get('closed_at', '')}"
+        )
+    
+    lines.append(f"\n**Net P&L: ${total_pnl:+,.2f}** | {wins}/{len(recent)} wins")
+    lines.append("================================")
+    await ctx.send("\n".join(lines))
+
+
+@bot.command(name="audit")
+async def audit_cmd(ctx, n: int = 10):
+    """Show recent audit log entries."""
+    recent = TRADE_AUDIT_LOG[-n:]
+    if not recent:
+        await ctx.send("Audit log is empty.")
+        return
+    
+    lines = [f"**Audit Log** (last {len(recent)} entries)", "================================"]
+    for entry in reversed(recent):
+        lines.append(f"`{entry['timestamp']}` **{entry['action']}** — {str(entry['details'])[:100]}")
+    
+    lines.append("================================")
+    report = "\n".join(lines)
+    if len(report) > 1900:
+        report = report[:1900] + "\n*...truncated*"
+    await ctx.send(report)
+
+
+@bot.command(name="auto-config")
+async def auto_config_cmd(ctx, key: str = "", value: str = ""):
+    """View or update auto-execution config."""
+    if not key:
+        lines = ["**Auto-Execution Config**", "================================"]
+        for k, v in AUTO_LIVE_CONFIG.items():
+            lines.append(f"  `{k}`: {v}")
+        lines.append("\nUsage: `!auto-config <key> <value>` to change")
+        lines.append("================================")
+        await ctx.send("\n".join(lines))
+        return
+    
+    if key not in AUTO_LIVE_CONFIG:
+        await ctx.send(f"Unknown key: `{key}`. Use `!auto-config` to see all keys.")
+        return
+    
+    # Convert value
+    old = AUTO_LIVE_CONFIG[key]
+    try:
+        if isinstance(old, bool):
+            AUTO_LIVE_CONFIG[key] = value.lower() in ("true", "yes", "on", "1")
+        elif isinstance(old, int):
+            AUTO_LIVE_CONFIG[key] = int(value)
+        elif isinstance(old, float):
+            AUTO_LIVE_CONFIG[key] = float(value)
+        else:
+            AUTO_LIVE_CONFIG[key] = value
+    except Exception:
+        await ctx.send(f"Invalid value for `{key}`: {value}")
+        return
+    
+    save_positions()
+    audit_log("CONFIG_CHANGED", {"key": key, "old": old, "new": AUTO_LIVE_CONFIG[key]})
+    await ctx.send(f"Updated `{key}`: {old} → {AUTO_LIVE_CONFIG[key]}")
+
+
+# ============================================================================
+# V9: AI OVERSIGHT + WATCHDOG
+# ============================================================================
+
+OVERSIGHT_CONFIG = {
+    "win_rate_floor": 40,       # Pause if win rate drops below 40%
+    "max_drawdown_halt": 5.0,   # Halt at 5% drawdown
+    "max_daily_loss": -200,     # Halt at -$200 daily
+    "consecutive_loss_halt": 5, # Halt after 5 consecutive losses
+    "last_oversight_run": "",
+}
+
+
+async def run_ai_oversight(channel):
+    """AI oversight: review performance, pause if needed, suggest improvements."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    
+    total_trades = ANALYTICS.get("total_trades", 0)
+    winning = ANALYTICS.get("winning_trades", 0)
+    losing = ANALYTICS.get("losing_trades", 0)
+    total_pnl = ANALYTICS.get("total_pnl", 0)
+    max_dd = ANALYTICS.get("max_drawdown", 0)
+    
+    win_rate = (winning / max(total_trades, 1)) * 100
+    
+    alerts = []
+    halt_trading = False
+    
+    # Check win rate
+    if total_trades >= 10 and win_rate < OVERSIGHT_CONFIG["win_rate_floor"]:
+        alerts.append(f"Win rate {win_rate:.1f}% below floor ({OVERSIGHT_CONFIG['win_rate_floor']}%)")
+        halt_trading = True
+    
+    # Check drawdown
+    if max_dd >= OVERSIGHT_CONFIG["max_drawdown_halt"]:
+        alerts.append(f"Drawdown {max_dd:.1f}% exceeds halt threshold ({OVERSIGHT_CONFIG['max_drawdown_halt']}%)")
+        halt_trading = True
+    
+    # Check daily loss
+    if DAILY_PNL <= OVERSIGHT_CONFIG["max_daily_loss"]:
+        alerts.append(f"Daily P&L ${DAILY_PNL:,.2f} below halt threshold (${OVERSIGHT_CONFIG['max_daily_loss']:,.2f})")
+        halt_trading = True
+    
+    # Check consecutive losses
+    recent_closed = CLOSED_POSITIONS[-5:]
+    consecutive_losses = 0
+    for p in reversed(recent_closed):
+        if p.get("final_pnl", 0) < 0:
+            consecutive_losses += 1
+        else:
+            break
+    if consecutive_losses >= OVERSIGHT_CONFIG["consecutive_loss_halt"]:
+        alerts.append(f"{consecutive_losses} consecutive losses — halt threshold is {OVERSIGHT_CONFIG['consecutive_loss_halt']}")
+        halt_trading = True
+    
+    if halt_trading:
+        AUTO_LIVE_CONFIG["enabled"] = False
+        audit_log("AI_HALT", {"alerts": alerts})
+        try:
+            await channel.send(
+                f"**AI OVERSIGHT ALERT** | {ts}\n"
+                f"Trading HALTED by AI oversight.\n"
+                f"Reasons:\n" + "\n".join(f"  - {a}" for a in alerts) +
+                f"\n\nUse `!auto-config enabled true` to resume after review."
+            )
+        except Exception:
+            pass
+    
+    # Build daily oversight report
+    regime = REGIME_CONFIG.get("current_regime", "UNKNOWN")
+    fng = REGIME_CONFIG.get("fng_value", "?")
+    
+    report = (
+        f"**AI Oversight Report** | {ts}\n================================\n"
+        f"Regime: {regime} | F&G: {fng}/100\n"
+        f"Mode: {TRADING_MODE.upper()} | Auto-exec: {'ON' if AUTO_LIVE_CONFIG['enabled'] else 'HALTED'}\n"
+        f"\n**Performance:**\n"
+        f"  Trades: {total_trades} | Wins: {winning} | Losses: {losing}\n"
+        f"  Win rate: {win_rate:.1f}%\n"
+        f"  Total P&L: ${total_pnl:+,.2f}\n"
+        f"  Daily P&L: ${DAILY_PNL:+,.2f}\n"
+        f"  Max drawdown: {max_dd:.1f}%\n"
+        f"\n**Positions:**\n"
+        f"  Open: {len(OPEN_POSITIONS)} | Closed today: {AUTO_LIVE_CONFIG['trades_today']}\n"
+        f"  Consecutive losses: {consecutive_losses}\n"
+    )
+    
+    if alerts:
+        report += f"\n**ALERTS:** {len(alerts)}\n" + "\n".join(f"  - {a}" for a in alerts)
+    else:
+        report += "\n**Status:** All systems nominal"
+    
+    report += "\n================================"
+    
+    OVERSIGHT_CONFIG["last_oversight_run"] = ts
+    
+    return report
+
+
+@bot.command(name="oversight")
+async def oversight_cmd(ctx):
+    """Run AI oversight check manually."""
+    report = await run_ai_oversight(ctx.channel)
+    if len(report) > 1900:
+        report = report[:1900] + "\n*...truncated*"
+    await ctx.send(report)
 
 
 # ============================================================================
