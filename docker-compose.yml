@@ -27,7 +27,6 @@ services:
     env_file:
       - .env
     volumes:
-      - openclaw-data:/root/.openclaw
       - ./skills:/root/.openclaw/skills
       - skills-venv:/root/traderjoes-skills
     ports:
@@ -65,7 +64,6 @@ services:
 volumes:
   skills-venv:
   bot-logs:
-  openclaw-data:
   netdataconfig:
   netdatalib:
   netdatacache:

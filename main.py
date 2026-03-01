@@ -2130,6 +2130,220 @@ async def before_alert_scan():
     await bot.wait_until_ready()
 
 
+
+
+# ============================================================================
+# AUTO-PAPER TRADING + LEARNING SYSTEM
+# ============================================================================
+AUTO_PAPER_ENABLED = False
+SIGNAL_HISTORY = []  # All high-EV signals: executed and not executed
+
+
+def record_signal(opp, executed=False, paper=True):
+    """Record a high-EV signal for learning."""
+    signal = {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "platform": opp.get("platform", "unknown"),
+        "market": opp.get("market", "")[:80],
+        "ev": opp.get("ev", 0),
+        "type": opp.get("type", ""),
+        "detail": opp.get("detail", "")[:100],
+        "executed": executed,
+        "paper": paper,
+        "entry_price": None,
+        "exit_price": None,
+        "pnl": None,
+        "size": suggest_position_size(opp.get("ev", 0)),
+        "fng": None,
+    }
+    try:
+        fng_val, fng_label = get_fear_greed()
+        signal["fng"] = fng_val
+    except Exception:
+        pass
+    SIGNAL_HISTORY.append(signal)
+    # Keep last 500 signals
+    if len(SIGNAL_HISTORY) > 500:
+        SIGNAL_HISTORY.pop(0)
+    return signal
+
+
+async def auto_paper_execute(channel, opp):
+    """Automatically execute a high-EV opportunity in paper mode."""
+    if not AUTO_PAPER_ENABLED:
+        return False
+    if TRADING_MODE != "paper":
+        return False
+    if COST_CONFIG.get("kill_switch", False):
+        return False
+
+    ev = opp.get("ev", 0)
+    if ev < ALERT_CONFIG["min_ev_threshold"]:
+        return False
+
+    # Calculate position size with Kelly criterion
+    size = suggest_position_size(ev)
+    price = 0.50  # default for prediction markets
+
+    # Extract price from detail if available
+    detail = opp.get("detail", "")
+    import re
+    price_match = re.search(r"\$([0-9.]+)", detail)
+    if price_match:
+        try:
+            price = float(price_match.group(1))
+            if price > 1:
+                price = price / 100  # normalize if > $1
+        except ValueError:
+            price = 0.50
+
+    # Execute paper trade
+    shares = int(size / max(price, 0.01))
+    if shares < 1:
+        shares = 1
+    cost = shares * price
+    slippage = cost * 0.005
+    fees = cost * 0.001
+    total_cost = cost + slippage + fees
+
+    if total_cost > PAPER_PORTFOLIO["cash"]:
+        return False
+
+    PAPER_PORTFOLIO["cash"] -= total_cost
+    position = {
+        "market": opp["market"][:60],
+        "side": "BUY",
+        "shares": shares,
+        "entry_price": price,
+        "cost": total_cost,
+        "value": cost,
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "platform": opp.get("platform", ""),
+    }
+    PAPER_PORTFOLIO["positions"].append(position)
+    PAPER_PORTFOLIO["trades"].append(position)
+
+    # Record signal as executed
+    signal = record_signal(opp, executed=True, paper=True)
+
+    # Update analytics
+    ANALYTICS["total_trades"] += 1
+
+    # Push to Netdata
+    try:
+        push_all_analytics()
+    except Exception:
+        pass
+
+    # Send notification
+    ev_pct = ev * 100
+    ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    msg = (
+        f"**AUTO-PAPER TRADE** | {ts}\n"
+        f"[{opp['platform']}] {opp['type']} — EV: +{ev_pct:.1f}%\n"
+        f"{opp['market'][:60]}\n"
+        f"BUY {shares} shares @ ${price:.3f} = ${total_cost:.2f}\n"
+        f"Cash remaining: ${PAPER_PORTFOLIO['cash']:,.2f}"
+    )
+    try:
+        await channel.send(msg)
+    except Exception:
+        pass
+
+    # Log to GitHub
+    try:
+        log_to_github(
+            f"\n## Auto-Paper Trade — {ts}\n"
+            f"- [{opp['platform']}] {opp['market'][:60]}\n"
+            f"- EV: +{ev_pct:.1f}% | {shares} shares @ ${price:.3f} = ${total_cost:.2f}\n"
+            f"---\n"
+        )
+    except Exception:
+        pass
+
+    return True
+
+
+@bot.command(name="auto-paper")
+async def auto_paper_cmd(ctx, action: str = ""):
+    """Toggle auto-paper trading. Usage: !auto-paper on/off"""
+    global AUTO_PAPER_ENABLED
+    if action.lower() == "on":
+        AUTO_PAPER_ENABLED = True
+        await ctx.send(
+            f"**Auto-Paper Trading ENABLED**\n"
+            f"High-EV opportunities (>{ALERT_CONFIG['min_ev_threshold']*100:.0f}%) will be auto-executed in paper mode.\n"
+            f"Safety: Max 1% position | Kelly sizing | Daily loss limit\n"
+            f"Use `!auto-paper off` to disable."
+        )
+    elif action.lower() == "off":
+        AUTO_PAPER_ENABLED = False
+        await ctx.send("Auto-paper trading **DISABLED**.")
+    else:
+        status = "ENABLED" if AUTO_PAPER_ENABLED else "DISABLED"
+        trades = len([t for t in PAPER_PORTFOLIO.get("trades", []) if True])
+        await ctx.send(
+            f"**Auto-Paper Status:** {status}\n"
+            f"Threshold: >{ALERT_CONFIG['min_ev_threshold']*100:.0f}% EV\n"
+            f"Mode: {TRADING_MODE.upper()}\n"
+            f"Paper trades: {trades}\n"
+            f"Cash: ${PAPER_PORTFOLIO['cash']:,.2f}\n"
+            f"Usage: `!auto-paper on` or `!auto-paper off`"
+        )
+
+
+@bot.command(name="signals")
+async def signals_cmd(ctx, action: str = "recent"):
+    """View signal history and learning stats. Usage: !signals [recent|stats|all]"""
+    if action == "stats":
+        total = len(SIGNAL_HISTORY)
+        executed = len([s for s in SIGNAL_HISTORY if s["executed"]])
+        not_exec = total - executed
+        avg_ev = sum(s["ev"] for s in SIGNAL_HISTORY) / max(total, 1) * 100
+
+        # Platform breakdown
+        platforms = {}
+        for s in SIGNAL_HISTORY:
+            p = s["platform"]
+            if p not in platforms:
+                platforms[p] = {"total": 0, "executed": 0}
+            platforms[p]["total"] += 1
+            if s["executed"]:
+                platforms[p]["executed"] += 1
+
+        platform_str = "\n".join(
+            f"  {p}: {d['total']} signals, {d['executed']} executed"
+            for p, d in platforms.items()
+        ) or "  No data yet"
+
+        await ctx.send(
+            f"**Signal Learning Stats**\n================================\n"
+            f"Total signals: {total}\n"
+            f"Executed: {executed} | Skipped: {not_exec}\n"
+            f"Avg EV: {avg_ev:.1f}%\n"
+            f"\n**By Platform:**\n{platform_str}\n"
+            f"================================"
+        )
+    elif action == "all":
+        if not SIGNAL_HISTORY:
+            await ctx.send("No signals recorded yet.")
+            return
+        lines = ["**All Signals (last 20):**"]
+        for s in SIGNAL_HISTORY[-20:]:
+            icon = "EXEC" if s["executed"] else "SKIP"
+            lines.append(f"[{icon}] {s['timestamp']} | {s['platform']} | EV +{s['ev']*100:.1f}% | {s['market'][:40]}")
+        await ctx.send("\n".join(lines))
+    else:  # recent
+        if not SIGNAL_HISTORY:
+            await ctx.send("No signals recorded yet. Run `!cycle` or wait for auto-scan.")
+            return
+        lines = ["**Recent Signals (last 10):**"]
+        for s in SIGNAL_HISTORY[-10:]:
+            icon = "EXEC" if s["executed"] else "SKIP"
+            lines.append(f"[{icon}] {s['timestamp']} | {s['platform']} | EV +{s['ev']*100:.1f}% | {s['market'][:40]}")
+        await ctx.send("\n".join(lines))
+
+
 # ============================================================================
 # ENTRY POINT
 # ============================================================================
