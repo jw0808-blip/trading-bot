@@ -5,7 +5,7 @@ Multi-platform portfolio viewer and EV scanner.
 Platforms: Kalshi, Polymarket, Robinhood (Crypto), Coinbase (Advanced Trade), Phemex
 """
 
-MAX_POSITION_PCT = 0.01
+MAX_POSITION_PCT = 0.0025  # 0.25% per trade
 DAILY_LOSS_LIMIT = -500
 DAILY_PNL = 0.0
 # HARD KILL-SWITCH: If total portfolio drops below this, ALL trading stops.
@@ -1842,7 +1842,7 @@ async def show_memory(ctx, action: str = "view", *, content: str = ""):
 # ============================================================================
 CONTEXT_MEMORY = {
     "hot": {  # Core rules — always active
-        "max_position_pct": 0.01,
+        "max_position_pct": 0.0025,  # 0.25% per trade
         "daily_loss_limit": -500,
         "trading_mode": "paper",
         "risk_tolerance": "conservative",
@@ -2322,7 +2322,7 @@ async def tv_signal(ctx, signal_type: str = "", asset: str = "MARKET", indicator
     if not signal_type:
         sig = TRADINGVIEW_SIGNALS.get("latest_signal", {})
         if sig:
-            age = (datetime.datetime.utcnow() - sig.get("timestamp", datetime.datetime.min)).total_seconds() / 60
+            age = (datetime.utcnow() - sig.get("timestamp", datetime.min)).total_seconds() / 60
             await ctx.send(f"**TV/MC Signal Active**\nType: {sig.get('signal')} | Asset: {sig.get('asset')} | Indicator: {sig.get('indicator')}\nAge: {age:.0f}min | Expires: {TRADINGVIEW_SIGNALS['signal_expiry_minutes']}min")
         else:
             await ctx.send("No active TradingView signal.\nUsage: `!tv-signal BUY BTC MarketCipher`\nSignals: BUY, SELL, BULLISH, BEARISH, GREEN_DOT, RED_DOT, BLUE_WAVE, RED_WAVE")
@@ -2331,7 +2331,7 @@ async def tv_signal(ctx, signal_type: str = "", asset: str = "MARKET", indicator
         "signal": signal_type.upper(),
         "asset": asset.upper(),
         "indicator": indicator,
-        "timestamp": datetime.datetime.utcnow(),
+        "timestamp": datetime.utcnow(),
     }
     await ctx.send(f"**TV/MC Signal Set:** {signal_type.upper()} {asset.upper()} ({indicator})\nWill boost edge scores for {TRADINGVIEW_SIGNALS['signal_expiry_minutes']} minutes.\nNote: This boosts scores but does NOT auto-trigger trades alone.")
     await ctx.send("Kill switch **DEACTIVATED** — Trading resumed.")
@@ -3741,7 +3741,7 @@ def calculate_edge_score(opportunity):
         tv = TRADINGVIEW_SIGNALS
         if tv.get("enabled") and tv.get("latest_signal"):
             sig = tv["latest_signal"]
-            sig_age = (datetime.datetime.utcnow() - sig.get("timestamp", datetime.datetime.min)).total_seconds() / 60
+            sig_age = (datetime.utcnow() - sig.get("timestamp", datetime.min)).total_seconds() / 60
             if sig_age <= tv.get("signal_expiry_minutes", 30):
                 sig_type = sig.get("signal", "").upper()
                 asset = opportunity.get("asset", opportunity.get("slug", "")).upper()
@@ -3895,7 +3895,7 @@ import os as _os
 
 AUTO_LIVE_CONFIG = {
     "enabled": True,
-    "min_ev": 0.05,           # 5% minimum EV
+    "min_ev": 0.025,          # 2.5% minimum EV
     "min_edge_score": 65,     # MEDIUM+ confidence
     "max_position_pct": 0.0025,  # 0.25% max per trade (tiny start)
     "max_daily_trades": 20,
