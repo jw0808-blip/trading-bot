@@ -491,3 +491,23 @@ Found 4 opps
 - [Polymarket] Will Alexandria Ocasio-Cortez win the 2028 US Presidential E
 - EV: +6.2% | 1612 shares @ $0.062 = $100.54
 ---
+
+## Portfolio Snapshot -- 2026-03-02 20:40:20 UTC
+- Kalshi: $1,233.58
+- Polymarket: $2,005.04 (positions: $1.07, deposited: $2,003.97)
+- Robinhood: $534.21 USD (buying power)
+- Coinbase: $79,609.71 USD total
+HBAR: 1,106.176173 ($110.41)
+DOGE: 0.056559
+XLM: 105,574.048027 ($16,719.76)
+SHIB: 73,192,336.172359 ($411.34)
+REN: 0.015922
+XRP: 31,898.241283 ($44,657.54)
+ALGO: 5,403.952179 ($480.46)
+USD: 0.004684
+USDC: 16,206.305113 ($16,206.31)
+ETH: 0.000384 ($0.78)
+BTC: 0.014797 ($1,023.11)
+- Phemex: $5,118.25 USDT
+
+---
