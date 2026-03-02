@@ -4689,64 +4689,22 @@ async def execute_polymarket_order(action, token_id, amount, price=None):
         if not client:
             return False, "Failed to initialize Polymarket CLOB client"
         
-        # ---- VERIFY token_id on CLOB before placing order ----
-        verified_token = token_id
-        try:
-            mkt_info = client.get_market(token_id)
-            log.info("CLOB market verified for token %s", token_id[:20])
-        except Exception as verify_err:
-            log.warning("CLOB token lookup failed (%s), trying condition_id lookup...", verify_err)
-            try:
-                r = requests.get(f"https://clob.polymarket.com/markets/{token_id}", timeout=10)
-                if r.status_code == 200:
-                    clob_data = r.json()
-                    clob_tokens = clob_data.get("tokens", [])
-                    if clob_tokens:
-                        idx = 0 if action.upper() == "BUY" else min(1, len(clob_tokens) - 1)
-                        verified_token = clob_tokens[idx].get("token_id", token_id)
-                        log.info("Resolved CLOB token via condition_id: %s", verified_token[:30])
-                else:
-                    # Last resort: refresh from Gamma API
-                    log.warning("CLOB condition lookup returned %d, trying Gamma refresh", r.status_code)
-                    try:
-                        gr = requests.get(
-                            "https://gamma-api.polymarket.com/markets",
-                            params={"limit": 50, "closed": "false", "active": "true",
-                                    "order": "volume24hr", "ascending": "false"},
-                            timeout=15,
-                        )
-                        if gr.status_code == 200:
-                            for gm in gr.json():
-                                clob_raw = gm.get("clobTokenIds", "")
-                                cond = gm.get("condition_id", "")
-                                if cond and token_id.startswith(cond[:10]):
-                                    try:
-                                        ids = json.loads(clob_raw) if isinstance(clob_raw, str) else clob_raw
-                                        if ids:
-                                            verified_token = ids[0]
-                                            log.info("Gamma refresh resolved token: %s", verified_token[:30])
-                                            break
-                                    except (json.JSONDecodeError, IndexError):
-                                        pass
-                    except Exception as gex:
-                        log.warning("Gamma refresh failed: %s", gex)
-            except Exception as clob_err:
-                log.warning("CLOB condition_id lookup also failed: %s", clob_err)
-        
         side = BUY if action.upper() == "BUY" else SELL
         
         if price and price > 0:
+            # Limit order
             order_args = OrderArgs(
                 price=price,
                 size=round(amount / price, 2),
                 side=side,
-                token_id=verified_token,
+                token_id=token_id,
             )
             signed_order = client.create_order(order_args)
             resp = client.post_order(signed_order, OrderType.GTC)
         else:
+            # Market order (FOK)
             mo = MarketOrderArgs(
-                token_id=verified_token,
+                token_id=token_id,
                 amount=amount,
                 side=side,
             )
