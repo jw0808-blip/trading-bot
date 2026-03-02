@@ -1121,7 +1121,7 @@ async def portfolio(ctx):
     report += (
         f"**Phemex:** {phemex}\n"
         f"================================\n"
-        f"*Alpaca: {get_alpaca_balance()}\nPredictIt & Interactive Brokers: pending integration*"
+        f"*Alpaca: {get_alpaca_balance()}\nInteractive Brokers: {get_ibkr_balance()}\nPredictIt: pending integration*"
     )
 
     await msg.edit(content=report)
@@ -2296,6 +2296,31 @@ COST_CONFIG = {
     "strict_mode": True,                     # enforce all safety checks
 }
 
+
+@bot.command(name="cost-status")
+async def cost_status(ctx):
+    """Show cost and safety status."""
+    c = COST_CONFIG
+    auto = AUTO_LIVE_CONFIG
+    await ctx.send(
+        f"**Cost & Safety Status** | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
+        f"================================\n"
+        f"**AI Costs:**\n"
+        f"  Model: {c['preferred_model']} (fallback: {c['fallback_model']})\n"
+        f"  OpenAI spend: ${c['monthly_openai_spent']:.2f} / ${c['monthly_openai_limit']:.2f} monthly limit\n"
+        f"**Safety:**\n"
+        f"  Kill switch: {'ACTIVE' if c['kill_switch'] else 'Off'}\n"
+        f"  Dry-run: {'ON' if DRY_RUN_MODE else 'OFF'}\n"
+        f"  Trading mode: {TRADING_MODE}\n"
+        f"  Portfolio floor: ${PORTFOLIO_FLOOR:,.0f} ({'BREACHED' if PORTFOLIO_FLOOR_ACTIVE else 'OK'})\n"
+        f"  Daily P&L: ${DAILY_PNL:+,.2f} (limit: ${DAILY_LOSS_LIMIT:,.2f})\n"
+        f"  Daily trades: {c['daily_trades_count']}/{c['max_daily_trades']}\n"
+        f"**Auto-Live Config:**\n"
+        f"  Enabled: {auto['enabled']}\n"
+        f"  Min EV: {auto['min_ev']*100:.1f}% | Min edge score: {auto['min_edge_score']}\n"
+        f"  Max position: {auto['max_position_pct']*100:.2f}% | Max daily trades: {auto['max_daily_trades']}\n"
+        f"  Drawdown halt: {auto['drawdown_halt_pct']}%\n"
+    )
 
 @bot.command(name="kill-switch")
 async def kill_switch(ctx, action: str = ""):
@@ -4625,6 +4650,12 @@ ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")  # Paper by default
 
+# Interactive Brokers (Client Portal API)
+IBKR_ACCOUNT_ID = os.getenv("IBKR_ACCOUNT_ID", "")
+IBKR_BASE_URL = os.getenv("IBKR_BASE_URL", "https://localhost:5000/v1/api")
+IBKR_USERNAME = os.getenv("IBKR_USERNAME", "")
+IBKR_TOKEN = os.getenv("IBKR_TOKEN", "")
+
 
 def get_alpaca_balance():
     """Fetch Alpaca account balance."""
@@ -4891,6 +4922,62 @@ async def poly_setup_cmd(ctx):
     lines.append("================================")
     await ctx.send("\n".join(lines))
 
+
+
+# ============================================================================
+# INTERACTIVE BROKERS INTEGRATION
+# ============================================================================
+
+def get_ibkr_balance():
+    if not IBKR_ACCOUNT_ID:
+        return "Not configured (add IBKR_ACCOUNT_ID to .env)"
+    try:
+        hdrs = {"Content-Type": "application/json"}
+        url = f"{IBKR_BASE_URL}/portfolio/{IBKR_ACCOUNT_ID}/summary"
+        r = requests.get(url, headers=hdrs, timeout=5, verify=False)
+        if r.status_code == 200:
+            data = r.json()
+            equity = data.get("netliquidation", {}).get("amount", 0)
+            cash = data.get("totalcashvalue", {}).get("amount", 0)
+            is_paper = IBKR_ACCOUNT_ID.startswith("DU")
+            return f"${equity:,.2f} equity | ${cash:,.2f} cash | {'PAPER' if is_paper else 'LIVE'} | {IBKR_ACCOUNT_ID}"
+        else:
+            is_paper = IBKR_ACCOUNT_ID.startswith("DU")
+            return f"Gateway not connected ({IBKR_ACCOUNT_ID} {'PAPER' if is_paper else 'LIVE'})"
+    except Exception:
+        is_paper = IBKR_ACCOUNT_ID.startswith("DU")
+        return f"Gateway offline ({IBKR_ACCOUNT_ID} {'PAPER' if is_paper else 'LIVE'} - start Client Portal Gateway)"
+
+
+async def execute_ibkr_order(action, symbol, amount):
+    if not IBKR_ACCOUNT_ID:
+        return False, "IBKR not configured (add IBKR_ACCOUNT_ID to .env)"
+    if DRY_RUN_MODE:
+        return True, f"DRY RUN: {action} {symbol} ${amount:.2f} - order NOT sent (dry-run mode)"
+    try:
+        hdrs = {"Content-Type": "application/json"}
+        side = "BUY" if action.upper() == "BUY" else "SELL"
+        search_url = f"{IBKR_BASE_URL}/iserver/secdef/search"
+        sr = requests.post(search_url, json={"symbol": symbol, "secType": "STK"}, headers=hdrs, timeout=10, verify=False)
+        if sr.status_code != 200:
+            return False, f"IBKR symbol lookup failed: {sr.status_code}"
+        contracts = sr.json()
+        if not contracts:
+            return False, f"IBKR: No contract found for {symbol}"
+        conid = contracts[0].get("conid", "")
+        order_url = f"{IBKR_BASE_URL}/iserver/account/{IBKR_ACCOUNT_ID}/orders"
+        order_body = {"orders": [{"conid": conid, "orderType": "MKT", "side": side, "quantity": 1, "tif": "DAY"}]}
+        r = requests.post(order_url, json=order_body, headers=hdrs, timeout=15, verify=False)
+        if r.status_code in (200, 201):
+            data = r.json()
+            oid = data[0].get("order_id", "unknown") if isinstance(data, list) else data.get("order_id", "unknown")
+            return True, f"IBKR order placed: {side} {symbol} (ID: {oid})"
+        else:
+            return False, f"IBKR order failed: {r.status_code} {r.text[:100]}"
+    except requests.exceptions.ConnectionError:
+        return False, "IBKR Gateway offline - start Client Portal Gateway to trade"
+    except Exception as exc:
+        return False, f"IBKR error: {exc}"
 
 # ============================================================================
 # ENTRY POINT
