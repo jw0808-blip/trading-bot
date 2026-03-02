@@ -603,3 +603,8 @@ Found 4 opps
 - [Polymarket] Will Alexandria Ocasio-Cortez win the 2028 US Presidential E
 - EV: +6.2% | 3606 shares @ $0.061 = $221.29
 ---
+
+## Auto-Paper Trade — 21:43 UTC
+- [Kalshi] Will the world pass 2 degrees Celsius over pre-industrial le
+- EV: +7.0% | 293 shares @ $0.750 = $221.07
+---
