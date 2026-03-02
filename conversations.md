@@ -435,3 +435,8 @@ BTC: 0.014797 ($1,019.94)
 - [Polymarket] US x Iran ceasefire by March 6?
 - EV: +6.5% | 1538 shares @ $0.065 = $100.57
 ---
+
+## Auto-Paper Trade — 20:25 UTC
+- [Kalshi] Will the world pass 2 degrees Celsius over pre-industrial le
+- EV: +6.0% | 133 shares @ $0.750 = $100.35
+---
