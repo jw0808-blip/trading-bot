@@ -54,7 +54,7 @@ KALSHI_PRIVATE_KEY  = os.environ.get("KALSHI_PRIVATE_KEY", "")
 KALSHI_BASE         = "https://api.elections.kalshi.com/trade-api/v2"
 
 # Polymarket
-POLY_WALLET_ADDRESS     = os.environ.get("POLY_WALLET_ADDRESS", "")
+POLY_WALLET_ADDRESS     = os.environ.get("POLY_WALLET_ADDRESS", os.environ.get("POLYMARKET_FUNDER", ""))
 POLYMARKET_API_KEY      = os.environ.get("POLYMARKET_API_KEY", "")
 POLYMARKET_SECRET       = os.environ.get("POLYMARKET_SECRET", "")
 POLYMARKET_PASSPHRASE   = os.environ.get("POLYMARKET_PASSPHRASE", "")
@@ -304,6 +304,29 @@ def _get_polymarket_positions():
 
 
 def get_polymarket_balance():
+    # Try CLOB-based balance first (includes deposited cash + positions)
+    if POLYMARKET_PK or POLYMARKET_FUNDER:
+        try:
+            result, err = get_polymarket_clob_balance()
+            if result and result["total"] > 0:
+                total = result["total"]
+                cash = result["cash"]
+                pv = result["positions_value"]
+                details = result["position_details"]
+                summary = f"${total:,.2f}"
+                parts = []
+                if cash > 0.01:
+                    parts.append(f"cash: ${cash:,.2f}")
+                if pv > 0.01:
+                    parts.append(f"positions: ${pv:,.2f}")
+                if parts:
+                    summary += f" ({', '.join(parts)})"
+                if details:
+                    summary += "\n" + "\n".join(details)
+                return summary
+        except Exception as exc:
+            log.warning("CLOB balance fallback: %s", exc)
+    
     if not POLY_WALLET_ADDRESS:
         return "Wallet not configured"
 
