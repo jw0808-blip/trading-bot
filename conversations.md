@@ -440,3 +440,23 @@ BTC: 0.014797 ($1,019.94)
 - [Kalshi] Will the world pass 2 degrees Celsius over pre-industrial le
 - EV: +6.0% | 133 shares @ $0.750 = $100.35
 ---
+
+## Portfolio Snapshot -- 2026-03-02 20:26:02 UTC
+- Kalshi: $1,233.58
+- Polymarket: $2,005.04 (positions: $1.06, deposited: $2,003.97)
+- Robinhood: $534.21 USD (buying power)
+- Coinbase: $79,263.71 USD total
+HBAR: 1,106.176173 ($110.13)
+DOGE: 0.056559
+XLM: 105,574.048027 ($16,696.01)
+SHIB: 73,192,336.172359 ($411.34)
+REN: 0.015922
+XRP: 31,898.241283 ($44,338.56)
+ALGO: 5,403.952179 ($480.05)
+USD: 0.004684
+USDC: 16,206.305113 ($16,206.31)
+ETH: 0.000384 ($0.78)
+BTC: 0.014797 ($1,020.53)
+- Phemex: $5,118.25 USDT
+
+---
