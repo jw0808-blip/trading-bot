@@ -4617,8 +4617,6 @@ async def test_execution(ctx, platform: str = "", amount: str = "1"):
             success, exec_msg = await execute_alpaca_order("BUY", "AAPL", amt)
         except Exception as exc:
             exec_msg = f"Error: {exc}"
-    
-    else:
     elif platform == "ibkr":
         try:
             success, exec_msg = await execute_ibkr_order("BUY", "AAPL", amt)
