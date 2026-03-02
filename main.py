@@ -13,6 +13,16 @@ DAILY_PNL = 0.0
 PORTFOLIO_FLOOR = 50000  # $50K absolute minimum — kill all trading below this
 PORTFOLIO_FLOOR_ACTIVE = False  # Set True automatically when floor is breached
 
+# TradingView / Market Cipher signal integration
+# Boosts edge score but does NOT auto-trigger trades alone
+TRADINGVIEW_SIGNALS = {
+    "enabled": True,
+    "webhook_secret": os.getenv("TV_WEBHOOK_SECRET", ""),
+    "latest_signal": {},  # Updated via webhook or manual command
+    "signal_expiry_minutes": 30,  # Signals older than this are ignored
+    "max_boost_points": 15,  # Max points added to edge score
+}
+
 import discord
 from discord.ext import commands, tasks
 import os
@@ -2305,6 +2315,25 @@ async def kill_switch(ctx, action: str = ""):
 async def confirm_kill_off(ctx):
     """Confirm deactivating the kill switch."""
     COST_CONFIG["kill_switch"] = False
+
+@bot.command(name="tv-signal")
+async def tv_signal(ctx, signal_type: str = "", asset: str = "MARKET", indicator: str = "MarketCipher"):
+    """Input TradingView/Market Cipher signal. Usage: !tv-signal BUY BTC MarketCipher"""
+    if not signal_type:
+        sig = TRADINGVIEW_SIGNALS.get("latest_signal", {})
+        if sig:
+            age = (datetime.datetime.utcnow() - sig.get("timestamp", datetime.datetime.min)).total_seconds() / 60
+            await ctx.send(f"**TV/MC Signal Active**\nType: {sig.get('signal')} | Asset: {sig.get('asset')} | Indicator: {sig.get('indicator')}\nAge: {age:.0f}min | Expires: {TRADINGVIEW_SIGNALS['signal_expiry_minutes']}min")
+        else:
+            await ctx.send("No active TradingView signal.\nUsage: `!tv-signal BUY BTC MarketCipher`\nSignals: BUY, SELL, BULLISH, BEARISH, GREEN_DOT, RED_DOT, BLUE_WAVE, RED_WAVE")
+        return
+    TRADINGVIEW_SIGNALS["latest_signal"] = {
+        "signal": signal_type.upper(),
+        "asset": asset.upper(),
+        "indicator": indicator,
+        "timestamp": datetime.datetime.utcnow(),
+    }
+    await ctx.send(f"**TV/MC Signal Set:** {signal_type.upper()} {asset.upper()} ({indicator})\nWill boost edge scores for {TRADINGVIEW_SIGNALS['signal_expiry_minutes']} minutes.\nNote: This boosts scores but does NOT auto-trigger trades alone.")
     await ctx.send("Kill switch **DEACTIVATED** — Trading resumed.")
 
 
@@ -3706,6 +3735,37 @@ def calculate_edge_score(opportunity):
     else:
         score += 5
     
+    # 6. TradingView / Market Cipher Signal Boost (0-15 points)
+    # This layer BOOSTS edge score but never triggers trades alone
+    try:
+        tv = TRADINGVIEW_SIGNALS
+        if tv.get("enabled") and tv.get("latest_signal"):
+            sig = tv["latest_signal"]
+            sig_age = (datetime.datetime.utcnow() - sig.get("timestamp", datetime.datetime.min)).total_seconds() / 60
+            if sig_age <= tv.get("signal_expiry_minutes", 30):
+                sig_type = sig.get("signal", "").upper()
+                asset = opportunity.get("asset", opportunity.get("slug", "")).upper()
+                sig_asset = sig.get("asset", "").upper()
+                # Only boost if signal matches the asset or is broad market
+                if sig_asset in (asset, "BTC", "SPY", "MARKET", ""):
+                    if sig_type == "BUY" and opportunity.get("action", "BUY").upper() == "BUY":
+                        score += 15
+                        signals.append(f"TV/MC BUY signal ({sig.get('indicator', 'MC')})")
+                    elif sig_type == "SELL" and opportunity.get("action", "").upper() == "SELL":
+                        score += 15
+                        signals.append(f"TV/MC SELL signal ({sig.get('indicator', 'MC')})")
+                    elif sig_type in ("BULLISH", "GREEN_DOT", "BLUE_WAVE"):
+                        score += 10
+                        signals.append(f"TV/MC bullish ({sig_type})")
+                    elif sig_type in ("BEARISH", "RED_DOT", "RED_WAVE"):
+                        score += 10
+                        signals.append(f"TV/MC bearish ({sig_type})")
+                    else:
+                        score += 5
+                        signals.append(f"TV/MC signal: {sig_type}")
+    except Exception:
+        pass  # TradingView signals are optional — never block scoring
+
     # Determine confidence
     if score >= 75:
         confidence = "HIGH"
