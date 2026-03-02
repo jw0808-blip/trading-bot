@@ -2160,7 +2160,7 @@ def track_openai_usage(tokens_used, model="gpt-4o-mini"):
 
 ALERT_CONFIG = {
     "enabled": True,
-    "min_ev_threshold": 0.025,  # 2.5% EV for more paper trades
+    "min_ev_threshold": 0.02,  # 2% EV for more paper trades in learning mode
     "cooldown_seconds": 1800,  # 30 min between alerts per market
     "max_alerts_per_hour": 5,
     "alert_history": {},       # market -> last_alert_time
@@ -2244,9 +2244,18 @@ async def check_and_send_alerts():
                     try:
                         executed = await auto_paper_execute(channel, opp)
                         if executed:
-                            log.info("Auto-paper executed: %s", market_key)
+                            log.info("AUTO-PAPER TRADE: %s EV:%.1f%% Cash:$%.2f Trades:%d",
+                                     market_key, ev_pct, PAPER_PORTFOLIO["cash"], len(PAPER_PORTFOLIO["trades"]))
                     except Exception as aex:
                         log.warning("Auto-paper error: %s", aex)
+                # AUTO-EXECUTE in live mode if enabled
+                if TRADING_MODE == "live" and not DRY_RUN_MODE:
+                    try:
+                        live_exec = await auto_live_execute(channel, opp)
+                        if live_exec:
+                            log.info("AUTO-LIVE executed: %s", market_key)
+                    except Exception as lex:
+                        log.warning("Auto-live error: %s", lex)
 
     except Exception as exc:
         log.warning("Alert check error: %s", exc)
@@ -3530,7 +3539,7 @@ def detect_regime():
     
     # Position size multiplier based on regime
     if regime in ("EXTREME_FEAR", "EXTREME_GREED"):
-        REGIME_CONFIG["size_multiplier"] = 0.5  # Half size in extremes
+        REGIME_CONFIG["size_multiplier"] = 0.65  # Slightly more trades in extremes for learning
     elif regime in ("FEAR", "GREED"):
         REGIME_CONFIG["size_multiplier"] = 0.75
     else:
@@ -5160,6 +5169,112 @@ def get_predictit_balance():
             return f"API error: {r.status_code}"
     except Exception as exc:
         return f"Offline ({exc})"
+
+
+# ============================================================================
+# AUTO-LIVE EXECUTION ENGINE
+# ============================================================================
+async def auto_live_execute(channel, opp):
+    """Auto-execute trade in live mode when edge score meets threshold."""
+    if DRY_RUN_MODE or TRADING_MODE != "live":
+        return False
+    if COST_CONFIG.get("kill_switch", False):
+        return False
+    auto = AUTO_LIVE_CONFIG
+    if not auto["enabled"]:
+        return False
+    ev = opp.get("ev", 0)
+    if ev < auto["min_ev"]:
+        log.info("Auto-live skip: EV %.1f%% < %.1f%% min", ev*100, auto["min_ev"]*100)
+        return False
+    score, confidence, signals = calculate_edge_score(opp)
+    if score < auto["min_edge_score"]:
+        log.info("Auto-live skip: score %d < %d min", score, auto["min_edge_score"])
+        return False
+    if auto.get("trades_today", 0) >= auto["max_daily_trades"]:
+        log.info("Auto-live skip: daily trade limit reached")
+        return False
+    # Portfolio floor check
+    try:
+        total = float(str(COST_CONFIG.get("portfolio_value", 88000)).replace(",", ""))
+        if total < PORTFOLIO_FLOOR:
+            log.warning("Auto-live BLOCKED: portfolio $%.0f < floor $%.0f", total, PORTFOLIO_FLOOR)
+            return False
+    except Exception:
+        pass
+    # Calculate size: 0.25% of portfolio
+    portfolio_val = 88000  # approximate
+    size = min(suggest_position_size(ev), portfolio_val * auto["max_position_pct"])
+    if size < 5:
+        return False
+    platform = opp.get("platform", "").lower()
+    success = False
+    msg = ""
+    try:
+        if platform == "polymarket":
+            success, msg = await execute_polymarket_order(opp, size)
+        elif platform == "kalshi":
+            ticker = opp.get("ticker", "")
+            success, msg = await execute_kalshi_order("BUY", ticker, int(size))
+        elif platform in ("coinbase", "crypto"):
+            success, msg = await execute_coinbase_order("BUY", "BTC", size)
+        elif platform == "phemex":
+            success, msg = await execute_phemex_order("BUY", "sBTCUSDT", size)
+        elif platform == "alpaca":
+            success, msg = await execute_alpaca_order("BUY", "AAPL", size)
+        elif platform == "ibkr":
+            success, msg = await execute_ibkr_order("BUY", "AAPL", size)
+        if success:
+            auto["trades_today"] = auto.get("trades_today", 0) + 1
+            COST_CONFIG["daily_trades"] = COST_CONFIG.get("daily_trades", 0) + 1
+            notify_zapier("trade_executed", {
+                "platform": platform, "market": opp.get("market", ""),
+                "size": size, "ev": ev, "score": score, "confidence": confidence,
+            })
+            trade_msg = (
+                f"**AUTO-TRADE EXECUTED** [{platform.upper()}]\n"
+                f"Market: {opp.get('market', '')[:60]}\n"
+                f"Size: ${size:.2f} | EV: +{ev*100:.1f}% | Score: {score}/100 ({confidence})\n"
+                f"{msg}"
+            )
+            await channel.send(trade_msg)
+            record_signal(opp, executed=True, paper=False)
+            log.info("AUTO-LIVE TRADE: %s $%.2f EV:%.1f%% Score:%d", platform, size, ev*100, score)
+            return True
+        else:
+            log.info("Auto-live order failed: %s - %s", platform, msg)
+    except Exception as exc:
+        log.warning("Auto-live execute error on %s: %s", platform, exc)
+    return False
+
+
+# ============================================================================
+# DAILY RESET TASK (reset trade counters at midnight UTC)
+# ============================================================================
+@tasks.loop(hours=24)
+async def daily_reset_task():
+    """Reset daily counters at midnight UTC."""
+    AUTO_LIVE_CONFIG["trades_today"] = 0
+    COST_CONFIG["daily_trades"] = 0
+    COST_CONFIG["daily_pnl"] = 0.0
+    log.info("Daily counters reset")
+    # Log paper trading summary
+    trades = PAPER_PORTFOLIO.get("trades", [])
+    cash = PAPER_PORTFOLIO["cash"]
+    positions = len(PAPER_PORTFOLIO["positions"])
+    log.info("Paper summary: %d trades, $%.2f cash, %d open positions", len(trades), cash, positions)
+    # Send daily summary to Zapier
+    notify_zapier("daily_summary", {
+        "paper_trades": len(trades),
+        "paper_cash": cash,
+        "paper_positions": positions,
+        "signal_history": len(SIGNAL_HISTORY),
+    })
+
+@daily_reset_task.before_loop
+async def before_daily_reset():
+    await bot.wait_until_ready()
+
 
 # ============================================================================
 # ENTRY POINT
