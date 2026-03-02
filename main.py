@@ -4651,7 +4651,6 @@ POLYMARKET_FUNDER = os.getenv("POLYMARKET_FUNDER", "").strip()
 POLYMARKET_API_KEY = os.getenv("POLYMARKET_API_KEY", "").strip()
 POLYMARKET_API_SECRET = os.getenv("POLYMARKET_API_SECRET", "").strip()
 POLYMARKET_PASSPHRASE = os.getenv("POLYMARKET_PASSPHRASE", "").strip()
-POLYMARKET_SIG_TYPE = int(os.getenv("POLYMARKET_SIG_TYPE", "1"))  # 1=email/magic, 0=EOA, 2=browser
 
 
 def get_polymarket_clob_client():
@@ -4666,10 +4665,9 @@ def get_polymarket_clob_client():
             "key": POLYMARKET_PK,
             "chain_id": 137,
         }
-        
+        kwargs["signature_type"] = 2
         if POLYMARKET_FUNDER:
             kwargs["funder"] = POLYMARKET_FUNDER
-            kwargs["signature_type"] = POLYMARKET_SIG_TYPE
         
         client = ClobClient(**kwargs)
         
@@ -4804,7 +4802,6 @@ async def poly_setup_cmd(ctx):
     lines.append(f"  Private Key: **{pk_status}**")
     lines.append(f"  Funder Address: **{funder_status}**")
     lines.append(f"  API Credentials: **{api_status}**")
-    lines.append(f"  Signature Type: {POLYMARKET_SIG_TYPE}")
     
     # Try to init client
     client = get_polymarket_clob_client()
@@ -4823,7 +4820,6 @@ async def poly_setup_cmd(ctx):
     lines.append("1. Export your private key from reveal.polymarket.com")
     lines.append("2. Add to .env: `POLYMARKET_PK=0x...`")
     lines.append("3. Add funder: `POLYMARKET_FUNDER=0x...`")
-    lines.append("4. Set sig type: `POLYMARKET_SIG_TYPE=1` (email) or `0` (EOA)")
     lines.append("5. Run `!test-execution polymarket 1` to test")
     lines.append("================================")
     await ctx.send("\n".join(lines))
