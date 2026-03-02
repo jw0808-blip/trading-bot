@@ -430,3 +430,8 @@ BTC: 0.014797 ($1,019.94)
 - Phemex: $5,118.25 USDT
 
 ---
+
+## Auto-Paper Trade — 20:25 UTC
+- [Polymarket] US x Iran ceasefire by March 6?
+- EV: +6.5% | 1538 shares @ $0.065 = $100.57
+---
