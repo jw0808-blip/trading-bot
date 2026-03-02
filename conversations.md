@@ -486,3 +486,8 @@ Found 4 opps
 - [Polymarket] US x Iran ceasefire by March 6?
 - EV: +6.5% | 1538 shares @ $0.065 = $100.57
 ---
+
+## Auto-Paper Trade — 20:38 UTC
+- [Polymarket] Will Alexandria Ocasio-Cortez win the 2028 US Presidential E
+- EV: +6.2% | 1612 shares @ $0.062 = $100.54
+---
