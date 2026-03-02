@@ -81,6 +81,7 @@ GITHUB_REPO     = os.environ.get("GITHUB_REPO", "jw0808-blip/trading-bot")
 
 # Trading Mode
 TRADING_MODE    = os.environ.get("TRADING_MODE", "paper")
+DRY_RUN_MODE    = True  # Safe default: dry-run on
 PAPER_PORTFOLIO = {"cash": 10000.0, "positions": [], "trades": [], "pnl": 0.0}
 
 # OpenAI
@@ -2767,6 +2768,7 @@ async def execute_kalshi_order(action, ticker, amount):
             "action": "buy" if action.upper() == "BUY" else "sell",
             "side": side,
             "count": count,
+            "yes_price_dollars": "0.99",
         }
         
         headers = {
@@ -2790,34 +2792,43 @@ async def execute_kalshi_order(action, ticker, amount):
 
 
 async def execute_phemex_order(action, symbol, amount):
-    """Place an order on Phemex. Returns (success, message)."""
+    """Place a spot order on Phemex. Returns (success, message)."""
     if not PHEMEX_API_KEY or not PHEMEX_API_SECRET:
         return False, "Phemex API keys not configured"
     if DRY_RUN_MODE:
         log.info("DRY RUN: Phemex %s %s $%.2f", action, symbol, amount)
         return True, f"DRY RUN: {action} order logged but not sent (dry-run mode)"
     try:
-        import hmac, hashlib, time as _time
+        import hmac, hashlib, time as _time, json
         
         expiry = str(int(_time.time()) + 60)
         
-        # Phemex spot order
+        # Phemex spot order endpoint
         path = "/spot/orders"
         side = "Buy" if action.upper() == "BUY" else "Sell"
         
-        order_data = {
-            "symbol": symbol if "s" in symbol.lower() else f"s{symbol}",
+        # Symbol must start with 's' for spot
+        spot_symbol = symbol if symbol.startswith("s") else f"s{symbol}"
+        
+        order_body = {
+            "symbol": spot_symbol,
+            "clOrdID": f"tj-{int(_time.time())}",
             "side": side,
+            "qtyType": "ByQuote",
+            "quoteQtyEv": int(amount * 100000000),
             "ordType": "Market",
-            "quoteQtyEv": int(amount * 100000000),  # Scale to Phemex value scale
+            "timeInForce": "ImmediateOrCancel",
         }
         
-        import json
-        body_str = json.dumps(order_data, separators=(",", ":"))
+        body_str = json.dumps(order_body, separators=(",", ":"))
         
-        # Sign: path + queryString + expiry + body
-        msg = path + expiry + body_str
-        sig = hmac.new(PHEMEX_API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+        # Sign: path + expiry + body (concatenated, no separators)
+        sign_str = path + expiry + body_str
+        sig = hmac.new(
+            PHEMEX_API_SECRET.encode("utf-8"),
+            sign_str.encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
         
         headers = {
             "x-phemex-access-token": PHEMEX_API_KEY,
@@ -2826,20 +2837,19 @@ async def execute_phemex_order(action, symbol, amount):
             "Content-Type": "application/json",
         }
         
-        r = requests.post(f"https://api.phemex.com{path}", json=order_data, headers=headers, timeout=15)
+        r = requests.post(f"https://api.phemex.com{path}", data=body_str, headers=headers, timeout=15)
         
         if r.status_code == 200:
             data = r.json()
             if data.get("code") == 0:
                 order_id = data.get("data", {}).get("orderID", "unknown")
-                return True, f"Phemex order: {side} {symbol} ${amount:.2f} (ID: {order_id})"
+                return True, f"Phemex order: {side} {spot_symbol} ${amount:.2f} (ID: {order_id})"
             else:
-                return False, f"Phemex error: {data.get('msg', 'unknown')}"
+                return False, f"Phemex error: code={data.get('code')} msg={data.get('msg', 'unknown')}"
         else:
             return False, f"Phemex API error: {r.status_code} {r.text[:200]}"
     except Exception as exc:
         return False, f"Phemex execution error: {exc}"
-
 
 async def backtest_real(ctx, *, args: str = ""):
     """Backtest with REAL historical data from CoinGecko.
@@ -2971,63 +2981,67 @@ async def execute_coinbase_order(action, symbol, amount):
 
 
 async def execute_robinhood_order(action, symbol, amount):
-    """Place an order via Robinhood Crypto API. Returns (success, message)."""
+    """Place a crypto order via Robinhood Crypto API. Returns (success, message)."""
     if not ROBINHOOD_API_KEY or not ROBINHOOD_PRIVATE_KEY:
         return False, "Robinhood API keys not configured"
-    # DRY_RUN_MODE check
     if DRY_RUN_MODE:
-        log.info("DRY RUN: %s %s — order NOT sent", action, ticker if 'ticker' in dir() else symbol if 'symbol' in dir() else amount)
+        log.info("DRY RUN: Robinhood %s %s $%.2f", action, symbol, amount)
         return True, f"DRY RUN: {action} order logged but not sent (dry-run mode)"
     try:
-        import base64, time as _time, uuid as _uuid
+        import base64, json, uuid as _uuid, datetime as _dt
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-        from cryptography.hazmat.primitives import serialization
         
+        # Load private key — base64 decode, take first 32 bytes
+        private_bytes = base64.b64decode(ROBINHOOD_PRIVATE_KEY)
+        private_key = Ed25519PrivateKey.from_private_bytes(private_bytes[:32])
+        
+        # Build request
+        base_url = "https://trading.robinhood.com"
         path = "/api/v1/crypto/trading/orders/"
-        ts = str(int(_time.time()))
+        timestamp = int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp())
         
         side_str = "buy" if action.upper() == "BUY" else "sell"
+        
+        # Robinhood uses "BTC-USD" format, not just "BTC"
+        rh_symbol = symbol if "-" in symbol else f"{symbol}-USD"
+        
         order_body = {
             "client_order_id": str(_uuid.uuid4()),
             "side": side_str,
-            "symbol": symbol,
+            "symbol": rh_symbol,
             "type": "market",
             "market_order_config": {
                 "asset_quantity": str(round(amount, 8))
             }
         }
         
-        import json
         body_str = json.dumps(order_body)
-        message = f"{ROBINHOOD_API_KEY}{ts}{path}{body_str}"
         
-        # Sign with Ed25519
-        pk_bytes = base64.b64decode(ROBINHOOD_PRIVATE_KEY)
-        private_key = Ed25519PrivateKey.from_private_bytes(pk_bytes[:32])
-        signature = base64.b64encode(private_key.sign(message.encode())).decode()
+        # Sign exactly per official docs: api_key + str(timestamp) + path + body
+        message = f"{ROBINHOOD_API_KEY}{timestamp}{path}{body_str}"
+        signature = private_key.sign(message.encode("utf-8"))
+        sig_b64 = base64.b64encode(signature).decode("utf-8")
         
-        hdrs = {
+        headers = {
             "x-api-key": ROBINHOOD_API_KEY,
-            "x-timestamp": ts,
-            "x-signature": signature,
+            "x-timestamp": str(timestamp),
+            "x-signature": sig_b64,
             "Content-Type": "application/json",
         }
         
-        r = requests.post(f"https://trading.robinhood.com{path}", json=order_body, headers=hdrs, timeout=15)
+        log.info("Robinhood request: %s %s %s qty=%s", side_str, rh_symbol, base_url + path, amount)
+        
+        r = requests.post(f"{base_url}{path}", data=body_str, headers=headers, timeout=15)
+        
         if r.status_code in (200, 201):
             data = r.json()
             order_id = data.get("id", "unknown")
-            return True, f"Robinhood order placed: {side_str} {symbol} qty={amount} (ID: {order_id})"
+            status = data.get("state", "unknown")
+            return True, f"Robinhood order: {side_str} {rh_symbol} qty={amount} (ID: {order_id}, Status: {status})"
         else:
             return False, f"Robinhood error: {r.status_code} {r.text[:200]}"
     except Exception as exc:
         return False, f"Robinhood execution error: {exc}"
-
-
-
-
-DRY_RUN_MODE = True  # When True, live orders are logged but not sent
-
 
 @bot.command(name="dry-run")
 async def dry_run_cmd(ctx, action: str = ""):
@@ -3924,7 +3938,12 @@ async def auto_execute_opportunity(opp, channel):
         elif platform == "Polymarket":
             # Polymarket needs on-chain execution — log as pending
             success = True
-            exec_msg = f"PAPER-ROUTED: Polymarket on-chain not yet automated. Logged for manual review."
+            # Route to Polymarket CLOB
+                if POLYMARKET_PK:
+                    token_id = opp.get("token_id", opp.get("slug", ""))
+                    success, exec_msg = await execute_polymarket_order("BUY", token_id, size)
+                else:
+                    exec_msg = f"Polymarket not configured. Add POLYMARKET_PK to .env."
         elif asset in ("BTC", "ETH", "DOGE", "XRP", "SOL", "ALGO", "SHIB", "XLM", "HBAR"):
             success, exec_msg = await execute_coinbase_order("BUY", asset, size)
         elif asset.endswith("USDT") or asset.endswith("PERP"):
@@ -4396,6 +4415,14 @@ async def test_execution(ctx, platform: str = "", amount: str = "1"):
         except Exception as exc:
             exec_msg = f"Error: {exc}"
     
+    elif platform == "polymarket":
+        try:
+            # Use a known liquid token_id for testing
+            # This is just a test — will fail if no token_id provided
+            success, exec_msg = await execute_polymarket_order("BUY", "test", amt)
+        except Exception as exc:
+            exec_msg = f"Error: {exc}"
+    
     elif platform == "alpaca":
         try:
             success, exec_msg = await execute_alpaca_order("BUY", "AAPL", amt)
@@ -4515,6 +4542,152 @@ async def execute_alpaca_order(action, symbol, amount):
             return False, f"Alpaca error: {r.status_code} {r.text[:200]}"
     except Exception as exc:
         return False, f"Alpaca execution error: {exc}"
+
+
+
+
+# ============================================================================
+# POLYMARKET CLOB EXECUTION
+# ============================================================================
+POLYMARKET_PK = os.getenv("POLYMARKET_PK", "").strip()
+POLYMARKET_FUNDER = os.getenv("POLYMARKET_FUNDER", "").strip()
+POLYMARKET_API_KEY = os.getenv("POLYMARKET_API_KEY", "").strip()
+POLYMARKET_API_SECRET = os.getenv("POLYMARKET_API_SECRET", "").strip()
+POLYMARKET_PASSPHRASE = os.getenv("POLYMARKET_PASSPHRASE", "").strip()
+POLYMARKET_SIG_TYPE = int(os.getenv("POLYMARKET_SIG_TYPE", "1"))  # 1=email/magic, 0=EOA, 2=browser
+
+
+def get_polymarket_clob_client():
+    """Initialize Polymarket CLOB client. Returns client or None."""
+    if not POLYMARKET_PK:
+        return None
+    try:
+        from py_clob_client.client import ClobClient
+        
+        kwargs = {
+            "host": "https://clob.polymarket.com",
+            "key": POLYMARKET_PK,
+            "chain_id": 137,
+        }
+        
+        if POLYMARKET_FUNDER:
+            kwargs["funder"] = POLYMARKET_FUNDER
+            kwargs["signature_type"] = POLYMARKET_SIG_TYPE
+        
+        client = ClobClient(**kwargs)
+        
+        # Set API creds if available
+        if POLYMARKET_API_KEY and POLYMARKET_API_SECRET and POLYMARKET_PASSPHRASE:
+            from py_clob_client.clob_types import ApiCreds
+            creds = ApiCreds(
+                api_key=POLYMARKET_API_KEY,
+                api_secret=POLYMARKET_API_SECRET,
+                api_passphrase=POLYMARKET_PASSPHRASE,
+            )
+            client.set_api_creds(creds)
+        else:
+            # Derive creds from private key
+            try:
+                client.set_api_creds(client.create_or_derive_api_creds())
+            except Exception as ce:
+                log.warning("Polymarket cred derivation failed: %s", ce)
+        
+        return client
+    except ImportError:
+        log.warning("py-clob-client not installed")
+        return None
+    except Exception as exc:
+        log.warning("Polymarket client init error: %s", exc)
+        return None
+
+
+async def execute_polymarket_order(action, token_id, amount, price=None):
+    """Place an order on Polymarket CLOB. Returns (success, message)."""
+    if not POLYMARKET_PK:
+        return False, "Polymarket private key not configured (add POLYMARKET_PK to .env)"
+    
+    if DRY_RUN_MODE:
+        log.info("DRY RUN: Polymarket %s token=%s $%.2f", action, token_id[:20], amount)
+        return True, f"DRY RUN: {action} Polymarket order logged but not sent (dry-run mode)"
+    
+    try:
+        from py_clob_client.clob_types import MarketOrderArgs, OrderArgs, OrderType
+        from py_clob_client.order_builder.constants import BUY, SELL
+        
+        client = get_polymarket_clob_client()
+        if not client:
+            return False, "Failed to initialize Polymarket CLOB client"
+        
+        side = BUY if action.upper() == "BUY" else SELL
+        
+        if price and price > 0:
+            # Limit order
+            order_args = OrderArgs(
+                price=price,
+                size=round(amount / price, 2),
+                side=side,
+                token_id=token_id,
+            )
+            signed_order = client.create_order(order_args)
+            resp = client.post_order(signed_order, OrderType.GTC)
+        else:
+            # Market order (FOK)
+            mo = MarketOrderArgs(
+                token_id=token_id,
+                amount=amount,
+                side=side,
+            )
+            signed_order = client.create_market_order(mo)
+            resp = client.post_order(signed_order, OrderType.FOK)
+        
+        if resp and resp.get("success", False):
+            order_id = resp.get("orderID", "unknown")
+            return True, f"Polymarket order placed: {action} ${amount:.2f} (ID: {order_id})"
+        else:
+            error = resp.get("errorMsg", str(resp)[:200]) if resp else "No response"
+            return False, f"Polymarket order failed: {error}"
+    
+    except ImportError:
+        return False, "py-clob-client not installed. Run: pip install py-clob-client"
+    except Exception as exc:
+        return False, f"Polymarket execution error: {exc}"
+
+
+@bot.command(name="poly-setup")
+async def poly_setup_cmd(ctx):
+    """Show Polymarket setup status and instructions."""
+    lines = ["**Polymarket CLOB Setup**", "================================"]
+    
+    pk_status = "Configured" if POLYMARKET_PK else "NOT SET"
+    funder_status = f"{POLYMARKET_FUNDER[:10]}..." if POLYMARKET_FUNDER else "NOT SET"
+    api_status = "Configured" if POLYMARKET_API_KEY else "NOT SET"
+    
+    lines.append(f"  Private Key: **{pk_status}**")
+    lines.append(f"  Funder Address: **{funder_status}**")
+    lines.append(f"  API Credentials: **{api_status}**")
+    lines.append(f"  Signature Type: {POLYMARKET_SIG_TYPE}")
+    
+    # Try to init client
+    client = get_polymarket_clob_client()
+    if client:
+        lines.append(f"  Client: **CONNECTED**")
+        try:
+            ok = client.get_ok()
+            lines.append(f"  Server: {ok}")
+        except Exception as e:
+            lines.append(f"  Server test: {e}")
+    else:
+        lines.append(f"  Client: **NOT CONNECTED**")
+    
+    lines.append("")
+    lines.append("**Setup Steps:**")
+    lines.append("1. Export your private key from reveal.polymarket.com")
+    lines.append("2. Add to .env: `POLYMARKET_PK=0x...`")
+    lines.append("3. Add funder: `POLYMARKET_FUNDER=0x...`")
+    lines.append("4. Set sig type: `POLYMARKET_SIG_TYPE=1` (email) or `0` (EOA)")
+    lines.append("5. Run `!test-execution polymarket 1` to test")
+    lines.append("================================")
+    await ctx.send("\n".join(lines))
 
 
 # ============================================================================
