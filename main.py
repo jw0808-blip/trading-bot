@@ -1121,7 +1121,7 @@ async def portfolio(ctx):
     report += (
         f"**Phemex:** {phemex}\n"
         f"================================\n"
-        f"*Alpaca: {get_alpaca_balance()}\nInteractive Brokers: {get_ibkr_balance()}\nPredictIt: pending integration*"
+        f"*Alpaca: {get_alpaca_balance()}\nInteractive Brokers: {get_ibkr_balance()}\nPredictIt: {get_predictit_balance()}*"
     )
 
     await msg.edit(content=report)
@@ -4690,7 +4690,11 @@ def get_alpaca_balance():
                     unrealized = float(p.get("unrealized_pl", 0))
                     positions_str += f"\n  {sym}: {qty} shares (${mkt_val:,.2f}, P&L: ${unrealized:+,.2f})"
             
-            result = f"${equity:,.2f} equity | ${cash:,.2f} cash | BP: ${buying_power:,.2f}"
+            # Cap display for paper account to avoid inflated portfolio totals
+            display_equity = min(equity, 25000) if "paper" in ALPACA_BASE_URL else equity
+            display_cash = min(cash, 25000) if "paper" in ALPACA_BASE_URL else cash
+            display_bp = min(buying_power, 50000) if "paper" in ALPACA_BASE_URL else buying_power
+            result = f"${display_equity:,.2f} equity | ${display_cash:,.2f} cash | BP: ${display_bp:,.2f}"
             if positions_str:
                 result += positions_str
             
