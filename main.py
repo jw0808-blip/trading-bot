@@ -2239,6 +2239,14 @@ async def check_and_send_alerts():
                 await channel.send(alert)
                 record_alert(market_key)
                 log.info("Alert sent: %s EV +%.1f%%", market_key, ev_pct)
+                # AUTO-EXECUTE in paper mode if enabled
+                if AUTO_PAPER_ENABLED and TRADING_MODE == "paper":
+                    try:
+                        executed = await auto_paper_execute(channel, opp)
+                        if executed:
+                            log.info("Auto-paper executed: %s", market_key)
+                    except Exception as aex:
+                        log.warning("Auto-paper error: %s", aex)
 
     except Exception as exc:
         log.warning("Alert check error: %s", exc)
