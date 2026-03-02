@@ -17,7 +17,7 @@ PORTFOLIO_FLOOR_ACTIVE = False  # Set True automatically when floor is breached
 # Boosts edge score but does NOT auto-trigger trades alone
 TRADINGVIEW_SIGNALS = {
     "enabled": True,
-    "webhook_secret": os.getenv("TV_WEBHOOK_SECRET", ""),
+    "webhook_secret": "",  # Set TV_WEBHOOK_SECRET in .env
     "latest_signal": {},  # Updated via webhook or manual command
     "signal_expiry_minutes": 30,  # Signals older than this are ignored
     "max_boost_points": 15,  # Max points added to edge score
