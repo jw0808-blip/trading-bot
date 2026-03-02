@@ -4488,9 +4488,37 @@ async def test_execution(ctx, platform: str = "", amount: str = "1"):
     
     elif platform == "polymarket":
         try:
-            # Use a known liquid token_id for testing
-            # This is just a test — will fail if no token_id provided
-            success, exec_msg = await execute_polymarket_order("BUY", "test", amt)
+            # Dynamically find a real active market from latest scan
+            poly_opps = find_polymarket_opportunities()
+            if not poly_opps:
+                await msg.edit(content="No active Polymarket markets found. Cannot test execution.")
+                return
+            target_opp = None
+            for opp in poly_opps:
+                tid = opp.get("token_id", "")
+                if tid and len(tid) > 10:
+                    target_opp = opp
+                    break
+            if not target_opp or not target_opp.get("token_id"):
+                await msg.edit(content="No Polymarket opportunities with valid CLOB token_id found.")
+                return
+            token_id = target_opp["token_id"]
+            market_name = target_opp.get("market", "Unknown")[:60]
+            price = 0.50
+            detail = target_opp.get("detail", "")
+            if "YES @ $" in detail:
+                try:
+                    price = float(detail.split("YES @ $")[1].split()[0])
+                except (IndexError, ValueError):
+                    pass
+            elif "Yes $" in detail:
+                try:
+                    price = float(detail.split("Yes $")[1].split()[0])
+                except (IndexError, ValueError):
+                    pass
+            await msg.edit(content=f"Testing Polymarket execution{dry_tag}... ${amt:.2f}\nMarket: {market_name}\nToken: {token_id[:20]}...")
+            success, exec_msg = await execute_polymarket_order("BUY", token_id, amt, price=price)
+            exec_msg = f"[{market_name}] {exec_msg}"
         except Exception as exc:
             exec_msg = f"Error: {exc}"
     
