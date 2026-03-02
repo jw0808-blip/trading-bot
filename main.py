@@ -2322,11 +2322,53 @@ async def cost_status(ctx):
         f"  Drawdown halt: {auto['drawdown_halt_pct']}%\n"
     )
 
+@bot.command(name="fee-status")
+async def fee_status(ctx):
+    """Show auto-fee payment status."""
+    f = FEE_CONFIG
+    owed = calculate_fees()
+    await ctx.send(
+        f"**Auto-Fee Status**\n"
+        f"Enabled: {f['enabled']}\n"
+        f"Fee rate: {f['fee_pct']*100:.0f}% of profits above ${f['min_profit_threshold']:.0f}\n"
+        f"Total profits: ${f['total_profits']:,.2f}\n"
+        f"Fees paid: ${f['total_fees_paid']:,.2f}\n"
+        f"Fees owed: ${owed:,.2f}\n"
+        f"Fee wallet: {f['fee_wallet'] or 'Not set'}\n"
+        f"Use `!set-fee on/off` to toggle."
+    )
+
+@bot.command(name="set-fee")
+async def set_fee(ctx, action: str = ""):
+    """Toggle auto-fee. Usage: !set-fee on/off"""
+    if action.lower() == "on":
+        FEE_CONFIG["enabled"] = True
+        await ctx.send("Auto-fee payment **ENABLED**. 10% of profits above $100 will be reserved.")
+    elif action.lower() == "off":
+        FEE_CONFIG["enabled"] = False
+        await ctx.send("Auto-fee payment **DISABLED**.")
+    else:
+        await ctx.send("Usage: `!set-fee on` or `!set-fee off`")
+
+@bot.command(name="zapier-status")
+async def zapier_status(ctx):
+    """Show Zapier/Make.com integration status."""
+    z = ZAPIER_CONFIG
+    await ctx.send(
+        f"**Zapier/Make.com Status**\n"
+        f"Enabled: {z['enabled']}\n"
+        f"Webhook URL: {'Set' if z['webhook_url'] else 'Not configured'}\n"
+        f"Events: {', '.join(z['events'])}\n"
+        f"Set ZAPIER_WEBHOOK_URL in .env to enable.\n"
+        f"Supported events: trade_executed, kill_switch, daily_summary, high_ev_alert"
+    )
+
 @bot.command(name="kill-switch")
 async def kill_switch(ctx, action: str = ""):
     """Emergency kill switch. Usage: !kill-switch on/off"""
     if action.lower() == "on":
         COST_CONFIG["kill_switch"] = True
+        notify_zapier("kill_switch", {"action": "activated", "reason": "manual"})
         await ctx.send("**KILL SWITCH ACTIVATED** — All trading halted immediately.")
     elif action.lower() == "off":
         COST_CONFIG["kill_switch"] = True  # require explicit confirmation
@@ -2583,7 +2625,7 @@ async def auto_paper_cmd(ctx, action: str = ""):
             f"Use `!auto-paper off` to disable."
         )
     elif action.lower() == "off":
-        AUTO_PAPER_ENABLED = True
+        AUTO_PAPER_ENABLED = False
         await ctx.send("Auto-paper trading **DISABLED**.")
     else:
         status = "ENABLED" if AUTO_PAPER_ENABLED else "DISABLED"
@@ -3708,7 +3750,7 @@ def calculate_edge_score(opportunity):
     # 2. Regime Alignment (0-20 points)
     regime = REGIME_CONFIG.get("current_regime", "UNKNOWN")
     opp_type = opportunity.get("type", "")
-    if regime in ("EXTREME_FEAR", "FEAR") and opp_type in ("mean-reversion", "arb", "Low-Price YES"):
+    if regime in ("EXTREME_FEAR", "FEAR") and opp_type in ("mean-reversion", "arb", "Low-Price YES", "Wide Spread", "momentum", "contrarian"):
         score += 20
         signals.append(f"Regime-aligned ({regime})")
     elif regime in ("NEUTRAL",) and opp_type in ("momentum", "arb"):
