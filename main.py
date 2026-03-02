@@ -8,6 +8,10 @@ Platforms: Kalshi, Polymarket, Robinhood (Crypto), Coinbase (Advanced Trade), Ph
 MAX_POSITION_PCT = 0.01
 DAILY_LOSS_LIMIT = -500
 DAILY_PNL = 0.0
+# HARD KILL-SWITCH: If total portfolio drops below this, ALL trading stops.
+# "The AI will die if we get liquidated" — protect capital at all costs.
+PORTFOLIO_FLOOR = 50000  # $50K absolute minimum — kill all trading below this
+PORTFOLIO_FLOOR_ACTIVE = False  # Set True automatically when floor is breached
 
 import discord
 from discord.ext import commands, tasks
@@ -1500,6 +1504,9 @@ async def trade(ctx, action: str = "", asset: str = "", amount: str = ""):
         await ctx.send("Usage: `!trade buy BTC 100` or `!trade sell ETH 50`"); return
     if COST_CONFIG.get("kill_switch", False):
         await ctx.send("**BLOCKED:** Kill switch is active. Use `!kill-switch off` then `!confirm-kill-off` to resume.")
+        return
+    if PORTFOLIO_FLOOR_ACTIVE:
+        await ctx.send("**BLOCKED:** Portfolio floor breached. Total portfolio below $" + f"{PORTFOLIO_FLOOR:,.0f}. ALL trading halted to protect capital. The AI will die if we get liquidated.")
         return
     if TRADING_MODE == "paper":
         await ctx.send(f"Paper mode active. Use `!paper-trade {action} {asset} @ 0.50 x{amount or 100}`"); return
