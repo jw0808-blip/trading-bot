@@ -3937,13 +3937,13 @@ async def auto_execute_opportunity(opp, channel):
             success, exec_msg = await execute_kalshi_order("BUY", asset, size)
         elif platform == "Polymarket":
             # Polymarket needs on-chain execution — log as pending
-            success = True
             # Route to Polymarket CLOB
-                if POLYMARKET_PK:
-                    token_id = opp.get("token_id", opp.get("slug", ""))
-                    success, exec_msg = await execute_polymarket_order("BUY", token_id, size)
-                else:
-                    exec_msg = f"Polymarket not configured. Add POLYMARKET_PK to .env."
+            if POLYMARKET_PK:
+                token_id = opp.get("token_id", opp.get("slug", ""))
+                success, exec_msg = await execute_polymarket_order("BUY", token_id, size)
+            else:
+                success = False
+                exec_msg = "Polymarket not configured. Add POLYMARKET_PK to .env."
         elif asset in ("BTC", "ETH", "DOGE", "XRP", "SOL", "ALGO", "SHIB", "XLM", "HBAR"):
             success, exec_msg = await execute_coinbase_order("BUY", asset, size)
         elif asset.endswith("USDT") or asset.endswith("PERP"):
