@@ -410,3 +410,23 @@ Found 4 opps
 - [Polymarket] US x Iran ceasefire by March 6?
 - EV: +6.5% | 1538 shares @ $0.065 = $100.57
 ---
+
+## Portfolio Snapshot -- 2026-03-02 20:19:13 UTC
+- Kalshi: $1,233.58
+- Polymarket: $2,005.04 (positions: $1.06, deposited: $2,003.97)
+- Robinhood: $534.21 USD (buying power)
+- Coinbase: $79,249.65 USD total
+HBAR: 1,106.176173 ($110.10)
+DOGE: 0.056559
+XLM: 105,574.048027 ($16,683.23)
+SHIB: 73,192,336.172359 ($411.34)
+REN: 0.015922
+XRP: 31,898.241283 ($44,338.56)
+ALGO: 5,403.952179 ($479.39)
+USD: 0.004684
+USDC: 16,206.305113 ($16,206.31)
+ETH: 0.000384 ($0.78)
+BTC: 0.014797 ($1,019.94)
+- Phemex: $5,118.25 USDT
+
+---
