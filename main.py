@@ -4488,36 +4488,34 @@ async def test_execution(ctx, platform: str = "", amount: str = "1"):
     
     elif platform == "polymarket":
         try:
-            # Dynamically find a real active market from latest scan
-            poly_opps = find_polymarket_opportunities()
-            if not poly_opps:
-                await msg.edit(content="No active Polymarket markets found. Cannot test execution.")
+            # Fetch ANY active market with valid CLOB token for testing
+            poly_mkts = get_polymarket_markets(limit=20)
+            token_id = ""
+            market_name = "Unknown"
+            yes_price = 0.50
+            for mkt in poly_mkts:
+                clob_raw = mkt.get("clobTokenIds", "")
+                if clob_raw:
+                    try:
+                        ids = json.loads(clob_raw) if isinstance(clob_raw, str) else clob_raw
+                        if ids and len(str(ids[0])) > 10:
+                            token_id = ids[0]
+                            market_name = mkt.get("question", mkt.get("title", "Unknown"))[:60]
+                            op = mkt.get("outcomePrices", "")
+                            if op:
+                                try:
+                                    pp = json.loads(op) if isinstance(op, str) else op
+                                    yes_price = float(pp[0])
+                                except (ValueError, IndexError):
+                                    pass
+                            break
+                    except (json.JSONDecodeError, IndexError):
+                        pass
+            if not token_id:
+                await msg.edit(content="No Polymarket markets with valid CLOB token found.")
                 return
-            target_opp = None
-            for opp in poly_opps:
-                tid = opp.get("token_id", "")
-                if tid and len(tid) > 10:
-                    target_opp = opp
-                    break
-            if not target_opp or not target_opp.get("token_id"):
-                await msg.edit(content="No Polymarket opportunities with valid CLOB token_id found.")
-                return
-            token_id = target_opp["token_id"]
-            market_name = target_opp.get("market", "Unknown")[:60]
-            price = 0.50
-            detail = target_opp.get("detail", "")
-            if "YES @ $" in detail:
-                try:
-                    price = float(detail.split("YES @ $")[1].split()[0])
-                except (IndexError, ValueError):
-                    pass
-            elif "Yes $" in detail:
-                try:
-                    price = float(detail.split("Yes $")[1].split()[0])
-                except (IndexError, ValueError):
-                    pass
-            await msg.edit(content=f"Testing Polymarket execution{dry_tag}... ${amt:.2f}\nMarket: {market_name}\nToken: {token_id[:20]}...")
-            success, exec_msg = await execute_polymarket_order("BUY", token_id, amt, price=price)
+            await msg.edit(content=f"Testing Polymarket execution{dry_tag}... ${amt:.2f}\nMarket: {market_name}\nToken: {token_id[:20]}...\nYES price: ${yes_price:.3f}")
+            success, exec_msg = await execute_polymarket_order("BUY", token_id, amt, price=yes_price)
             exec_msg = f"[{market_name}] {exec_msg}"
         except Exception as exc:
             exec_msg = f"Error: {exc}"
