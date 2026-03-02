@@ -4987,6 +4987,19 @@ async def execute_ibkr_order(action, symbol, amount):
     except Exception as exc:
         return False, f"IBKR error: {exc}"
 
+
+def get_predictit_balance():
+    """Get PredictIt status."""
+    try:
+        r = requests.get("https://www.predictit.org/api/marketdata/all/", timeout=5)
+        if r.status_code == 200:
+            markets = r.json().get("markets", [])
+            return f"Connected ({len(markets)} markets available)"
+        else:
+            return f"API error: {r.status_code}"
+    except Exception as exc:
+        return f"Offline ({exc})"
+
 # ============================================================================
 # ENTRY POINT
 # ============================================================================
