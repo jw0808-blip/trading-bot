@@ -2143,7 +2143,7 @@ def track_openai_usage(tokens_used, model="gpt-4o-mini"):
 
 ALERT_CONFIG = {
     "enabled": True,
-    "min_ev_threshold": 0.05,  # 5% EV minimum
+    "min_ev_threshold": 0.025,  # 2.5% EV for more paper trades
     "cooldown_seconds": 1800,  # 30 min between alerts per market
     "max_alerts_per_hour": 5,
     "alert_history": {},       # market -> last_alert_time
