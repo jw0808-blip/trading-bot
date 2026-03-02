@@ -5,7 +5,7 @@ Multi-platform portfolio viewer and EV scanner.
 Platforms: Kalshi, Polymarket, Robinhood (Crypto), Coinbase (Advanced Trade), Phemex
 """
 
-MAX_POSITION_PCT = 0.0025  # 0.25% per trade
+MAX_POSITION_PCT = 0.015  # Tiered: 1.5% high / 0.5% medium / 0.25% low confidence
 DAILY_LOSS_LIMIT = -500
 DAILY_PNL = 0.0
 # HARD KILL-SWITCH: If total portfolio drops below this, ALL trading stops.
@@ -1062,9 +1062,31 @@ def get_fear_greed():
         d = r.json()["data"][0]; return int(d["value"]), d["value_classification"]
     except: return 50, "Neutral"
 
-def suggest_position_size(ev, portfolio_value=10000, max_pct=0.01):
+def get_tiered_max_position(edge_score=0):
+    """Tiered position sizing based on edge score confidence.
+    HIGH (≥75): 1-2% of portfolio
+    MEDIUM (65-74): 0.5%
+    LOW (<65): 0.25%
+    """
+    if edge_score >= 75:
+        return 0.015  # 1.5% for high confidence
+    elif edge_score >= 65:
+        return 0.005  # 0.5% for medium confidence
+    else:
+        return 0.0025  # 0.25% for lower confidence
+
+def suggest_position_size(ev, portfolio_value=88000, max_pct=None, edge_score=0):
+    """Position sizing with tiered confidence scaling."""
     if ev <= 0: return 0.0
-    return min(portfolio_value * min(ev, 0.05), portfolio_value * max_pct)
+    if max_pct is None:
+        max_pct = get_tiered_max_position(edge_score)
+    # Kelly fraction capped at tier max
+    kelly = min(ev, 0.05)
+    size = portfolio_value * kelly
+    cap = portfolio_value * max_pct
+    # Apply regime multiplier
+    regime_mult = REGIME_CONFIG.get("size_multiplier", 1.0) if "REGIME_CONFIG" in dir() else 1.0
+    return min(size * regime_mult, cap)
 
 
 # ============================================================================
@@ -1147,7 +1169,12 @@ async def cycle(ctx):
     kalshi_opps = find_kalshi_opportunities()
     poly_opps = find_polymarket_opportunities()
     crypto_opps = find_crypto_momentum()
-    all_opps = kalshi_opps + poly_opps + crypto_opps
+    # Funding rate arbitrage
+    try:
+        funding_opps = await check_funding_rate_arb()
+    except Exception:
+        funding_opps = []
+    all_opps = kalshi_opps + poly_opps + crypto_opps + funding_opps
     all_opps.sort(key=lambda x: x.get("ev", 0), reverse=True)
     if not all_opps:
         await msg.edit(content=f"**EV Scan** | {ts}\nFear & Greed: {fng_val}/100 ({fng_label}) | Regime: {REGIME_CONFIG.get("current_regime", "?")}\nNo opportunities found.")
@@ -1842,7 +1869,7 @@ async def show_memory(ctx, action: str = "view", *, content: str = ""):
 # ============================================================================
 CONTEXT_MEMORY = {
     "hot": {  # Core rules — always active
-        "max_position_pct": 0.0025,  # 0.25% per trade
+        "max_position_pct": 0.015,  # Tiered: up to 1.5% for high-confidence
         "daily_loss_limit": -500,
         "trading_mode": "paper",
         "risk_tolerance": "conservative",
@@ -2335,7 +2362,7 @@ async def cost_status(ctx):
         f"**Auto-Live Config:**\n"
         f"  Enabled: {auto['enabled']}\n"
         f"  Min EV: {auto['min_ev']*100:.1f}% | Min edge score: {auto['min_edge_score']}\n"
-        f"  Max position: {auto['max_position_pct']*100:.2f}% | Max daily trades: {auto['max_daily_trades']}\n"
+        f"  Max position: Tiered (1.5%/0.5%/0.25%) | Max daily trades: {auto['max_daily_trades']}\n"
         f"  Drawdown halt: {auto['drawdown_halt_pct']}%\n"
     )
 
@@ -3941,7 +3968,7 @@ def suggest_position_size_v2(opportunity, bankroll=10000):
         size = 0  # Don't trade SKIP signals
     
     # Floor and ceiling
-    size = max(0, min(size, bankroll * MAX_POSITION_PCT))
+    size = max(0, min(size, bankroll * get_tiered_max_position(opportunity.get("edge_score", 0))))
     
     return round(size, 2)
 
@@ -5224,6 +5251,58 @@ def get_predictit_balance():
         return f"Offline ({exc})"
 
 
+
+# ============================================================================
+# FUNDING RATE ARBITRAGE MODULE (Phemex + Coinbase)
+# ============================================================================
+FUNDING_ARB_CONFIG = {
+    "enabled": True,
+    "min_funding_rate": 0.0003,  # 0.03% minimum (above round-trip friction)
+    "commission_estimate": 0.0002,  # ~0.02% per side (Phemex + Coinbase)
+    "slippage_estimate": 0.0001,  # ~0.01% estimated slippage
+    "max_position_usd": 2000,  # Max $2000 per arb leg
+    "pairs": ["BTC", "ETH"],  # Assets to monitor
+    "active_arbs": [],  # Currently open arb positions
+}
+
+async def check_funding_rate_arb():
+    """Check Phemex funding rates for arbitrage opportunities."""
+    if not FUNDING_ARB_CONFIG["enabled"]:
+        return []
+    opps = []
+    min_rate = FUNDING_ARB_CONFIG["min_funding_rate"]
+    friction = FUNDING_ARB_CONFIG["commission_estimate"] * 2 + FUNDING_ARB_CONFIG["slippage_estimate"]
+    for asset in FUNDING_ARB_CONFIG["pairs"]:
+        try:
+            # Fetch funding rate from Phemex
+            symbol = f"s{asset}USDT" if asset == "BTC" else f"s{asset}USDT"
+            url = f"https://api.phemex.com/v1/md/ticker/24hr?symbol={symbol}"
+            r = requests.get(url, timeout=5)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            # Phemex returns funding rate in result
+            result = data.get("result", {})
+            funding_rate = float(result.get("fundingRate", "0")) / 1e8 if result.get("fundingRate") else 0
+            if funding_rate > min_rate and funding_rate > friction:
+                net_yield = funding_rate - friction
+                annualized = net_yield * 3 * 365 * 100  # 3x daily funding, annualized %
+                opps.append({
+                    "platform": "Phemex+Coinbase",
+                    "type": "Funding Rate Arb",
+                    "market": f"{asset} Funding Rate Arbitrage",
+                    "detail": f"Rate: {funding_rate*100:.4f}% | Net: {net_yield*100:.4f}% | Ann: {annualized:.1f}% | Friction: {friction*100:.4f}%",
+                    "ev": net_yield * 3,  # Daily EV (3 funding periods)
+                    "ticker": asset,
+                    "funding_rate": funding_rate,
+                    "net_yield": net_yield,
+                })
+                log.info("Funding arb: %s rate=%.4f%% net=%.4f%% ann=%.1f%%",
+                         asset, funding_rate*100, net_yield*100, annualized)
+        except Exception as exc:
+            log.warning("Funding rate check error for %s: %s", asset, exc)
+    return opps
+
 # ============================================================================
 # AUTO-LIVE EXECUTION ENGINE
 # ============================================================================
@@ -5452,7 +5531,11 @@ async def enforce_paper_trade_floor(channel):
         kalshi_opps = find_kalshi_opportunities()
         poly_opps = find_polymarket_opportunities()
         crypto_opps = find_crypto_momentum()
-        all_opps = kalshi_opps + poly_opps + crypto_opps
+        try:
+            funding_opps = await check_funding_rate_arb()
+        except Exception:
+            funding_opps = []
+        all_opps = kalshi_opps + poly_opps + crypto_opps + funding_opps
         all_opps.sort(key=lambda x: x.get("ev", 0), reverse=True)
         for opp in all_opps[:3]:  # Try up to 3 trades
             if PAPER_TRADES_TODAY >= MIN_PAPER_TRADES_PER_DAY:
