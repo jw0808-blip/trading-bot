@@ -148,3 +148,9 @@ F&G: 10
 Found 5 opps
 
 ---
+
+## EV Scan -- 2026-03-02 05:31:53 UTC
+F&G: 10
+Found 6 opps
+
+---
