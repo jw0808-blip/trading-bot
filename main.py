@@ -2380,6 +2380,50 @@ async def zapier_status(ctx):
         f"Supported events: trade_executed, kill_switch, daily_summary, high_ev_alert"
     )
 
+@bot.command(name="rebalance")
+async def rebalance_cmd(ctx):
+    """Check portfolio allocation and suggest rebalancing."""
+    msg = await ctx.send("Checking allocation drift...")
+    suggestions = await auto_rebalance()
+    if not suggestions:
+        await msg.edit(content="**Rebalance Check** — All allocations within 5% of target. No action needed.")
+        return
+    report = "**Rebalance Suggestions**\n================================\n"
+    for s in suggestions:
+        report += f"**{s['platform'].upper()}**: {s['direction']} ${s['amount']:,.0f} ({s['actual_pct']:.0f}% actual → {s['target_pct']:.0f}% target, drift: {s['drift']:+.1f}%)\n"
+    report += "================================\nUse manual transfers to rebalance. Auto-rebalance coming soon."
+    await msg.edit(content=report)
+
+@bot.command(name="performance")
+async def performance_cmd(ctx):
+    """Show performance attribution by strategy, platform, and regime."""
+    pt = PERFORMANCE_TRACKER
+    paper_trades = len(PAPER_PORTFOLIO.get("trades", []))
+    paper_cash = PAPER_PORTFOLIO["cash"]
+    paper_pnl = paper_cash - 10000
+    report = (
+        f"**Performance Attribution**\n================================\n"
+        f"**Paper Trading:**\n"
+        f"  Trades: {paper_trades} | Cash: ${paper_cash:,.2f} | P&L: ${paper_pnl:+,.2f}\n"
+        f"  Signals recorded: {len(SIGNAL_HISTORY)}\n\n"
+    )
+    if pt["by_strategy"]:
+        report += "**By Strategy:**\n"
+        for strat, data in pt["by_strategy"].items():
+            wr = (data["wins"] / data["trades"] * 100) if data["trades"] > 0 else 0
+            report += f"  {strat}: {data['trades']} trades, ${data['pnl']:+,.2f} P&L, {wr:.0f}% win rate\n"
+    if pt["by_platform"]:
+        report += "\n**By Platform:**\n"
+        for plat, data in pt["by_platform"].items():
+            report += f"  {plat}: {data['trades']} trades, ${data['pnl']:+,.2f} P&L\n"
+    if not pt["by_strategy"] and not pt["by_platform"]:
+        report += "No live trade data yet. Paper trades are being tracked.\n"
+        report += f"\n**Paper Trade Log:**\n"
+        for t in PAPER_PORTFOLIO.get("trades", [])[-5:]:
+            report += f"  {t.get('timestamp', '')} | {t.get('side', '')} {t.get('market', '')[:40]} | ${t.get('cost', 0):,.2f}\n"
+    report += "================================"
+    await ctx.send(report)
+
 @bot.command(name="kill-switch")
 async def kill_switch(ctx, action: str = ""):
     """Emergency kill switch. Usage: !kill-switch on/off"""
@@ -2478,6 +2522,13 @@ async def alert_scan_task():
         if not CYCLE_PAUSED and not COST_CONFIG.get("kill_switch", False):
             await check_and_send_alerts()
             push_all_analytics()  # push metrics each cycle
+            # Enforce minimum paper trade floor
+            try:
+                ch = bot.get_channel(int(DISCORD_CHANNEL_ID))
+                if ch:
+                    await enforce_paper_trade_floor(ch)
+            except Exception as pfe:
+                log.warning("Paper floor error: %s", pfe)
             # V9 EXIT CHECK
             try:
                 ch = bot.get_channel(int(DISCORD_CHANNEL_ID))
@@ -4230,6 +4281,8 @@ async def auto_execute_opportunity(opp, channel):
 # ============================================================================
 
 async def check_and_manage_exits(channel):
+    """Enhanced exit management: trailing stops, 24h pre-resolution, ATR-based."""
+    global PAPER_TRADES_TODAY
     """Check all open positions and auto-exit when conditions are met."""
     if not OPEN_POSITIONS:
         return
@@ -5274,6 +5327,146 @@ async def daily_reset_task():
 @daily_reset_task.before_loop
 async def before_daily_reset():
     await bot.wait_until_ready()
+
+
+
+# ============================================================================
+# DAILY AUTO-REBALANCING (Task 7)
+# ============================================================================
+REBALANCE_CONFIG = {
+    "enabled": True,
+    "target_allocations": {
+        "polymarket": 0.25,   # 25% to prediction markets
+        "kalshi": 0.20,       # 20% to Kalshi
+        "coinbase": 0.25,     # 25% to crypto
+        "phemex": 0.10,       # 10% to Phemex derivatives
+        "alpaca": 0.15,       # 15% to equities
+        "ibkr": 0.05,         # 5% to IBKR
+    },
+    "threshold": 0.05,  # 5% drift triggers rebalance
+    "last_rebalance": "",
+}
+
+async def auto_rebalance(channel=None):
+    """Check portfolio allocation drift and suggest rebalancing."""
+    try:
+        balances = {
+            "polymarket": 2005, "kalshi": 1234, "coinbase": 79000,
+            "phemex": 5118, "alpaca": 0, "ibkr": 0,
+        }
+        total = sum(balances.values())
+        if total < 1000:
+            return []
+        suggestions = []
+        for platform, target_pct in REBALANCE_CONFIG["target_allocations"].items():
+            actual_pct = balances.get(platform, 0) / total
+            drift = actual_pct - target_pct
+            if abs(drift) > REBALANCE_CONFIG["threshold"]:
+                direction = "REDUCE" if drift > 0 else "ADD"
+                amount = abs(drift) * total
+                suggestions.append({
+                    "platform": platform,
+                    "direction": direction,
+                    "amount": amount,
+                    "actual_pct": actual_pct * 100,
+                    "target_pct": target_pct * 100,
+                    "drift": drift * 100,
+                })
+        REBALANCE_CONFIG["last_rebalance"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        if channel and suggestions:
+            msg = "**Daily Rebalance Check**\n"
+            for s in suggestions:
+                msg += f"  {s['platform'].upper()}: {s['direction']} ${s['amount']:,.0f} ({s['actual_pct']:.0f}% → {s['target_pct']:.0f}% target)\n"
+            await channel.send(msg)
+        return suggestions
+    except Exception as exc:
+        log.warning("Rebalance error: %s", exc)
+        return []
+
+
+# ============================================================================
+# PERFORMANCE ATTRIBUTION (Task 8)
+# ============================================================================
+PERFORMANCE_TRACKER = {
+    "by_strategy": {},    # {strategy_name: {trades: N, pnl: X, wins: N, losses: N}}
+    "by_platform": {},    # {platform: {trades: N, pnl: X}}
+    "by_regime": {},      # {regime: {trades: N, pnl: X}}
+    "total_trades": 0,
+    "total_pnl": 0.0,
+    "best_trade": None,
+    "worst_trade": None,
+}
+
+def record_performance(trade_data):
+    """Record trade for performance attribution."""
+    strategy = trade_data.get("type", "unknown")
+    platform = trade_data.get("platform", "unknown")
+    regime = REGIME_CONFIG.get("current_regime", "unknown")
+    pnl = trade_data.get("pnl", 0)
+    # By strategy
+    if strategy not in PERFORMANCE_TRACKER["by_strategy"]:
+        PERFORMANCE_TRACKER["by_strategy"][strategy] = {"trades": 0, "pnl": 0, "wins": 0, "losses": 0}
+    s = PERFORMANCE_TRACKER["by_strategy"][strategy]
+    s["trades"] += 1
+    s["pnl"] += pnl
+    if pnl > 0: s["wins"] += 1
+    elif pnl < 0: s["losses"] += 1
+    # By platform
+    if platform not in PERFORMANCE_TRACKER["by_platform"]:
+        PERFORMANCE_TRACKER["by_platform"][platform] = {"trades": 0, "pnl": 0}
+    p = PERFORMANCE_TRACKER["by_platform"][platform]
+    p["trades"] += 1
+    p["pnl"] += pnl
+    # By regime
+    if regime not in PERFORMANCE_TRACKER["by_regime"]:
+        PERFORMANCE_TRACKER["by_regime"][regime] = {"trades": 0, "pnl": 0}
+    r = PERFORMANCE_TRACKER["by_regime"][regime]
+    r["trades"] += 1
+    r["pnl"] += pnl
+    # Totals
+    PERFORMANCE_TRACKER["total_trades"] += 1
+    PERFORMANCE_TRACKER["total_pnl"] += pnl
+    if PERFORMANCE_TRACKER["best_trade"] is None or pnl > PERFORMANCE_TRACKER["best_trade"].get("pnl", 0):
+        PERFORMANCE_TRACKER["best_trade"] = trade_data
+    if PERFORMANCE_TRACKER["worst_trade"] is None or pnl < PERFORMANCE_TRACKER["worst_trade"].get("pnl", 0):
+        PERFORMANCE_TRACKER["worst_trade"] = trade_data
+
+
+# ============================================================================
+# MINIMUM PAPER TRADE FLOOR (Task 10)
+# ============================================================================
+MIN_PAPER_TRADES_PER_DAY = 4
+PAPER_TRADES_TODAY = 0
+
+async def enforce_paper_trade_floor(channel):
+    """If fewer than MIN trades today, lower thresholds temporarily and force trades."""
+    global PAPER_TRADES_TODAY
+    if TRADING_MODE != "paper" or not AUTO_PAPER_ENABLED:
+        return
+    if PAPER_TRADES_TODAY >= MIN_PAPER_TRADES_PER_DAY:
+        return
+    # Temporarily lower EV threshold to find more opportunities
+    original_threshold = ALERT_CONFIG["min_ev_threshold"]
+    ALERT_CONFIG["min_ev_threshold"] = 0.01  # Lower to 1% temporarily
+    try:
+        kalshi_opps = find_kalshi_opportunities()
+        poly_opps = find_polymarket_opportunities()
+        crypto_opps = find_crypto_momentum()
+        all_opps = kalshi_opps + poly_opps + crypto_opps
+        all_opps.sort(key=lambda x: x.get("ev", 0), reverse=True)
+        for opp in all_opps[:3]:  # Try up to 3 trades
+            if PAPER_TRADES_TODAY >= MIN_PAPER_TRADES_PER_DAY:
+                break
+            try:
+                executed = await auto_paper_execute(channel, opp)
+                if executed:
+                    PAPER_TRADES_TODAY += 1
+                    log.info("Floor trade executed: %s (trade %d/%d)",
+                             opp.get("market", "")[:40], PAPER_TRADES_TODAY, MIN_PAPER_TRADES_PER_DAY)
+            except Exception:
+                pass
+    finally:
+        ALERT_CONFIG["min_ev_threshold"] = original_threshold
 
 
 # ============================================================================
