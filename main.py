@@ -4988,6 +4988,117 @@ async def execute_ibkr_order(action, symbol, amount):
         return False, f"IBKR error: {exc}"
 
 
+# ============================================================================
+# TRADINGVIEW WEBHOOK ENDPOINT
+# ============================================================================
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class TVWebhookHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode()
+            data = _json.loads(body) if body else {}
+            secret = TRADINGVIEW_SIGNALS.get("webhook_secret", "")
+            if secret and data.get("secret") != secret:
+                self.send_response(403)
+                self.end_headers()
+                return
+            sig_type = data.get("signal", data.get("action", "")).upper()
+            asset = data.get("asset", data.get("ticker", "MARKET")).upper()
+            indicator = data.get("indicator", data.get("source", "TradingView"))
+            if sig_type:
+                TRADINGVIEW_SIGNALS["latest_signal"] = {
+                    "signal": sig_type, "asset": asset, "indicator": indicator,
+                    "timestamp": datetime.utcnow(), "source": "webhook",
+                }
+                log.info("TV Webhook: %s %s (%s)", sig_type, asset, indicator)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+        except Exception as exc:
+            log.warning("TV Webhook error: %s", exc)
+            self.send_response(500)
+            self.end_headers()
+    def log_message(self, fmt, *args):
+        pass
+
+def start_webhook_server(port=8080):
+    try:
+        server = HTTPServer(("0.0.0.0", port), TVWebhookHandler)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        log.info("TradingView webhook server on port %d", port)
+    except Exception as exc:
+        log.warning("Webhook server failed: %s", exc)
+
+
+# ============================================================================
+# ZAPIER / MAKE.COM INTEGRATION
+# ============================================================================
+ZAPIER_CONFIG = {
+    "enabled": bool(os.getenv("ZAPIER_WEBHOOK_URL", "")),
+    "webhook_url": os.getenv("ZAPIER_WEBHOOK_URL", ""),
+    "events": ["trade_executed", "kill_switch", "daily_summary", "high_ev_alert"],
+}
+
+def notify_zapier(event_type, payload):
+    if not ZAPIER_CONFIG["enabled"] or event_type not in ZAPIER_CONFIG["events"]:
+        return
+    try:
+        requests.post(ZAPIER_CONFIG["webhook_url"], json={
+            "event": event_type, "timestamp": datetime.utcnow().isoformat(),
+            "data": payload, "bot": "TraderJoes",
+        }, timeout=5)
+    except Exception:
+        pass
+
+
+# ============================================================================
+# AUTO-FEE PAYMENT FROM PROFITS
+# ============================================================================
+FEE_CONFIG = {
+    "enabled": False,
+    "fee_pct": 0.10,
+    "min_profit_threshold": 100.0,
+    "total_profits": 0.0,
+    "total_fees_paid": 0.0,
+    "fee_wallet": os.getenv("FEE_WALLET_ADDRESS", ""),
+    "last_fee_date": "",
+}
+
+def calculate_fees():
+    profits = FEE_CONFIG["total_profits"]
+    already_paid = FEE_CONFIG["total_fees_paid"]
+    if profits <= FEE_CONFIG["min_profit_threshold"]:
+        return 0.0
+    return max(0, (profits * FEE_CONFIG["fee_pct"]) - already_paid)
+
+
+# ============================================================================
+# PREDICTIT MARKET SCANNER
+# ============================================================================
+def get_predictit_markets(limit=10):
+    try:
+        r = requests.get("https://www.predictit.org/api/marketdata/all/", timeout=5)
+        if r.status_code != 200:
+            return []
+        markets = []
+        for m in r.json().get("markets", [])[:limit]:
+            for c in m.get("contracts", []):
+                yp = c.get("lastTradePrice", 0) or 0
+                if 0.05 <= yp <= 0.95:
+                    markets.append({
+                        "platform": "PredictIt", "market": m.get("shortName", "")[:60],
+                        "slug": c.get("shortName", ""), "yes_price": yp,
+                        "no_price": 1 - yp, "volume24h": 0, "liquidity": 0,
+                    })
+        return markets
+    except Exception:
+        return []
+
+
 def get_predictit_balance():
     """Get PredictIt status."""
     try:
@@ -5008,4 +5119,5 @@ if __name__ == "__main__":
     if not DISCORD_TOKEN:
         log.error("DISCORD_TOKEN not set -- cannot start bot")
         raise SystemExit(1)
+    start_webhook_server(port=int(os.getenv("TV_WEBHOOK_PORT", "8080")))
     bot.run(DISCORD_TOKEN)
