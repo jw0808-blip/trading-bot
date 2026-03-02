@@ -2451,6 +2451,62 @@ async def performance_cmd(ctx):
     report += "================================"
     await ctx.send(report)
 
+@bot.command(name="security-status")
+async def security_status(ctx):
+    """Show security status including hostname, circuit breaker, key rotation."""
+    hostname_ok = check_hostname_security()
+    cb = CIRCUIT_BREAKER
+    rotations = check_key_rotation_needed()
+    report = (
+        f"**Security Status**\n================================\n"
+        f"Hostname: {socket.gethostname()} ({'OK' if hostname_ok else 'UNAUTHORIZED'})\n"
+        f"Allowed: {ALLOWED_HOSTNAME}\n"
+        f"Circuit breaker: {'TRIPPED' if cb['tripped'] else 'OK'}\n"
+        f"Trades last 60s: {len(cb['trades_last_60s'])} / {cb['max_trades_per_minute']} max\n"
+    )
+    if cb["tripped"]:
+        report += f"Trip reason: {cb['trip_reason']}\n"
+    if rotations:
+        report += "\n**Key Rotation Reminders:**\n"
+        for r in rotations:
+            report += f"  {r}\n"
+    else:
+        report += "\nKey rotation: All keys current\n"
+    report += "================================"
+    await ctx.send(report)
+
+@bot.command(name="reset-breaker")
+async def reset_breaker(ctx):
+    """Reset the circuit breaker after it trips."""
+    CIRCUIT_BREAKER["tripped"] = False
+    CIRCUIT_BREAKER["trip_reason"] = ""
+    CIRCUIT_BREAKER["trades_last_60s"] = []
+    await ctx.send("Circuit breaker **RESET**. Trading can resume.")
+
+@bot.command(name="key-rotation-status")
+async def key_rotation_status(ctx):
+    """Check API key rotation status."""
+    reminders = check_key_rotation_needed()
+    if reminders:
+        msg = "**Key Rotation Reminders:**\n"
+        for r in reminders:
+            msg += f"  {r}\n"
+    else:
+        msg = "All API keys are current. No rotation needed."
+    msg += f"\nLast Kalshi rotation: {KEY_ROTATION_CONFIG['kalshi_last_rotated']}"
+    msg += f"\nRotation interval: {KEY_ROTATION_CONFIG['rotation_interval_days']} days"
+    msg += "\n\nTo mark keys as rotated: `!key-rotated kalshi`"
+    await ctx.send(msg)
+
+@bot.command(name="key-rotated")
+async def key_rotated(ctx, platform: str = ""):
+    """Mark a platform's API key as freshly rotated."""
+    if not platform:
+        await ctx.send("Usage: `!key-rotated kalshi` or `!key-rotated phemex`")
+        return
+    KEY_ROTATION_CONFIG[f"{platform.lower()}_last_rotated"] = datetime.utcnow().strftime("%Y-%m-%d")
+    await ctx.send(f"Marked **{platform}** API key as rotated today.")
+
 @bot.command(name="kill-switch")
 async def kill_switch(ctx, action: str = ""):
     """Emergency kill switch. Usage: !kill-switch on/off"""
@@ -5303,6 +5359,80 @@ async def check_funding_rate_arb():
             log.warning("Funding rate check error for %s: %s", asset, exc)
     return opps
 
+
+# ============================================================================
+# APPLICATION-LEVEL SECURITY (Hostname Pinning + Circuit Breaker)
+# ============================================================================
+import socket
+
+ALLOWED_HOSTNAME = "ubuntu-4gb-hel1-1"
+CIRCUIT_BREAKER = {
+    "trades_last_60s": [],  # timestamps of recent trades
+    "max_trades_per_minute": 10,
+    "tripped": False,
+    "trip_reason": "",
+}
+KEY_ROTATION_CONFIG = {
+    "kalshi_last_rotated": "2026-03-02",
+    "rotation_interval_days": 30,
+    "platforms_to_rotate": ["kalshi", "phemex", "coinbase", "alpaca"],
+}
+
+def check_hostname_security():
+    """Verify we are running on the authorized server."""
+    current = socket.gethostname()
+    if current != ALLOWED_HOSTNAME:
+        log.critical("SECURITY ALERT: Trade from unauthorized host %s (expected %s)", current, ALLOWED_HOSTNAME)
+        return False
+    return True
+
+def check_circuit_breaker():
+    """Check if circuit breaker is tripped. Returns True if safe to trade."""
+    if CIRCUIT_BREAKER["tripped"]:
+        return False
+    now = datetime.now(timezone.utc)
+    # Clean old entries (older than 60s)
+    CIRCUIT_BREAKER["trades_last_60s"] = [
+        t for t in CIRCUIT_BREAKER["trades_last_60s"]
+        if (now - t).total_seconds() < 60
+    ]
+    if len(CIRCUIT_BREAKER["trades_last_60s"]) >= CIRCUIT_BREAKER["max_trades_per_minute"]:
+        CIRCUIT_BREAKER["tripped"] = True
+        CIRCUIT_BREAKER["trip_reason"] = f"Rate limit: {len(CIRCUIT_BREAKER['trades_last_60s'])} trades in 60s"
+        log.critical("CIRCUIT BREAKER TRIPPED: %s", CIRCUIT_BREAKER["trip_reason"])
+        COST_CONFIG["kill_switch"] = True
+        return False
+    return True
+
+def record_trade_for_breaker():
+    """Record a trade timestamp for circuit breaker tracking."""
+    CIRCUIT_BREAKER["trades_last_60s"].append(datetime.now(timezone.utc))
+
+def check_key_rotation_needed():
+    """Check if any API keys need rotation."""
+    reminders = []
+    try:
+        last = datetime.strptime(KEY_ROTATION_CONFIG["kalshi_last_rotated"], "%Y-%m-%d")
+        days_since = (datetime.utcnow() - last).days
+        days_until = KEY_ROTATION_CONFIG["rotation_interval_days"] - days_since
+        if days_until <= 0:
+            reminders.append(f"Kalshi API key OVERDUE for rotation ({days_since} days old)")
+        elif days_until <= 7:
+            reminders.append(f"Kalshi API key rotation in {days_until} days")
+    except Exception:
+        reminders.append("Kalshi key rotation date unknown")
+    return reminders
+
+def pre_trade_security_check(platform=""):
+    """Run all security checks before any trade execution."""
+    if not check_hostname_security():
+        return False, "BLOCKED: Unauthorized hostname"
+    if not check_circuit_breaker():
+        return False, f"BLOCKED: Circuit breaker tripped - {CIRCUIT_BREAKER.get('trip_reason', 'rate limit')}"
+    if COST_CONFIG.get("kill_switch", False):
+        return False, "BLOCKED: Kill switch active"
+    return True, "OK"
+
 # ============================================================================
 # AUTO-LIVE EXECUTION ENGINE
 # ============================================================================
@@ -5310,7 +5440,10 @@ async def auto_live_execute(channel, opp):
     """Auto-execute trade in live mode when edge score meets threshold."""
     if DRY_RUN_MODE or TRADING_MODE != "live":
         return False
-    if COST_CONFIG.get("kill_switch", False):
+    # Security checks
+    safe, reason = pre_trade_security_check(opp.get("platform", ""))
+    if not safe:
+        log.warning("Auto-live blocked: %s", reason)
         return False
     auto = AUTO_LIVE_CONFIG
     if not auto["enabled"]:
@@ -5359,6 +5492,7 @@ async def auto_live_execute(channel, opp):
         if success:
             auto["trades_today"] = auto.get("trades_today", 0) + 1
             COST_CONFIG["daily_trades"] = COST_CONFIG.get("daily_trades", 0) + 1
+            record_trade_for_breaker()
             notify_zapier("trade_executed", {
                 "platform": platform, "market": opp.get("market", ""),
                 "size": size, "ev": ev, "score": score, "confidence": confidence,
