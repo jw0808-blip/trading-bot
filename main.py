@@ -2873,7 +2873,7 @@ async def auto_paper_cmd(ctx, action: str = ""):
         )
 
 
-@bot.command(name="signals")
+
 async def signals_cmd(ctx, action: str = "recent"):
     """View signal history and learning stats. Usage: !signals [recent|stats|all]"""
     if action == "stats":
