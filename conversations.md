@@ -718,3 +718,8 @@ Found 4 opps
 - [Polymarket] US x Iran ceasefire by March 6?
 - EV: +6.5% | 3384 shares @ $0.065 = $221.28
 ---
+
+## Auto-Paper Trade — 00:46 UTC
+- [Polymarket] US x Iran ceasefire by March 6?
+- EV: +6.5% | 3384 shares @ $0.065 = $221.28
+---
