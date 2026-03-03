@@ -2454,6 +2454,40 @@ async def performance_cmd(ctx):
     report += "================================"
     await ctx.send(report)
 
+@bot.command(name="calibration")
+async def calibration_cmd(ctx):
+    s = get_calibration_summary()
+    if s["total"] == 0:
+        await ctx.send("**Calibration Report**\nNo resolved trades yet.\nUse `!resolve win [market]` or `!resolve loss [market]` when markets close.")
+        return
+    grade = "Excellent" if s["avg_brier"] < 0.1 else "Good" if s["avg_brier"] < 0.2 else "Average" if s["avg_brier"] < 0.25 else "Poor"
+    r = f"**Calibration Report**\n================================\nResolved: {s['total']} | Win rate: {s['win_rate']:.0f}% | P&L: ${s['total_pnl']:+,.2f}\n"
+    r += f"Brier Score: {s['avg_brier']:.4f} ({grade}) | 0=perfect, 0.25=coin flip\n"
+    r += f"EV Accuracy: {s['avg_ev_accuracy']:.4f} | lower = better calibrated\n================================"
+    await ctx.send(r)
+
+@bot.command(name="resolve")
+async def resolve_cmd(ctx, outcome: str = "", *, market_search: str = ""):
+    if outcome.lower() not in ("win", "loss"):
+        await ctx.send("Usage: `!resolve win Iran ceasefire` or `!resolve loss 2 degrees`")
+        return
+    outcome_val = 1.0 if outcome.lower() == "win" else 0.0
+    matched = None
+    matched_idx = None
+    for i, pos in enumerate(PAPER_PORTFOLIO.get("positions", [])):
+        if market_search.lower() in pos.get("market", "").lower():
+            matched = pos
+            matched_idx = i
+            break
+    if not matched:
+        await ctx.send(f"No open position matching that. Check `!paper-status`.")
+        return
+    result = record_resolution(matched, outcome_val)
+    PAPER_PORTFOLIO["positions"].pop(matched_idx)
+    if outcome_val == 1.0:
+        PAPER_PORTFOLIO["cash"] += matched.get("shares", 1) * 1.0
+    await ctx.send(f"**Resolved: {'WIN' if outcome_val == 1.0 else 'LOSS'}** | {matched.get('market', '')}\nEntry: ${matched.get('entry_price', 0):.3f} | P&L: ${result['pnl']:+,.2f} | Brier: {result['brier_score']:.4f}\nUse `!calibration` for overall accuracy.")
+
 @bot.command(name="security-status")
 async def security_status(ctx):
     """Show security status including hostname, circuit breaker, key rotation."""
@@ -5693,6 +5727,40 @@ async def enforce_paper_trade_floor(channel):
                 pass
     finally:
         ALERT_CONFIG["min_ev_threshold"] = original_threshold
+
+
+
+# ============================================================================
+# POST-RESOLUTION AUDIT (Brier Score + EV Calibration)
+# ============================================================================
+RESOLUTION_TRACKER = {"resolved_trades": [], "total_brier": 0.0, "total_resolved": 0, "calibration_scores": []}
+
+def record_resolution(trade, outcome):
+    entry_price = trade.get("entry_price", 0.5)
+    predicted_ev = trade.get("ev", 0)
+    realized_edge = (1.0 - entry_price) if outcome == 1.0 else (0.0 - entry_price)
+    brier = (entry_price - outcome) ** 2
+    ev_accuracy = abs(realized_edge - predicted_ev)
+    result = {"market": trade.get("market", ""), "platform": trade.get("platform", ""),
+              "entry_price": entry_price, "outcome": outcome, "realized_edge": realized_edge,
+              "predicted_ev": predicted_ev, "ev_accuracy": ev_accuracy, "brier_score": brier,
+              "pnl": realized_edge * trade.get("shares", 1), "resolved_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
+    RESOLUTION_TRACKER["resolved_trades"].append(result)
+    RESOLUTION_TRACKER["total_brier"] += brier
+    RESOLUTION_TRACKER["total_resolved"] += 1
+    RESOLUTION_TRACKER["calibration_scores"].append(ev_accuracy)
+    return result
+
+def get_calibration_summary():
+    rt = RESOLUTION_TRACKER
+    if rt["total_resolved"] == 0:
+        return {"avg_brier": None, "win_rate": None, "total": 0, "total_pnl": 0}
+    avg_brier = rt["total_brier"] / rt["total_resolved"]
+    wins = sum(1 for t in rt["resolved_trades"] if t["pnl"] > 0)
+    avg_ev = sum(rt["calibration_scores"]) / len(rt["calibration_scores"])
+    return {"avg_brier": avg_brier, "avg_ev_accuracy": avg_ev,
+            "win_rate": wins / rt["total_resolved"] * 100, "total": rt["total_resolved"],
+            "total_pnl": sum(t["pnl"] for t in rt["resolved_trades"])}
 
 
 # ============================================================================
