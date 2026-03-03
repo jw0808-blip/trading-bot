@@ -1101,6 +1101,9 @@ def suggest_position_size(ev, portfolio_value=88000, max_pct=None, edge_score=0)
 
 @bot.event
 async def on_ready():
+    init_redis()
+    init_db()
+    db_load_daily_state()
     log.info("TraderJoes bot online as %s", bot.user)
     if not daily_report_task.is_running():
         daily_report_task.start()
@@ -2803,6 +2806,9 @@ async def auto_paper_execute(channel, opp):
     }
     PAPER_PORTFOLIO["positions"].append(position)
     PAPER_PORTFOLIO["trades"].append(position)
+    publish_signal("trade_signals", {"market": position["market"], "platform": position.get("platform",""), "ev": opp.get("ev",0), "size": total_cost})
+    db_log_paper_trade(position)
+    db_save_daily_state()
 
     # Record signal as executed
     signal = record_signal(opp, executed=True, paper=True)
