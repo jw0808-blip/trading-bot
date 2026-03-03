@@ -1,4 +1,3 @@
-
 services:
   traderjoes-bot:
     build:
@@ -11,12 +10,25 @@ services:
     volumes:
       - bot-logs:/app/logs
       - ./data:/app/data
+    depends_on:
+      - redis
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
-
+  redis:
+    image: redis:7-alpine
+    container_name: traderjoes-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redis-data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
   openclaw:
     build:
       context: .
@@ -54,9 +66,9 @@ services:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
-
 volumes:
   bot-logs:
+  redis-data:
   netdataconfig:
   netdatalib:
   netdatacache:

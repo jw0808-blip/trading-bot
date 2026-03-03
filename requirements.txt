@@ -8,3 +8,4 @@ python-dotenv
 web3
 PyJWT
 py-clob-client
+redis>=5.0.0
