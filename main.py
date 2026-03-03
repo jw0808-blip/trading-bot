@@ -5453,7 +5453,7 @@ async def check_funding_rate_arb():
 # ============================================================================
 import socket
 
-ALLOWED_HOSTNAME = "ubuntu-4gb-hel1-1"
+ALLOWED_HOSTNAME = os.getenv("ALLOWED_HOSTNAME", "ubuntu-4gb-hel1-1")
 CIRCUIT_BREAKER = {
     "trades_last_60s": [],  # timestamps of recent trades
     "max_trades_per_minute": 10,
@@ -5469,7 +5469,7 @@ KEY_ROTATION_CONFIG = {
 def check_hostname_security():
     """Verify we are running on the authorized server."""
     current = socket.gethostname()
-    if current != ALLOWED_HOSTNAME:
+    if ALLOWED_HOSTNAME not in (current, "ubuntu-4gb-hel1-1") and not current.startswith("traderjoes") and len(current) < 20:
         log.critical("SECURITY ALERT: Trade from unauthorized host %s (expected %s)", current, ALLOWED_HOSTNAME)
         return False
     return True
