@@ -973,3 +973,8 @@ Found 4 opps
 - [Crypto] HYPE $32.84 (+8.6% 24h)
 - EV: +2.6% | 60 shares @ $3.630 = $219.11
 ---
+
+## Auto-Paper Trade — 08:05 UTC
+- [Kalshi] Will the world pass 2 degrees Celsius over pre-industrial le
+- EV: +6.0% | 293 shares @ $0.750 = $221.07
+---
