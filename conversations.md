@@ -968,3 +968,8 @@ Found 4 opps
 - [Polymarket] US x Iran ceasefire by March 6?
 - EV: +4.5% | 4888 shares @ $0.045 = $221.28
 ---
+
+## Auto-Paper Trade — 07:25 UTC
+- [Crypto] HYPE $32.84 (+8.6% 24h)
+- EV: +2.6% | 60 shares @ $3.630 = $219.11
+---
