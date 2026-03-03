@@ -738,3 +738,8 @@ Found 4 opps
 - [Kalshi] Will the world pass 2 degrees Celsius over pre-industrial le
 - EV: +6.0% | 293 shares @ $0.750 = $221.07
 ---
+
+## Auto-Paper Trade — 00:46 UTC
+- [Polymarket] Will Trump nominate Judy Shelton as the next Fed chair?
+- EV: +4.0% | 5500 shares @ $0.040 = $221.32
+---
