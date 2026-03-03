@@ -2277,10 +2277,7 @@ async def check_and_send_alerts():
                     try:
                         executed = await auto_paper_execute(channel, opp)
                         if executed:
-                            publish_signal("trade_signals", {"market": market_key, "platform": opp.get("platform",""), "ev": ev, "size": cost})
-            db_log_paper_trade({"timestamp": ts, "market": market_key, "platform": opp.get("platform",""), "shares": shares, "entry_price": price, "cost": cost, "ev": ev})
-            db_save_daily_state()
-            log.info("AUTO-PAPER TRADE: %s EV:%.1f%% Cash:$%.2f Trades:%d",
+                            log.info("AUTO-PAPER TRADE: %s EV:%.1f%% Cash:$%.2f Trades:%d",
                                      market_key, ev_pct, PAPER_PORTFOLIO["cash"], len(PAPER_PORTFOLIO["trades"]))
                     except Exception as aex:
                         log.warning("Auto-paper error: %s", aex)
