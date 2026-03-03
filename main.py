@@ -1303,7 +1303,7 @@ async def paper_status(ctx):
         f"Cash: ${cash:,.2f}\n"
         f"Positions Value: ${pos_value:,.2f}\n"
         f"Total: ${total:,.2f}\n"
-        f"P&L: ${pnl:+,.2f}\n"
+        f"P&L: ${total - 10000:+,.2f} (unrealized — positions open)\n"
         f"Trades: {len(trades)}\n"
     )
     if positions:
@@ -1622,7 +1622,7 @@ async def _send_daily_report(channel):
 
     kalshi=get_kalshi_balance(); poly=get_polymarket_balance()
     rh=get_robinhood_balance(); cb=get_coinbase_balance(); ph=get_phemex_balance()
-    pc=PAPER_PORTFOLIO["cash"]; pv=sum(p.get("value",0) for p in PAPER_PORTFOLIO["positions"])
+    pc=PAPER_PORTFOLIO["cash"]; pv=sum(p.get("value",0) for p in PAPER_PORTFOLIO.get("positions",[]))
     pt=pc+pv; ppnl=pt-10000.0
     r = (f"**TraderJoes Daily Report** | {ts}\n================================\n"
         f"**Market:** F&G {fng_val}/100 ({fng_label}) | Mode: {TRADING_MODE.upper()}\n"
@@ -2427,11 +2427,14 @@ async def performance_cmd(ctx):
     pt = PERFORMANCE_TRACKER
     paper_trades = len(PAPER_PORTFOLIO.get("trades", []))
     paper_cash = PAPER_PORTFOLIO["cash"]
-    paper_pnl = paper_cash - 10000
+    paper_pos_value = sum(p.get("value", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+    paper_total = paper_cash + paper_pos_value
+    paper_pnl = paper_total - 10000
     report = (
         f"**Performance Attribution**\n================================\n"
         f"**Paper Trading:**\n"
-        f"  Trades: {paper_trades} | Cash: ${paper_cash:,.2f} | P&L: ${paper_pnl:+,.2f}\n"
+        f"  Cash: ${paper_cash:,.2f} | Positions: ${paper_pos_value:,.2f} | Total: ${paper_total:,.2f}\n"
+        f"  Trades: {paper_trades} | P&L: ${paper_pnl:+,.2f} (unrealized)\n"
         f"  Signals recorded: {len(SIGNAL_HISTORY)}\n\n"
     )
     if pt["by_strategy"]:
