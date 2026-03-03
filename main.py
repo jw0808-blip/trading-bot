@@ -2781,7 +2781,11 @@ async def auto_paper_execute(channel, opp):
         except ValueError:
             price = 0.50
 
-    # Execute paper trade
+    # TWAP for large orders, direct for small
+    if size > TWAP_CONFIG["threshold"]:
+        log.info("TWAP triggered: size $%.2f > $%d threshold", size, TWAP_CONFIG["threshold"])
+        return await twap_execute_paper(opp, size, price, channel)
+    # Execute paper trade (direct for small orders)
     shares = int(size / max(price, 0.01))
     if shares < 1:
         shares = 1
@@ -5892,6 +5896,79 @@ def db_log_resolution(result):
         pass
 
 # ============================================================================
+# TWAP SMART SLICE EXECUTION (Slippage Killer)
+# ============================================================================
+TWAP_CONFIG = {
+    "threshold": 500,        # Orders above this get sliced
+    "num_slices": 5,         # Split into N slices
+    "min_interval": 45,      # Min seconds between slices
+    "max_interval": 90,      # Max seconds between slices
+    "tick_offset": 0.01,     # Limit price = mid + tick_offset
+}
+
+import random as _random
+
+async def twap_execute_paper(opp, total_size, price, channel):
+    """TWAP execution for paper mode: split large orders into slices."""
+    cfg = TWAP_CONFIG
+    num_slices = cfg["num_slices"]
+    slice_size = total_size / num_slices
+    market = opp.get("market", "")[:60]
+    platform = opp.get("platform", "")
+    executed_slices = 0
+    total_cost = 0
+    for i in range(num_slices):
+        slice_shares = max(1, int(slice_size / max(price, 0.01)))
+        slice_cost = slice_shares * price
+        slippage = slice_cost * 0.003
+        fees = slice_cost * 0.001
+        slice_total = slice_cost + slippage + fees
+        if slice_total > PAPER_PORTFOLIO["cash"]:
+            break
+        PAPER_PORTFOLIO["cash"] -= slice_total
+        total_cost += slice_total
+        executed_slices += 1
+        if i == 0:
+            position = {
+                "market": market, "side": "BUY", "shares": slice_shares,
+                "entry_price": price, "cost": slice_total, "value": slice_cost,
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                "platform": platform, "twap_slices": num_slices,
+            }
+            PAPER_PORTFOLIO["positions"].append(position)
+            PAPER_PORTFOLIO["trades"].append(position)
+        else:
+            for pos in PAPER_PORTFOLIO["positions"]:
+                if pos.get("market") == market:
+                    pos["shares"] += slice_shares
+                    pos["cost"] += slice_total
+                    pos["value"] += slice_cost
+                    break
+        if i < num_slices - 1:
+            delay = _random.randint(cfg["min_interval"], cfg["max_interval"])
+            await asyncio.sleep(delay)
+    if executed_slices > 0:
+        publish_signal("trade_signals", {"market": market, "platform": platform, "ev": opp.get("ev",0), "size": total_cost, "twap": True, "slices": executed_slices})
+        db_log_paper_trade({"market": market, "platform": platform, "shares": sum(1 for _ in range(executed_slices)), "entry_price": price, "cost": total_cost, "ev": opp.get("ev",0)})
+        db_save_daily_state()
+        if channel:
+            await channel.send(f"TWAP executed: {market} | {executed_slices}/{num_slices} slices | Total: ")
+        log.info("TWAP paper: %s | %d/%d slices | $%.2f", market, executed_slices, num_slices, total_cost)
+    return executed_slices > 0
+
+async def twap_execute_live(opp, total_size, price, channel):
+    """TWAP execution for live mode: placeholder for real API calls."""
+    cfg = TWAP_CONFIG
+    num_slices = cfg["num_slices"]
+    slice_size = total_size / num_slices
+    market = opp.get("market", "")[:60]
+    platform = opp.get("platform", "")
+    log.info("TWAP LIVE: Would execute %d slices of $%.2f for %s on %s", num_slices, slice_size, market, platform)
+    if channel:
+        await channel.send(f"TWAP LIVE: {market} | {num_slices} slices of  | Platform: {platform}")
+    return True
+
+# ============================================================================
 # CORRELATED POSITION CHECK
 # ============================================================================
 MARKET_CATEGORIES = {"politics": ["trump","biden","gop","democrat","republican","senate","congress","election","president","aoc","desantis"], "crypto": ["bitcoin","btc","ethereum","eth","solana","sol","crypto","token","defi"], "geopolitics": ["iran","russia","ukraine","china","war","ceasefire","nato","sanctions","tariff"], "climate": ["celsius","warming","climate","carbon","temperature","sea level"], "fed": ["fed","interest rate","fomc","powell","inflation","cpi","gdp","unemployment","jobs"], "tech": ["openai","google","apple","microsoft","nvidia","semiconductor"]}
@@ -5912,11 +5989,10 @@ def check_correlation(new_market, existing_positions):
     for pos in existing_positions:
         if get_market_category(pos.get("market", "")) == new_cat:
             same_cat_count += 1
-    if same_cat_count >= 3:
+    if same_cat_count >= 2:
         return False, 0, "Blocked: " + str(same_cat_count) + " open in " + new_cat
-    elif same_cat_count >= 1:
-        mult = 0.5 if same_cat_count == 1 else 0.33
-        return True, mult, str(same_cat_count) + " existing " + new_cat
+    elif same_cat_count == 1:
+        return True, 0.5, "1 existing " + new_cat + ", sizing at 50%"
     return True, 1.0, ""
 
 
