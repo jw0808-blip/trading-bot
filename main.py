@@ -2371,7 +2371,8 @@ async def cost_status(ctx):
         f"**Auto-Live Config:**\n"
         f"  Enabled: {auto['enabled']}\n"
         f"  Min EV: {auto['min_ev']*100:.1f}% | Min edge score: {auto['min_edge_score']}\n"
-        f"  Max position: Tiered (1.5%/0.5%/0.25%) | Max daily trades: {auto['max_daily_trades']}\n"
+        f"  Max position: Tiered (1.5%/0.5%/0.25%) | TWAP >500 | Corr Guard ON\n"
+        f"  Max daily trades: {auto['max_daily_trades']}\n"
         f"  Drawdown halt: {auto['drawdown_halt_pct']}%\n"
     )
 
