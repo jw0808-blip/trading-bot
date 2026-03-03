@@ -948,3 +948,8 @@ Found 4 opps
 - [Polymarket] US x Iran ceasefire by March 6?
 - EV: +5.5% | 4000 shares @ $0.055 = $221.32
 ---
+
+## Auto-Paper Trade — 06:45 UTC
+- [Kalshi] Will the world pass 2 degrees Celsius over pre-industrial le
+- EV: +6.0% | 293 shares @ $0.750 = $221.07
+---
