@@ -5455,6 +5455,12 @@ async def auto_live_execute(channel, opp):
     if ev < auto["min_ev"]:
         log.info("Auto-live skip: EV %.1f%% < %.1f%% min", ev*100, auto["min_ev"]*100)
         return False
+    # ONE POSITION PER MARKET — prevent over-concentration
+    market_key = opp.get("market", "")[:60]
+    for pos in PAPER_PORTFOLIO.get("positions", []):
+        if pos.get("market", "") == market_key:
+            log.info("Skip duplicate position (already open): %s", market_key)
+            return False
     score, confidence, signals = calculate_edge_score(opp)
     if score < auto["min_edge_score"]:
         log.info("Auto-live skip: score %d < %d min", score, auto["min_edge_score"])
