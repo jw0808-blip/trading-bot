@@ -848,3 +848,8 @@ Found 4 opps
 - [Polymarket] Will Trump nominate Judy Shelton as the next Fed chair?
 - EV: +4.0% | 5500 shares @ $0.040 = $221.32
 ---
+
+## Auto-Paper Trade — 01:25 UTC
+- [Polymarket] US x Iran ceasefire by March 6?
+- EV: +6.5% | 3384 shares @ $0.065 = $221.28
+---
