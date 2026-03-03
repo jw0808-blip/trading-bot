@@ -658,3 +658,8 @@ Found 4 opps
 - [Kalshi] Will the world pass 2 degrees Celsius over pre-industrial le
 - EV: +6.0% | 293 shares @ $0.750 = $221.07
 ---
+
+## Auto-Paper Trade — 00:11 UTC
+- [Polymarket] Will Alexandria Ocasio-Cortez win the 2028 US Presidential E
+- EV: +5.9% | 3728 shares @ $0.059 = $221.27
+---
