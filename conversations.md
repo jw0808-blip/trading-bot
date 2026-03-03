@@ -663,3 +663,8 @@ Found 4 opps
 - [Polymarket] Will Alexandria Ocasio-Cortez win the 2028 US Presidential E
 - EV: +5.9% | 3728 shares @ $0.059 = $221.27
 ---
+
+## Auto-Paper Trade — 00:17 UTC
+- [Polymarket] US x Iran ceasefire by March 6?
+- EV: +6.5% | 3384 shares @ $0.065 = $221.28
+---
