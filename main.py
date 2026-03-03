@@ -26,6 +26,12 @@ TRADINGVIEW_SIGNALS = {
 import discord
 from discord.ext import commands, tasks
 import os
+import sqlite3
+try:
+    import redis as redis_lib
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
 import requests
 import json
 import time
@@ -2271,7 +2277,10 @@ async def check_and_send_alerts():
                     try:
                         executed = await auto_paper_execute(channel, opp)
                         if executed:
-                            log.info("AUTO-PAPER TRADE: %s EV:%.1f%% Cash:$%.2f Trades:%d",
+                            publish_signal("trade_signals", {"market": market_key, "platform": opp.get("platform",""), "ev": ev, "size": cost})
+            db_log_paper_trade({"timestamp": ts, "market": market_key, "platform": opp.get("platform",""), "shares": shares, "entry_price": price, "cost": cost, "ev": ev})
+            db_save_daily_state()
+            log.info("AUTO-PAPER TRADE: %s EV:%.1f%% Cash:$%.2f Trades:%d",
                                      market_key, ev_pct, PAPER_PORTFOLIO["cash"], len(PAPER_PORTFOLIO["trades"]))
                     except Exception as aex:
                         log.warning("Auto-paper error: %s", aex)
@@ -2453,6 +2462,45 @@ async def performance_cmd(ctx):
             report += f"  {t.get('timestamp', '')} | {t.get('side', '')} {t.get('market', '')[:40]} | ${t.get('cost', 0):,.2f}\n"
     report += "================================"
     await ctx.send(report)
+
+@bot.command(name="redis-status")
+async def redis_status_cmd(ctx):
+    if REDIS_CLIENT:
+        try:
+            info = REDIS_CLIENT.info("memory")
+            sigs = REDIS_CLIENT.llen("history:trade_signals")
+            await ctx.send(f"**Redis Signal Bus**\nStatus: Connected\nMemory: {info.get('used_memory_human','N/A')}\nSignals: {sigs}")
+        except Exception as e:
+            await ctx.send(f"Redis error: {e}")
+    else:
+        await ctx.send("Redis: Not connected (in-memory fallback)")
+
+@bot.command(name="db-status")
+async def db_status_cmd(ctx):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM paper_trades")
+        trades = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM resolutions")
+        resolved = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM daily_state")
+        days = c.fetchone()[0]
+        conn.close()
+        await ctx.send(f"**SQLite Persistence**\nPaper trades: {trades} | Resolutions: {resolved} | Daily states: {days}")
+    except Exception as e:
+        await ctx.send(f"SQLite error: {e}")
+
+@bot.command(name="signals")
+async def signals_cmd(ctx, count: int = 5):
+    history = get_signal_history("trade_signals", count)
+    if not history:
+        await ctx.send("No signals in Redis history yet.")
+        return
+    r = "**Last Signals**\n"
+    for s in history:
+        r += f"  {s.get('market','')[:40]} | EV: {s.get('ev',0)*100:.1f}%\n"
+    await ctx.send(r)
 
 @bot.command(name="calibration")
 async def calibration_cmd(ctx):
@@ -5489,6 +5537,10 @@ async def auto_live_execute(channel, opp):
     if ev < auto["min_ev"]:
         log.info("Auto-live skip: EV %.1f%% < %.1f%% min", ev*100, auto["min_ev"]*100)
         return False
+    corr_ok, corr_mult, corr_reason = check_correlation(opp.get("market","")[:60], PAPER_PORTFOLIO.get("positions",[]))
+    if not corr_ok:
+        log.info("Correlation block: %s", corr_reason)
+        return False
     # ONE POSITION PER MARKET — prevent over-concentration
     market_key = opp.get("market", "")[:60]
     for pos in PAPER_PORTFOLIO.get("positions", []):
@@ -5728,6 +5780,141 @@ async def enforce_paper_trade_floor(channel):
     finally:
         ALERT_CONFIG["min_ev_threshold"] = original_threshold
 
+
+
+# ============================================================================
+# REDIS PUB/SUB SIGNAL BUS
+# ============================================================================
+REDIS_CLIENT = None
+def init_redis():
+    global REDIS_CLIENT
+    if not REDIS_AVAILABLE:
+        log.warning("redis-py not installed, using in-memory signals only")
+        return
+    try:
+        REDIS_CLIENT = redis_lib.Redis(host="redis", port=6379, db=0, decode_responses=True, socket_connect_timeout=3)
+        REDIS_CLIENT.ping()
+        log.info("Redis connected - signal bus active")
+    except Exception as e:
+        log.warning("Redis unavailable (%s), falling back to in-memory", e)
+        REDIS_CLIENT = None
+
+def publish_signal(signal_type, data):
+    if REDIS_CLIENT:
+        try:
+            import json as _json
+            REDIS_CLIENT.publish(signal_type, _json.dumps(data, default=str))
+            REDIS_CLIENT.lpush("history:" + signal_type, _json.dumps(data, default=str))
+            REDIS_CLIENT.ltrim("history:" + signal_type, 0, 499)
+        except Exception:
+            pass
+
+def get_signal_history(signal_type, count=10):
+    if REDIS_CLIENT:
+        try:
+            import json as _json
+            items = REDIS_CLIENT.lrange("history:" + signal_type, 0, count - 1)
+            return [_json.loads(i) for i in items]
+        except Exception:
+            return []
+    return []
+
+# ============================================================================
+# SQLITE STATE PERSISTENCE
+# ============================================================================
+DB_PATH = "/app/data/trading_firm.db"
+
+def init_db():
+    import os as _os
+    _os.makedirs("/app/data", exist_ok=True)
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""CREATE TABLE IF NOT EXISTS paper_trades (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, market TEXT, platform TEXT, side TEXT, shares REAL, entry_price REAL, cost REAL, ev REAL, edge_score REAL, status TEXT DEFAULT 'open')""")
+        c.execute("""CREATE TABLE IF NOT EXISTS daily_state (date TEXT PRIMARY KEY, trades_count INTEGER, daily_pnl REAL, paper_cash REAL, circuit_breaker_trips INTEGER DEFAULT 0)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS resolutions (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, market TEXT, platform TEXT, entry_price REAL, outcome REAL, brier_score REAL, realized_edge REAL, pnl REAL)""")
+        conn.commit()
+        conn.close()
+        log.info("SQLite initialized at %s", DB_PATH)
+    except Exception as e:
+        log.warning("SQLite init failed: %s", e)
+
+def db_log_paper_trade(trade):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT INTO paper_trades (timestamp,market,platform,side,shares,entry_price,cost,ev,edge_score) VALUES (?,?,?,?,?,?,?,?,?)", (trade.get("timestamp",""), trade.get("market",""), trade.get("platform",""), trade.get("side","BUY"), trade.get("shares",0), trade.get("entry_price",0), trade.get("cost",0), trade.get("ev",0), trade.get("edge_score",0)))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.warning("SQLite log failed: %s", e)
+
+def db_save_daily_state():
+    try:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO daily_state (date,trades_count,daily_pnl,paper_cash) VALUES (?,?,?,?)", (today, COST_CONFIG.get("daily_trades",0), COST_CONFIG.get("daily_pnl",0), PAPER_PORTFOLIO.get("cash",10000)))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+def db_load_daily_state():
+    try:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT trades_count, daily_pnl, paper_cash FROM daily_state WHERE date = ?", (today,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            COST_CONFIG["daily_trades"] = row[0]
+            COST_CONFIG["daily_pnl"] = row[1]
+            PAPER_PORTFOLIO["cash"] = row[2]
+            log.info("Restored state: %d trades, pnl %.2f, cash %.2f", row[0], row[1], row[2])
+            return True
+    except Exception:
+        pass
+    return False
+
+def db_log_resolution(result):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT INTO resolutions (timestamp,market,platform,entry_price,outcome,brier_score,realized_edge,pnl) VALUES (?,?,?,?,?,?,?,?)", (result.get("resolved_at",""), result.get("market",""), result.get("platform",""), result.get("entry_price",0), result.get("outcome",0), result.get("brier_score",0), result.get("realized_edge",0), result.get("pnl",0)))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+# ============================================================================
+# CORRELATED POSITION CHECK
+# ============================================================================
+MARKET_CATEGORIES = {"politics": ["trump","biden","gop","democrat","republican","senate","congress","election","president","aoc","desantis"], "crypto": ["bitcoin","btc","ethereum","eth","solana","sol","crypto","token","defi"], "geopolitics": ["iran","russia","ukraine","china","war","ceasefire","nato","sanctions","tariff"], "climate": ["celsius","warming","climate","carbon","temperature","sea level"], "fed": ["fed","interest rate","fomc","powell","inflation","cpi","gdp","unemployment","jobs"], "tech": ["openai","google","apple","microsoft","nvidia","semiconductor"]}
+
+def get_market_category(market_name):
+    name_lower = market_name.lower()
+    for cat, keywords in MARKET_CATEGORIES.items():
+        for kw in keywords:
+            if kw in name_lower:
+                return cat
+    return "other"
+
+def check_correlation(new_market, existing_positions):
+    new_cat = get_market_category(new_market)
+    if new_cat == "other":
+        return True, 1.0, ""
+    same_cat_count = 0
+    for pos in existing_positions:
+        if get_market_category(pos.get("market", "")) == new_cat:
+            same_cat_count += 1
+    if same_cat_count >= 3:
+        return False, 0, "Blocked: " + str(same_cat_count) + " open in " + new_cat
+    elif same_cat_count >= 1:
+        mult = 0.5 if same_cat_count == 1 else 0.33
+        return True, mult, str(same_cat_count) + " existing " + new_cat
+    return True, 1.0, ""
 
 
 # ============================================================================
