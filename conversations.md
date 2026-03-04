@@ -1043,3 +1043,8 @@ Found 4 opps
 - [Polymarket] US x Iran ceasefire by March 6?
 - EV: +2.2% | 10000 shares @ $0.022 = $221.32
 ---
+
+## Auto-Paper Trade — 19:13 UTC
+- [Crypto] DOGE $0.10 (+14.5% 24h)
+- EV: +4.4% | 9 shares @ $24.180 = $218.93
+---
