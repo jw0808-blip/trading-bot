@@ -1102,3 +1102,8 @@ Found 4 opps
 - [Crypto] DOGE $0.10 (+15.2% 24h)
 - EV: +4.6% | 8 shares @ $25.510 = $205.30
 ---
+
+## Auto-Paper Trade — 20:13 UTC
+- [Crypto] ZEC $248.66 (+13.6% 24h)
+- EV: +4.1% | 51 shares @ $4.260 = $218.56
+---
