@@ -4940,7 +4940,7 @@ async def test_execution(ctx, platform: str = "", amount: str = "1"):
 # ============================================================================
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
-ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")  # Paper by default
+ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")  # Set to https://api.alpaca.markets for live
 
 # Interactive Brokers (Client Portal API)
 IBKR_ACCOUNT_ID = os.getenv("IBKR_ACCOUNT_ID", "")
@@ -5981,6 +5981,36 @@ def get_market_category(market_name):
             if kw in name_lower:
                 return cat
     return "other"
+
+GICS_SECTORS = {"tech": ["AAPL","MSFT","GOOGL","META","NVDA","AMD","INTC","CRM","ORCL"],
+    "finance": ["JPM","BAC","GS","MS","WFC","V","MA","AXP","C"],
+    "energy": ["XOM","CVX","COP","SLB","EOG","OXY","MPC","PSX","VLO"],
+    "health": ["JNJ","UNH","PFE","ABBV","MRK","LLY","TMO","ABT","BMY"],
+    "consumer": ["KO","PEP","PG","WMT","COST","MCD","NKE","SBUX","TGT"]}
+MAX_SAME_DIRECTION = 3
+MAX_SECTOR_PCT = 0.30
+
+def get_gics_sector(ticker):
+    for sector, tickers in GICS_SECTORS.items():
+        if ticker.upper() in tickers:
+            return sector
+    return "other"
+
+def check_directional_limit(side, existing_positions):
+    same_dir = sum(1 for p in existing_positions if p.get("side", "BUY") == side)
+    if same_dir >= MAX_SAME_DIRECTION:
+        return False, "Blocked: " + str(same_dir) + " positions already " + side
+    return True, ""
+
+def check_sector_exposure(ticker, existing_positions, portfolio_value):
+    sector = get_gics_sector(ticker)
+    if sector == "other":
+        return True, 1.0, ""
+    sector_exposure = sum(p.get("cost", 0) for p in existing_positions if get_gics_sector(p.get("ticker", "")) == sector)
+    max_allowed = portfolio_value * MAX_SECTOR_PCT
+    if sector_exposure >= max_allowed:
+        return False, 0, "Sector cap: " + sector + " at " + str(int(sector_exposure)) + "/" + str(int(max_allowed))
+    return True, 1.0, ""
 
 def check_correlation(new_market, existing_positions):
     new_cat = get_market_category(new_market)
