@@ -1023,3 +1023,8 @@ Found 4 opps
 - [Kalshi] Will the world pass 2 degrees Celsius over pre-industrial le
 - EV: +5.0% | 293 shares @ $0.750 = $221.07
 ---
+
+## Auto-Paper Trade — 18:07 UTC
+- [Crypto] DOGE $0.10 (+13.2% 24h)
+- EV: +4.0% | 9 shares @ $23.280 = $210.78
+---
