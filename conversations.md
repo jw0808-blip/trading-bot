@@ -1097,3 +1097,8 @@ Found 4 opps
 - [Crypto] DOGE $0.10 (+15.6% 24h)
 - EV: +4.7% | 8 shares @ $24.800 = $199.59
 ---
+
+## Auto-Paper Trade — 20:13 UTC
+- [Crypto] DOGE $0.10 (+15.2% 24h)
+- EV: +4.6% | 8 shares @ $25.510 = $205.30
+---
