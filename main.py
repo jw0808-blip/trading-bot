@@ -4951,7 +4951,20 @@ async def test_execution(ctx, platform: str = "", amount: str = "1"):
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 KALSHI_KEY_PATH = os.getenv("KALSHI_KEY_PATH", "/app/keys/kalshi.pem")
+if os.path.exists(KALSHI_KEY_PATH):
+    with open(KALSHI_KEY_PATH) as _f:
+        _kalshi_pem = _f.read().strip()
+    if "-----BEGIN" in _kalshi_pem:
+        KALSHI_PRIVATE_KEY = _kalshi_pem
+        print(f"Loaded Kalshi PEM from {KALSHI_KEY_PATH}")
 COINBASE_KEY_PATH = os.getenv("COINBASE_KEY_PATH", "/app/keys/coinbase.pem")
+# Load PEM from file if exists, overriding .env value
+if os.path.exists(COINBASE_KEY_PATH):
+    with open(COINBASE_KEY_PATH) as _f:
+        _coinbase_pem = _f.read().strip()
+    if "-----BEGIN" in _coinbase_pem:
+        COINBASE_API_SECRET = _coinbase_pem
+        print(f"Loaded Coinbase PEM from {COINBASE_KEY_PATH}")
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")  # Set to https://api.alpaca.markets for live
 
 # Interactive Brokers (Client Portal API)
