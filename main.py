@@ -89,6 +89,17 @@ ROBINHOOD_BASE          = "https://trading.robinhood.com"
 # Coinbase Advanced Trade (CDP API Keys - JWT auth)
 COINBASE_API_KEY        = os.environ.get("COINBASE_API_KEY", "")
 COINBASE_API_SECRET     = os.environ.get("COINBASE_API_SECRET", "")
+# Load PEM keys from files if they exist (fixes Docker .env formatting issues)
+for _kp, _var in [("/app/keys/coinbase.pem", "COINBASE_API_SECRET"), ("/app/keys/kalshi.pem", "KALSHI_PRIVATE_KEY")]:
+    if os.path.exists(_kp):
+        with open(_kp) as _f:
+            _pem = _f.read().strip()
+        if "-----BEGIN" in _pem:
+            if _var == "COINBASE_API_SECRET":
+                COINBASE_API_SECRET = _pem
+            elif _var == "KALSHI_PRIVATE_KEY":
+                KALSHI_PRIVATE_KEY = _pem
+            print(f"Loaded {_var} from {_kp}")
 
 # Phemex
 PHEMEX_API_KEY      = os.environ.get("PHEMEX_API_KEY", "")
