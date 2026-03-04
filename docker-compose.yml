@@ -11,6 +11,7 @@ services:
     volumes:
       - bot-logs:/app/logs
       - ./data:/app/data
+      - ./keys:/app/keys:ro
     depends_on:
       - redis
     logging:
