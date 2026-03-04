@@ -2503,6 +2503,15 @@ async def signals_cmd(ctx, count: int = 5):
         r += f"  {s.get('market','')[:40]} | EV: {s.get('ev',0)*100:.1f}%\n"
     await ctx.send(r)
 
+@bot.command(name="paper-reset")
+async def paper_reset_cmd(ctx, amount: float = 10000):
+    PAPER_PORTFOLIO["cash"] = amount
+    PAPER_PORTFOLIO["positions"] = []
+    PAPER_PORTFOLIO["trades"] = []
+    ACTIVE_TRADE_LOCK.clear()
+    db_save_daily_state()
+    await ctx.send(f"Paper portfolio reset: ${amount:,.2f} cash, 0 positions. Ready for fresh validation.")
+
 @bot.command(name="calibration")
 async def calibration_cmd(ctx):
     s = get_calibration_summary()
