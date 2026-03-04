@@ -1038,3 +1038,8 @@ Found 4 opps
 - [Kalshi] Will the world pass 2 degrees Celsius over pre-industrial le
 - EV: +5.0% | 293 shares @ $0.750 = $221.07
 ---
+
+## Auto-Paper Trade — 18:36 UTC
+- [Polymarket] US x Iran ceasefire by March 6?
+- EV: +2.2% | 10000 shares @ $0.022 = $221.32
+---
