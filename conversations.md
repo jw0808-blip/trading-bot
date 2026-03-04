@@ -1018,3 +1018,8 @@ Found 4 opps
 - [Crypto] ETH $2,149.67 (+8.6% 24h)
 - EV: +2.6% | 1 shares @ $318.400 = $320.31
 ---
+
+## Auto-Paper Trade — 18:07 UTC
+- [Kalshi] Will the world pass 2 degrees Celsius over pre-industrial le
+- EV: +5.0% | 293 shares @ $0.750 = $221.07
+---
