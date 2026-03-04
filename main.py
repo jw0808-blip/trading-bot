@@ -2514,6 +2514,49 @@ async def signals_cmd(ctx, count: int = 5):
         r += f"  {s.get('market','')[:40]} | EV: {s.get('ev',0)*100:.1f}%\n"
     await ctx.send(r)
 
+@bot.command(name="equities-status")
+async def equities_status_cmd(ctx):
+    eq_val, eq_pct = get_equities_exposure(PAPER_PORTFOLIO.get("positions", []), 88000)
+    pairs_cfg = EQUITIES_CONFIG["pairs"]
+    msg = f"**Equities Module**\n"
+    msg += f"Enabled: {EQUITIES_ENABLED}\n"
+    msg += f"Market open: {is_market_open()}\n"
+    msg += f"Equities exposure: ${eq_val:,.0f} ({eq_pct*100:.1f}% of portfolio, max 30%)\n"
+    msg += f"Max concurrent: {EQUITIES_CONFIG['max_concurrent']}\n\n"
+    msg += f"**Pairs Config**\n"
+    msg += f"Seed pairs: {', '.join(f'{a}/{b}' for a,b in pairs_cfg['seed'])}\n"
+    msg += f"Min correlation: {pairs_cfg['min_correlation']} | Z-entry: +/-{pairs_cfg['zscore_entry']} | Z-exit: +/-{pairs_cfg['zscore_exit']}\n"
+    msg += f"TTL: {pairs_cfg['ttl_days']} trading days\n\n"
+    msg += f"**Exit Manager**\n"
+    msg += f"Crypto/Prediction TTL: {EXIT_CONFIG['crypto_ttl_hours']}h\n"
+    msg += f"PEAD TTL: {EXIT_CONFIG['pead_ttl_hours']}h | TP: +{EXIT_CONFIG['pead_tp_pct']*100:.0f}%\n"
+    msg += f"Pairs TTL: {EXIT_CONFIG['pairs_ttl_days']}d | Z-exit: +/-{EXIT_CONFIG['pairs_zscore_exit']}"
+    await ctx.send(msg)
+
+@bot.command(name="run-exits")
+async def run_exits_cmd(ctx):
+    """Manually trigger the exit manager."""
+    closed = await run_exit_manager(ctx.channel)
+    if closed == 0:
+        await ctx.send("Exit manager: No positions to close (all within TTL/TP limits).")
+
+@bot.command(name="scan-pairs")
+async def scan_pairs_cmd(ctx):
+    """Scan seed pairs for trading signals."""
+    if not EQUITIES_ENABLED:
+        await ctx.send("Equities module is disabled. Set EQUITIES_ENABLED = True to activate.")
+        return
+    if not is_market_open():
+        await ctx.send("NYSE/NASDAQ is closed. Pairs scanning only runs during market hours (9:30-4:00 EST).")
+        return
+    await ctx.send("Scanning pairs... (this may take 30-60 seconds for yfinance data)")
+    opps = scan_pairs_opportunities()
+    if not opps:
+        await ctx.send("No pairs signals found. All Z-scores within normal range.")
+        return
+    for o in opps:
+        await ctx.send(f"**PAIRS SIGNAL**: {o['pair']} | Corr: {o['correlation']:.3f} | Z: {o['zscore']:+.2f} | Dir: {o['direction']}")
+
 @bot.command(name="paper-reset")
 async def paper_reset_cmd(ctx, amount: float = 10000):
     PAPER_PORTFOLIO["cash"] = amount
@@ -2711,6 +2754,13 @@ async def alert_scan_task():
         if not CYCLE_PAUSED and not COST_CONFIG.get("kill_switch", False):
             await check_and_send_alerts()
             push_all_analytics()  # push metrics each cycle
+            # Run exit manager every cycle
+            try:
+                exits = await run_exit_manager()
+                if exits > 0:
+                    log.info("Exit manager closed %d positions this cycle", exits)
+            except Exception as ex:
+                log.warning("Exit manager error: %s", ex)
             # Enforce minimum paper trade floor
             try:
                 ch = bot.get_channel(int(DISCORD_CHANNEL_ID))
@@ -6066,6 +6116,182 @@ def check_correlation(new_market, existing_positions):
 # ============================================================================
 # POST-RESOLUTION AUDIT (Brier Score + EV Calibration)
 # ============================================================================
+
+# ============================================================================
+# SPRINT 2: EQUITIES & EXIT MANAGEMENT
+# ============================================================================
+EQUITIES_ENABLED = False  # Feature flag - do not enable until validated
+
+# --- MARKET HOURS GUARD ---
+def is_market_open():
+    """Check if NYSE/NASDAQ is open (9:30 AM - 4:00 PM EST, Mon-Fri)."""
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("America/New_York"))
+    if now.weekday() >= 5:  # Sat/Sun
+        return False
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    return market_open <= now <= market_close
+
+# --- DYNAMIC EXIT MANAGER ---
+EXIT_CONFIG = {
+    "crypto_ttl_hours": 72,
+    "prediction_ttl_hours": 72,
+    "pairs_ttl_days": 7,
+    "pead_ttl_hours": 72,
+    "pead_tp_pct": 0.08,
+    "pairs_zscore_exit": 0.5,
+}
+
+async def run_exit_manager(channel=None):
+    """Check all open paper positions for TTL/TP exits. Runs every cycle."""
+    now = datetime.now(timezone.utc)
+    positions_to_close = []
+    for i, pos in enumerate(PAPER_PORTFOLIO.get("positions", [])):
+        ts_str = pos.get("timestamp", "")
+        if not ts_str:
+            continue
+        try:
+            entry_time = datetime.strptime(ts_str, "%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            continue
+        age_hours = (now - entry_time).total_seconds() / 3600
+        strategy = pos.get("strategy", "prediction")
+        market = pos.get("market", "")
+        # TTL exits
+        if strategy == "pairs" and age_hours > EXIT_CONFIG["pairs_ttl_days"] * 24:
+            positions_to_close.append((i, pos, "TTL: pairs 7-day limit"))
+        elif strategy == "pead" and age_hours > EXIT_CONFIG["pead_ttl_hours"]:
+            positions_to_close.append((i, pos, "TTL: PEAD 72h limit"))
+        elif strategy in ("crypto", "momentum") and age_hours > EXIT_CONFIG["crypto_ttl_hours"]:
+            positions_to_close.append((i, pos, "TTL: crypto 72h limit"))
+        elif strategy == "prediction" and age_hours > EXIT_CONFIG["prediction_ttl_hours"]:
+            positions_to_close.append((i, pos, "TTL: prediction 72h limit"))
+        # TP exit for PEAD
+        if strategy == "pead":
+            entry_price = pos.get("entry_price", 0)
+            current_price = pos.get("value", 0) / max(pos.get("shares", 1), 1)
+            if entry_price > 0 and current_price > 0:
+                pnl_pct = (current_price - entry_price) / entry_price
+                if pnl_pct >= EXIT_CONFIG["pead_tp_pct"]:
+                    positions_to_close.append((i, pos, f"TP: PEAD +{pnl_pct*100:.1f}%"))
+    # Close positions (reverse order to preserve indices)
+    closed = 0
+    for idx, pos, reason in sorted(positions_to_close, key=lambda x: x[0], reverse=True):
+        if idx < len(PAPER_PORTFOLIO["positions"]):
+            removed = PAPER_PORTFOLIO["positions"].pop(idx)
+            PAPER_PORTFOLIO["cash"] += removed.get("value", removed.get("cost", 0))
+            closed += 1
+            log.info("EXIT MANAGER: Closed %s | Reason: %s | Returned $%.2f", removed.get("market", "")[:40], reason, removed.get("value", 0))
+            if channel:
+                await channel.send(f"Exit Manager closed: {removed.get('market', '')[:40]} | {reason}")
+    if closed > 0:
+        db_save_daily_state()
+        log.info("EXIT MANAGER: Closed %d positions, returned capital to paper cash", closed)
+    return closed
+
+# --- EQUITIES ALLOCATION LIMITS ---
+EQUITIES_CONFIG = {
+    "max_allocation_pct": 0.30,
+    "max_concurrent": 5,
+    "max_sector_pct": 0.30,
+    "pairs": {
+        "seed": [("V", "MA"), ("XOM", "CVX"), ("GOOGL", "META"), ("KO", "PEP"), ("JPM", "BAC")],
+        "min_correlation": 0.85,
+        "lookback_days": 252,
+        "zscore_entry": 2.0,
+        "zscore_exit": 0.5,
+        "ttl_days": 7,
+    },
+    "pead": {
+        "min_surprise_pct": 0.15,
+        "min_volume_mult": 1.5,
+        "tp_pct": 0.08,
+        "ttl_hours": 72,
+    },
+}
+
+def get_equities_exposure(positions, total_portfolio):
+    """Calculate current equities exposure."""
+    eq_value = sum(p.get("cost", 0) for p in positions if p.get("strategy") in ("pairs", "pead", "equities"))
+    return eq_value, eq_value / max(total_portfolio, 1)
+
+# --- PAIRS TRADING ENGINE ---
+def calculate_pair_zscore(ticker_a, ticker_b, lookback=252):
+    """Calculate Z-score of price ratio spread for a pair."""
+    try:
+        import yfinance as yf
+        import numpy as np
+        data_a = yf.download(ticker_a, period=f"{lookback}d", progress=False)
+        data_b = yf.download(ticker_b, period=f"{lookback}d", progress=False)
+        if len(data_a) < 100 or len(data_b) < 100:
+            return None, None, None
+        prices_a = data_a["Close"].values[-lookback:]
+        prices_b = data_b["Close"].values[-lookback:]
+        min_len = min(len(prices_a), len(prices_b))
+        prices_a = prices_a[-min_len:]
+        prices_b = prices_b[-min_len:]
+        ratio = prices_a / prices_b
+        correlation = float(np.corrcoef(prices_a, prices_b)[0, 1])
+        mean_ratio = float(np.mean(ratio))
+        std_ratio = float(np.std(ratio))
+        if std_ratio == 0:
+            return correlation, 0.0, mean_ratio
+        current_ratio = float(prices_a[-1] / prices_b[-1])
+        zscore = (current_ratio - mean_ratio) / std_ratio
+        return correlation, zscore, mean_ratio
+    except Exception as e:
+        log.warning("Pairs calc error %s/%s: %s", ticker_a, ticker_b, e)
+        return None, None, None
+
+def scan_pairs_opportunities():
+    """Scan seed pairs for entry signals."""
+    if not EQUITIES_ENABLED:
+        return []
+    if not is_market_open():
+        return []
+    opportunities = []
+    cfg = EQUITIES_CONFIG["pairs"]
+    for ticker_a, ticker_b in cfg["seed"]:
+        corr, zscore, mean_ratio = calculate_pair_zscore(ticker_a, ticker_b, cfg["lookback_days"])
+        if corr is None:
+            continue
+        if corr < cfg["min_correlation"]:
+            continue
+        if abs(zscore) >= cfg["zscore_entry"]:
+            direction = "short_a_long_b" if zscore > 0 else "long_a_short_b"
+            opportunities.append({
+                "type": "pairs",
+                "pair": f"{ticker_a}/{ticker_b}",
+                "ticker_a": ticker_a,
+                "ticker_b": ticker_b,
+                "correlation": corr,
+                "zscore": zscore,
+                "direction": direction,
+                "mean_ratio": mean_ratio,
+            })
+            log.info("PAIRS SIGNAL: %s/%s corr=%.3f zscore=%.2f dir=%s", ticker_a, ticker_b, corr, zscore, direction)
+    return opportunities
+
+# --- PEAD ENGINE (RULE-BASED) ---
+def check_earnings_surprise(ticker):
+    """Check if a stock has a recent earnings surprise > 15%."""
+    try:
+        import yfinance as yf
+        stock = yf.Ticker(ticker)
+        earnings = stock.earnings_dates
+        if earnings is None or len(earnings) == 0:
+            return None
+        latest = earnings.iloc[0]
+        estimate = latest.get("EPS Estimate", 0)
+        actual = latest.get("Reported EPS", 0)
+        if estimate and actual and estimate != 0:
+            surprise = (actual - estimate) / abs(estimate)
+            return {"ticker": ticker, "surprise_pct": surprise, "actual": actual, "estimate": estimate}
+    except Exception as e:
+        log.warning("PEAD check error %s: %s", ticker, e)
+    return None
+
 # ============================================================================
 # RACE CONDITION LOCK - prevents concurrent duplicate trades
 # ============================================================================

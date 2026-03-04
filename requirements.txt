@@ -9,3 +9,4 @@ web3
 PyJWT
 py-clob-client
 redis>=5.0.0
+yfinance>=0.2.0
