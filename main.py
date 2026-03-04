@@ -2796,6 +2796,7 @@ async def auto_paper_execute(channel, opp):
     total_cost = cost + slippage + fees
 
     if total_cost > PAPER_PORTFOLIO["cash"]:
+        release_trade_lock(opp.get("market", "")[:60])
         return False
 
     PAPER_PORTFOLIO["cash"] -= total_cost
@@ -4940,6 +4941,8 @@ async def test_execution(ctx, platform: str = "", amount: str = "1"):
 # ============================================================================
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
+KALSHI_KEY_PATH = os.getenv("KALSHI_KEY_PATH", "/app/keys/kalshi.pem")
+COINBASE_KEY_PATH = os.getenv("COINBASE_KEY_PATH", "/app/keys/coinbase.pem")
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")  # Set to https://api.alpaca.markets for live
 
 # Interactive Brokers (Client Portal API)
@@ -6030,6 +6033,20 @@ def check_correlation(new_market, existing_positions):
 # ============================================================================
 # POST-RESOLUTION AUDIT (Brier Score + EV Calibration)
 # ============================================================================
+# ============================================================================
+# RACE CONDITION LOCK - prevents concurrent duplicate trades
+# ============================================================================
+ACTIVE_TRADE_LOCK = set()
+
+def acquire_trade_lock(market_key):
+    if market_key in ACTIVE_TRADE_LOCK:
+        return False
+    ACTIVE_TRADE_LOCK.add(market_key)
+    return True
+
+def release_trade_lock(market_key):
+    ACTIVE_TRADE_LOCK.discard(market_key)
+
 RESOLUTION_TRACKER = {"resolved_trades": [], "total_brier": 0.0, "total_resolved": 0, "calibration_scores": []}
 
 def record_resolution(trade, outcome):
