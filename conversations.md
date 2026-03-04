@@ -1033,3 +1033,8 @@ Found 4 opps
 - [Crypto] ZEC $237.64 (+8.9% 24h)
 - EV: +2.7% | 66 shares @ $3.330 = $221.10
 ---
+
+## Auto-Paper Trade — 18:16 UTC
+- [Kalshi] Will the world pass 2 degrees Celsius over pre-industrial le
+- EV: +5.0% | 293 shares @ $0.750 = $221.07
+---
