@@ -1162,3 +1162,8 @@ Found 4 opps
 - [Crypto] SOL $93.56 (+10.1% 24h)
 - EV: +3.0% | 2 shares @ $75.970 = $152.85
 ---
+
+## Auto-Paper Trade — 20:46 UTC
+- [Crypto] DOGE $0.10 (+15.3% 24h)
+- EV: +4.6% | 8 shares @ $24.800 = $199.59
+---
