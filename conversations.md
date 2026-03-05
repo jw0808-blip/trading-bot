@@ -1560,3 +1560,8 @@ BTC: 0.014797 ($1,083.38)
 - [Kalshi] Will a human land on Mars before California starts high-spee
 - EV: +6.0% | 916 shares @ $0.240 = $221.16
 ---
+
+## Auto-Paper Trade — 18:26 UTC
+- [Kalshi] When will a supervolcano next erupt?
+- EV: +5.0% | 1222 shares @ $0.180 = $221.28
+---
