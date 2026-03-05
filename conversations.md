@@ -1570,3 +1570,8 @@ BTC: 0.014797 ($1,083.38)
 - [Crypto] DOGE $0.09 (-8.7% 24h)
 - EV: +2.6% | 11 shares @ $18.390 = $203.50
 ---
+
+## Auto-Paper Trade — 19:36 UTC
+- [Polymarket] US forces enter Iran by March 7?
+- EV: +7.2% | 3055 shares @ $0.072 = $221.28
+---
