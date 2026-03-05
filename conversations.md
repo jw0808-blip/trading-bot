@@ -1565,3 +1565,8 @@ BTC: 0.014797 ($1,083.38)
 - [Kalshi] When will a supervolcano next erupt?
 - EV: +5.0% | 1222 shares @ $0.180 = $221.28
 ---
+
+## Auto-Paper Trade — 18:26 UTC
+- [Crypto] DOGE $0.09 (-8.7% 24h)
+- EV: +2.6% | 11 shares @ $18.390 = $203.50
+---
