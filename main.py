@@ -2354,7 +2354,7 @@ COST_CONFIG = {
     "monthly_openai_limit": 10.00,           # $10/month max
     "monthly_openai_spent": 0.0,
     "kill_switch": False,                    # emergency stop all trading
-    "max_daily_trades": 20,                  # max trades per day
+    "max_daily_trades": 8,                  # max trades per day
     "daily_trades_count": 0,
     "max_portfolio_risk": 0.05,              # max 5% of portfolio at risk
     "strict_mode": True,                     # enforce all safety checks
@@ -2556,6 +2556,34 @@ async def scan_pairs_cmd(ctx):
         return
     for o in opps:
         await ctx.send(f"**PAIRS SIGNAL**: {o['pair']} | Corr: {o['correlation']:.3f} | Z: {o['zscore']:+.2f} | Dir: {o['direction']}")
+
+@bot.command(name="paper-pnl")
+async def paper_pnl_cmd(ctx):
+    positions = PAPER_PORTFOLIO.get("positions", [])
+    if not positions:
+        await ctx.send("No open paper positions.")
+        return
+    total_cost = sum(p.get("cost", 0) for p in positions)
+    total_value = sum(p.get("value", 0) for p in positions)
+    cash = PAPER_PORTFOLIO.get("cash", 0)
+    unrealized = total_value - total_cost
+    crypto_pos = sum(1 for p in positions if "crypto" in p.get("platform", "").lower() or any(k in p.get("market", "").lower() for k in ["btc","eth","sol","doge","zec","xlm","wbt"]))
+    pred_pos = len(positions) - crypto_pos
+    msg = f"**Paper P&L**\n================================\n"
+    msg += f"Cash: ${cash:,.2f}\n"
+    msg += f"Positions: {len(positions)} ({crypto_pos} crypto, {pred_pos} prediction)\n"
+    msg += f"Cost basis: ${total_cost:,.2f}\n"
+    msg += f"Current value: ${total_value:,.2f}\n"
+    msg += f"Unrealized P&L: ${unrealized:+,.2f} ({unrealized/max(total_cost,1)*100:+.1f}%)\n"
+    msg += f"Total portfolio: ${cash+total_value:,.2f}\n================================\n"
+    for p in positions[:15]:
+        cost = p.get("cost", 0)
+        val = p.get("value", 0)
+        ev = p.get("ev", 0)
+        msg += f"  {p.get('market','')[:30]} | ${cost:.0f} | EV:{ev*100:.1f}% | {p.get('platform','')}\n"
+    if len(positions) > 15:
+        msg += f"  +{len(positions)-15} more\n"
+    await ctx.send(msg)
 
 @bot.command(name="paper-reset")
 async def paper_reset_cmd(ctx, amount: float = 10000):
@@ -2879,6 +2907,7 @@ async def auto_paper_execute(channel, opp):
         "value": cost,
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "platform": opp.get("platform", ""),
+        "ev": opp.get("ev", 0),
     }
     PAPER_PORTFOLIO["positions"].append(position)
     PAPER_PORTFOLIO["trades"].append(position)
@@ -5842,6 +5871,8 @@ PAPER_TRADES_TODAY = 0
 
 async def enforce_paper_trade_floor(channel):
     """If fewer than MIN trades today, lower thresholds temporarily and force trades."""
+    return  # DISABLED: was forcing low-quality trades
+
     global PAPER_TRADES_TODAY
     if TRADING_MODE != "paper" or not AUTO_PAPER_ENABLED:
         return
@@ -6135,7 +6166,7 @@ def is_market_open():
 
 # --- DYNAMIC EXIT MANAGER ---
 EXIT_CONFIG = {
-    "crypto_ttl_hours": 72,
+    "crypto_ttl_hours": 48,
     "prediction_ttl_hours": 72,
     "pairs_ttl_days": 7,
     "pead_ttl_hours": 72,
@@ -6165,7 +6196,8 @@ async def run_exit_manager(channel=None):
             positions_to_close.append((i, pos, "TTL: PEAD 72h limit"))
         elif strategy in ("crypto", "momentum") and age_hours > EXIT_CONFIG["crypto_ttl_hours"]:
             positions_to_close.append((i, pos, "TTL: crypto 72h limit"))
-        elif strategy == "prediction" and age_hours > EXIT_CONFIG["prediction_ttl_hours"]:
+        elif strategy == "prediction":
+            continue  # Hold predictions to resolution - no TTL
             positions_to_close.append((i, pos, "TTL: prediction 72h limit"))
         # TP exit for PEAD
         if strategy == "pead":
@@ -6291,6 +6323,35 @@ def check_earnings_surprise(ticker):
     except Exception as e:
         log.warning("PEAD check error %s: %s", ticker, e)
     return None
+
+
+# ============================================================================
+# HOLDINGS FENCE - Protect long-term crypto holdings
+# ============================================================================
+QUARANTINED_ASSETS = ["BTC", "ETH", "XRP", "DOGE", "SOL", "XLM", "SHIB", "HBAR", "ALGO", "REN", "ZEC", "WBT"]
+TRADEABLE_FIAT = ["USD", "USDC", "USDT"]
+
+def get_tradeable_capital(platform_balances):
+    """Only count fiat/stablecoins as available trading capital. Ignore crypto holdings."""
+    capital = 0
+    for currency, amount in platform_balances.items():
+        if currency.upper() in TRADEABLE_FIAT:
+            capital += amount
+    return capital
+
+def is_bot_owned_position(asset, side="SELL"):
+    """Check if the bot opened this position. Prevents selling long-term holdings."""
+    if side != "SELL":
+        return True
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM paper_trades WHERE market LIKE ? AND side = 'BUY'", (f"%{asset}%",))
+        bot_bought = c.fetchone()[0]
+        conn.close()
+        return bot_bought > 0
+    except Exception:
+        return False
 
 # ============================================================================
 # RACE CONDITION LOCK - prevents concurrent duplicate trades
