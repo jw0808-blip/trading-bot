@@ -1530,3 +1530,8 @@ BTC: 0.014797 ($1,083.38)
 - [Kalshi] Will a human land on Mars before California starts high-spee
 - EV: +6.0% | 916 shares @ $0.240 = $221.16
 ---
+
+## Auto-Paper Trade — 17:16 UTC
+- [Polymarket] Will Reza Pahlavi enter Iran by March 31?
+- EV: +3.8% | 5945 shares @ $0.037 = $221.28
+---
