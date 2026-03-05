@@ -1535,3 +1535,8 @@ BTC: 0.014797 ($1,083.38)
 - [Polymarket] Will Reza Pahlavi enter Iran by March 31?
 - EV: +3.8% | 5945 shares @ $0.037 = $221.28
 ---
+
+## Auto-Paper Trade — 17:26 UTC
+- [Kalshi] When will a supervolcano next erupt?
+- EV: +5.0% | 1222 shares @ $0.180 = $221.28
+---
