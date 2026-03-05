@@ -1595,3 +1595,8 @@ BTC: 0.014797 ($1,083.38)
 - [Crypto] ZEC $228.44 (-8.0% 24h)
 - EV: +2.4% | 80 shares @ $2.750 = $221.32
 ---
+
+## Auto-Paper Trade — 20:46 UTC
+- [Polymarket] US forces enter Iran by March 7?
+- EV: +8.3% | 2619 shares @ $0.084 = $221.32
+---
