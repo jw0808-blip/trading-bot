@@ -1455,3 +1455,8 @@ BTC: 0.014797 ($1,083.38)
 - [Kalshi] Will the world pass 2 degrees Celsius over pre-industrial le
 - EV: +5.0% | 293 shares @ $0.750 = $221.07
 ---
+
+## Auto-Paper Trade — 05:49 UTC
+- [Crypto] ZEC $235.97 (+8.4% 24h)
+- EV: +2.5% | 57 shares @ $3.820 = $219.05
+---
