@@ -1650,3 +1650,8 @@ BTC: 0.014797 ($1,083.38)
 - [Kalshi] When will a supervolcano next erupt?
 - EV: +5.0% | 1222 shares @ $0.180 = $221.28
 ---
+
+## Auto-Paper Trade — 22:56 UTC
+- [Polymarket] US forces enter Iran by March 7?
+- EV: +4.0% | 5500 shares @ $0.040 = $221.32
+---
