@@ -1660,3 +1660,8 @@ BTC: 0.014797 ($1,083.38)
 - [Kalshi] Will the world pass 2 degrees Celsius over pre-industrial le
 - EV: +6.0% | 293 shares @ $0.750 = $221.07
 ---
+
+## Auto-Paper Trade — 23:36 UTC
+- [Polymarket] US forces enter Iran by March 7?
+- EV: +6.7% | 3283 shares @ $0.067 = $221.28
+---
