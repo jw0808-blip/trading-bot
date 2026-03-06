@@ -1735,3 +1735,8 @@ BTC: 0.014797 ($1,083.38)
 - [Kalshi] When will a supervolcano next erupt?
 - EV: +5.0% | 1222 shares @ $0.180 = $221.28
 ---
+
+## Auto-Paper Trade — 03:06 UTC
+- [Polymarket] Raptors vs. Timberwolves
+- EV: +6.5% | 3384 shares @ $0.065 = $221.28
+---
