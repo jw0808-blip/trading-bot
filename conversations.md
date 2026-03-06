@@ -2105,3 +2105,8 @@ BTC: 0.014797 ($1,083.38)
 - [Crypto] ZEC $211.17 (-8.0% 24h)
 - EV: +2.4% | 92 shares @ $2.380 = $220.27
 ---
+
+## Auto-Paper Trade — 23:26 UTC
+- [Kalshi] When will a supervolcano next erupt?
+- EV: +5.0% | 1222 shares @ $0.180 = $221.28
+---
