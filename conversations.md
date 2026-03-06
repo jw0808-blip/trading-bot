@@ -1805,3 +1805,8 @@ BTC: 0.014797 ($1,083.38)
 - [Polymarket] US forces enter Iran by March 7?
 - EV: +4.4% | 5000 shares @ $0.044 = $221.32
 ---
+
+## Auto-Paper Trade — 05:56 UTC
+- [Kalshi] When will a supervolcano next erupt?
+- EV: +5.0% | 1222 shares @ $0.180 = $221.28
+---
