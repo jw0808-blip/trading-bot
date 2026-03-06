@@ -1695,3 +1695,8 @@ BTC: 0.014797 ($1,083.38)
 - [Polymarket] US forces enter Iran by March 7?
 - EV: +4.2% | 5116 shares @ $0.043 = $221.31
 ---
+
+## Auto-Paper Trade — 01:16 UTC
+- [Kalshi] Will the world pass 2 degrees Celsius over pre-industrial le
+- EV: +6.0% | 293 shares @ $0.750 = $221.07
+---
