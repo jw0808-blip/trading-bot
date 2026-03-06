@@ -2000,3 +2000,8 @@ BTC: 0.014797 ($1,083.38)
 - [Crypto] ZEC $211.47 (-8.1% 24h)
 - EV: +2.4% | 97 shares @ $2.260 = $220.54
 ---
+
+## Auto-Paper Trade — 16:56 UTC
+- [Polymarket] Mavericks vs. Celtics
+- EV: +9.5% | 2315 shares @ $0.095 = $221.24
+---
