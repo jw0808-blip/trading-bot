@@ -2055,3 +2055,8 @@ BTC: 0.014797 ($1,083.38)
 - [Polymarket] Will the Iranian regime fall by March 31?
 - EV: +9.7% | 2268 shares @ $0.097 = $221.32
 ---
+
+## Auto-Paper Trade — 19:06 UTC
+- [Kalshi] Will the world pass 2 degrees Celsius over pre-industrial le
+- EV: +6.0% | 289 shares @ $0.760 = $220.96
+---
