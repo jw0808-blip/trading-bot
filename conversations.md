@@ -1930,3 +1930,8 @@ BTC: 0.014797 ($1,083.38)
 - [Polymarket] Will Judy Shelton be confirmed as Fed Chair?
 - EV: +3.0% | 7333 shares @ $0.030 = $221.31
 ---
+
+## Auto-Paper Trade — 13:36 UTC
+- [Polymarket] Will the Iranian regime fall by March 31?
+- EV: +9.4% | 2315 shares @ $0.095 = $221.24
+---
