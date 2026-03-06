@@ -1865,3 +1865,8 @@ BTC: 0.014797 ($1,083.38)
 - [Crypto] WBT $56.66 (+8.6% 24h)
 - EV: +2.6% | 215 shares @ $1.020 = $220.62
 ---
+
+## Auto-Paper Trade — 09:36 UTC
+- [Kalshi] Will the world pass 2 degrees Celsius over pre-industrial le
+- EV: +6.0% | 289 shares @ $0.760 = $220.96
+---
