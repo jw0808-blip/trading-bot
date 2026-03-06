@@ -1725,3 +1725,8 @@ BTC: 0.014797 ($1,083.38)
 - [Polymarket] Nets vs. Heat
 - EV: +7.5% | 2933 shares @ $0.075 = $221.29
 ---
+
+## Auto-Paper Trade — 02:26 UTC
+- [Kalshi] Will the world pass 2 degrees Celsius over pre-industrial le
+- EV: +5.0% | 289 shares @ $0.760 = $220.96
+---
