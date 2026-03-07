@@ -5152,9 +5152,9 @@ def get_alpaca_balance():
                     positions_str += f"\n  {sym}: {qty} shares (${mkt_val:,.2f}, P&L: ${unrealized:+,.2f})"
             
             # Cap display for paper account to avoid inflated portfolio totals
-            display_equity = min(equity, 25000) if "paper" in ALPACA_BASE_URL else equity
-            display_cash = min(cash, 25000) if "paper" in ALPACA_BASE_URL else cash
-            display_bp = min(buying_power, 50000) if "paper" in ALPACA_BASE_URL else buying_power
+            display_equity = equity
+            display_cash = cash
+            display_bp = buying_power
             result = f"${display_equity:,.2f} equity | ${display_cash:,.2f} cash | BP: ${display_bp:,.2f}"
             if positions_str:
                 result += positions_str
