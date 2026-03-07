@@ -2125,3 +2125,8 @@ BTC: 0.014797 ($1,083.38)
 - [Kalshi] Will a human land on Mars before California starts high-spee
 - EV: +6.0% | 956 shares @ $0.230 = $221.20
 ---
+
+## Auto-Paper Trade — 01:46 UTC
+- [Polymarket] Mavericks vs. Celtics
+- EV: +7.5% | 2933 shares @ $0.075 = $221.29
+---
