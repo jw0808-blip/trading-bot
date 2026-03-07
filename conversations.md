@@ -2385,3 +2385,8 @@ BTC: 0.014797 ($1,083.38)
 - [Polymarket] US x Iran ceasefire by March 15?
 - EV: +9.5% | 2315 shares @ $0.095 = $221.24
 ---
+
+## Auto-Paper Trade — 15:56 UTC
+- [Kalshi] When will a supervolcano next erupt?
+- EV: +5.0% | 1222 shares @ $0.180 = $221.28
+---
