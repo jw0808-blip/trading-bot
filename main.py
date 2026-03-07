@@ -2879,6 +2879,10 @@ async def auto_paper_execute(channel, opp):
     if any(s in _mkt_lower for s in _blacklist):
         log.info("BLACKLIST: skip %s", opp.get("market", "")[:40])
         return False
+    _plat = opp.get("platform", "").lower()
+    if _plat in ("polymarket", "kalshi", "predictit"):
+        log.info("SUSPENDED: pred market disabled (%s)", opp.get("market", "")[:40])
+        return False
     # === SQLITE DEDUP (1 per market, survives restarts) ===
     _mkey = opp.get("market", "")[:60]
     try:
@@ -6207,7 +6211,7 @@ def check_correlation(new_market, existing_positions):
 # ============================================================================
 # SPRINT 2: EQUITIES & EXIT MANAGEMENT
 # ============================================================================
-EQUITIES_ENABLED = False  # Feature flag - do not enable until validated
+EQUITIES_ENABLED = True  # Feature flag - do not enable until validated
 
 # --- MARKET HOURS GUARD ---
 def is_market_open():
