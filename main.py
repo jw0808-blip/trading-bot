@@ -2863,6 +2863,51 @@ async def auto_paper_execute(channel, opp):
     ev = opp.get("ev", 0)
     if ev < ALERT_CONFIG["min_ev_threshold"]:
         return False
+    # === BLACKLIST (sports, memes, long-term junk) ===
+    _mkt_lower = opp.get("market", "").lower()
+    _blacklist = ["vs.", "nba", "nfl", "nhl", "mlb", "soccer", "basketball",
+                  "baseball", "hockey", "mavericks", "celtics", "lakers",
+                  "warriors", "nets", "heat", "raptors", "timberwolves",
+                  "pacers", "pelicans", "suns", "knicks", "bucks", "nuggets",
+                  "clippers", "cavaliers", "grizzlies", "rockets", "spurs",
+                  "bulls", "pistons", "magic", "hornets", "hawks", "wizards",
+                  "blazers", "kings", "thunder", "jazz", "premier league",
+                  "la liga", "champions league", "bundesliga", "serie a",
+                  "epl", "psg", "manchester", "liverpool", "arsenal",
+                  "chelsea", "barcelona", "real madrid", "jesus christ",
+                  "supervolcano", "mars before", "next erupt", "2050"]
+    if any(s in _mkt_lower for s in _blacklist):
+        log.info("BLACKLIST: skip %s", opp.get("market", "")[:40])
+        return False
+    # === SQLITE DEDUP (1 per market, survives restarts) ===
+    _mkey = opp.get("market", "")[:60]
+    try:
+        _dconn = sqlite3.connect(DB_PATH)
+        _dc = _dconn.cursor()
+        _dc.execute("SELECT COUNT(*) FROM paper_trades WHERE market = ?", (_mkey,))
+        _dcount = _dc.fetchone()[0]
+        _dconn.close()
+        if _dcount > 0:
+            log.info("DEDUP-SQL: %s already traded %d times", _mkey, _dcount)
+            return False
+    except Exception:
+        pass
+    # === MEMORY DEDUP ===
+    for _p in PAPER_PORTFOLIO.get("positions", []):
+        if _p.get("market", "") == _mkey:
+            log.info("DEDUP-MEM: %s already open", _mkey)
+            return False
+    # === CRYPTO CAP (max 3) ===
+    _is_crypto = any(k in _mkt_lower for k in ["btc","eth","sol","doge","zec","xlm","crypto","wbt","xrp","hbar","shib"])
+    if _is_crypto:
+        _cc = sum(1 for _p in PAPER_PORTFOLIO.get("positions", []) if any(k in _p.get("market","").lower() for k in ["btc","eth","sol","doge","zec","xlm","crypto","wbt"]))
+        if _cc >= 3:
+            log.info("CRYPTO-CAP: skip %s (%d open)", _mkey[:30], _cc)
+            return False
+    # === GLOBAL POSITION CAP (max 15) ===
+    if len(PAPER_PORTFOLIO.get("positions", [])) >= 15:
+        log.info("GLOBAL-CAP: 15 positions open, skip")
+        return False
 
     # Calculate position size with Kelly criterion
     # Tiered sizing based on edge score
