@@ -2375,3 +2375,8 @@ BTC: 0.014797 ($1,083.38)
 - [Kalshi] When will a supervolcano next erupt?
 - EV: +5.0% | 1222 shares @ $0.180 = $221.28
 ---
+
+## Auto-Paper Trade — 15:36 UTC
+- [Kalshi] Will the world pass 2 degrees Celsius over pre-industrial le
+- EV: +5.0% | 289 shares @ $0.760 = $220.96
+---
