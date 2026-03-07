@@ -2274,16 +2274,7 @@ async def check_and_send_alerts():
 
             if should_alert(market_key, ev):
                 ev_pct = ev * 100
-                # Tiered sizing based on edge score
-    edge = opp.get("edge_score", 50)
-    if edge >= 75:
-        size_pct = 0.015  # 1.5% for high confidence
-    elif edge >= 65:
-        size_pct = 0.005  # 0.5% for medium
-    else:
-        size_pct = 0.0025  # 0.25% for low
-    size = PAPER_PORTFOLIO.get("cash", 10000) * size_pct
-    log.info("Tiered size: edge=%d pct=%.3f size=$%.2f", edge, size_pct, size)
+
                 alert = (
                     f"**HIGH EV ALERT**\n"
                     f"[{opp['platform']}] {opp['type']} — EV: +{ev_pct:.1f}%\n"
@@ -2874,7 +2865,15 @@ async def auto_paper_execute(channel, opp):
         return False
 
     # Calculate position size with Kelly criterion
-    size = suggest_position_size(ev)
+    # Tiered sizing based on edge score
+    _edge = opp.get("edge_score", 50)
+    if _edge >= 75:
+        size = PAPER_PORTFOLIO.get("cash", 10000) * 0.015
+    elif _edge >= 65:
+        size = PAPER_PORTFOLIO.get("cash", 10000) * 0.005
+    else:
+        size = PAPER_PORTFOLIO.get("cash", 10000) * 0.0025
+    log.info("Tiered size: edge=%d size=$%.2f", _edge, size)
     price = 0.50  # default for prediction markets
 
     # Extract price from detail if available
