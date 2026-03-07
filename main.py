@@ -2916,6 +2916,7 @@ async def auto_paper_execute(channel, opp):
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "platform": opp.get("platform", ""),
         "ev": opp.get("ev", 0),
+        "strategy": "crypto" if any(k in opp.get("market","").lower() for k in ["btc","eth","sol","doge","zec","xlm","crypto","wbt"]) else "prediction",
     }
     PAPER_PORTFOLIO["positions"].append(position)
     PAPER_PORTFOLIO["trades"].append(position)
@@ -5674,11 +5675,7 @@ async def auto_live_execute(channel, opp):
     if any(s in _market_lower for s in SPORTS_BLACKLIST):
         log.info("Sports blacklist: skipping %s", opp.get("market", "")[:40])
         return False
-    corr_ok, corr_mult, corr_reason = check_correlation(opp.get("market","")[:60], PAPER_PORTFOLIO.get("positions",[]))
-    if not corr_ok:
-        log.info("Correlation block: %s", corr_reason)
-        return False
-    # ONE POSITION PER MARKET — prevent over-concentration
+    # (dedup moved to unified pre-trade block above) — prevent over-concentration
     market_key = opp.get("market", "")[:60]
     for pos in PAPER_PORTFOLIO.get("positions", []):
         if pos.get("market", "") == market_key:
