@@ -2274,7 +2274,16 @@ async def check_and_send_alerts():
 
             if should_alert(market_key, ev):
                 ev_pct = ev * 100
-                size = suggest_position_size(ev)
+                # Tiered sizing based on edge score
+    edge = opp.get("edge_score", 50)
+    if edge >= 75:
+        size_pct = 0.015  # 1.5% for high confidence
+    elif edge >= 65:
+        size_pct = 0.005  # 0.5% for medium
+    else:
+        size_pct = 0.0025  # 0.25% for low
+    size = PAPER_PORTFOLIO.get("cash", 10000) * size_pct
+    log.info("Tiered size: edge=%d pct=%.3f size=$%.2f", edge, size_pct, size)
                 alert = (
                     f"**HIGH EV ALERT**\n"
                     f"[{opp['platform']}] {opp['type']} — EV: +{ev_pct:.1f}%\n"
@@ -5659,6 +5668,12 @@ async def auto_live_execute(channel, opp):
     ev = opp.get("ev", 0)
     if ev < auto["min_ev"]:
         log.info("Auto-live skip: EV %.1f%% < %.1f%% min", ev*100, auto["min_ev"]*100)
+        return False
+    # SPORTS BLACKLIST - we are not a sportsbook
+    SPORTS_BLACKLIST = ["vs.", "nba", "nfl", "nhl", "mlb", "soccer", "football", "basketball", "baseball", "hockey", "mavericks", "celtics", "lakers", "warriors", "nets", "heat", "raptors", "timberwolves", "pacers", "pelicans", "suns", "knicks", "bucks", "nuggets", "clippers", "76ers", "cavaliers", "grizzlies", "rockets", "spurs", "bulls", "pistons", "magic", "hornets", "hawks", "wizards", "blazers", "kings", "thunder", "jazz", "premier league", "la liga", "champions league", "bundesliga", "serie a", "epl", "psg", "manchester", "liverpool", "arsenal", "chelsea", "barcelona", "real madrid"]
+    _market_lower = opp.get("market", "").lower()
+    if any(s in _market_lower for s in SPORTS_BLACKLIST):
+        log.info("Sports blacklist: skipping %s", opp.get("market", "")[:40])
         return False
     corr_ok, corr_mult, corr_reason = check_correlation(opp.get("market","")[:60], PAPER_PORTFOLIO.get("positions",[]))
     if not corr_ok:
