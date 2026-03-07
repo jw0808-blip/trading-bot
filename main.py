@@ -2280,7 +2280,7 @@ async def check_and_send_alerts():
                     f"[{opp['platform']}] {opp['type']} — EV: +{ev_pct:.1f}%\n"
                     f"{opp['market']}\n"
                     f"{opp['detail']}\n"
-                    f"Suggested size: ${size:,.0f}\n"
+                    f"EV: {ev_pct:.1f}%\n"
                     f"Mode: {TRADING_MODE.upper()} | Use `!trade` to act"
                 )
                 await channel.send(alert)
