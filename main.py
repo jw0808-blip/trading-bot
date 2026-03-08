@@ -2272,6 +2272,9 @@ async def check_and_send_alerts():
             ev = opp.get("ev", 0)
             market_key = f"{opp['platform']}:{opp.get('ticker', opp['market'][:30])}"
 
+            _al=opp.get("market","").lower()
+            if any(s in _al for s in ["vs.","celsius","supervolcano","mars before","next erupt","jesus","strasbourg","pistons","nets vs","mavericks","celtics","lakers"]):
+                continue
             if should_alert(market_key, ev):
                 ev_pct = ev * 100
 
