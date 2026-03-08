@@ -2272,8 +2272,7 @@ async def check_and_send_alerts():
             ev = opp.get("ev", 0)
             market_key = f"{opp['platform']}:{opp.get('ticker', opp['market'][:30])}"
 
-            _al=opp.get("market","").lower()
-            if any(s in _al for s in ["vs.","celsius","supervolcano","mars before","next erupt","jesus","strasbourg","pistons","nets vs","mavericks","celtics","lakers"]):
+            if is_sports_or_junk(opp.get("market", "")):
                 continue
             if should_alert(market_key, ev):
                 ev_pct = ev * 100
@@ -2854,6 +2853,45 @@ def record_signal(opp, executed=False, paper=True):
     return signal
 
 
+
+# === SPORTS/JUNK STRUCTURAL FIREWALL ===
+import re as _sports_re
+
+def is_sports_or_junk(title):
+    """Pattern-based detection of sports and junk markets. No team names needed."""
+    if not title:
+        return False
+    t = title.lower()
+    # Sports patterns
+    if " vs." in t or " vs " in t:
+        return True
+    if _sports_re.search(r'\([+-]?\d+\.?\d*\)', t):
+        return True
+    if _sports_re.search(r'win on \d{4}', t):
+        return True
+    if " fc " in t or t.startswith("fc ") or " afc " in t:
+        return True
+    sports_terms = [
+        "nba", "nfl", "nhl", "mlb", "mls", "epl", "ufc", "ncaa", "wnba",
+        "premier league", "la liga", "serie a", "bundesliga", "champions league",
+        "ligue 1", "copa ", "soccer", "basketball", "baseball", "hockey",
+        "football game", "touchdown", "quarterback", "halftime", "innings",
+        "goal scorer", "match result", "spread:", "moneyline", "over/under",
+        "playoff", "world series", "super bowl", "world cup", "grand slam",
+        "formula 1", "f1 ", "nascar", "boxing", "mma ", "bellator",
+    ]
+    if any(s in t for s in sports_terms):
+        return True
+    # Junk/meme patterns
+    junk_terms = [
+        "jesus christ", "supervolcano", "mars before", "next erupt", "2050",
+        "land on mars", "2 degrees celsius", "alien contact", "rapture",
+        "asteroid", "bigfoot", "ufo ", "flat earth", "zombie",
+    ]
+    if any(s in t for s in junk_terms):
+        return True
+    return False
+
 async def auto_paper_execute(channel, opp):
     """Automatically execute a high-EV opportunity in paper mode."""
     if not AUTO_PAPER_ENABLED:
@@ -2868,18 +2906,7 @@ async def auto_paper_execute(channel, opp):
         return False
     # === BLACKLIST (sports, memes, long-term junk) ===
     _mkt_lower = opp.get("market", "").lower()
-    _blacklist = ["vs.", "nba", "nfl", "nhl", "mlb", "soccer", "basketball",
-                  "baseball", "hockey", "mavericks", "celtics", "lakers",
-                  "warriors", "nets", "heat", "raptors", "timberwolves",
-                  "pacers", "pelicans", "suns", "knicks", "bucks", "nuggets",
-                  "clippers", "cavaliers", "grizzlies", "rockets", "spurs",
-                  "bulls", "pistons", "magic", "hornets", "hawks", "wizards",
-                  "blazers", "kings", "thunder", "jazz", "premier league",
-                  "la liga", "champions league", "bundesliga", "serie a",
-                  "epl", "psg", "manchester", "liverpool", "arsenal",
-                  "chelsea", "barcelona", "real madrid", "jesus christ",
-                  "supervolcano", "mars before", "next erupt", "2050"]
-    if any(s in _mkt_lower for s in _blacklist):
+    if is_sports_or_junk(opp.get("market", "")):
         log.info("BLACKLIST: skip %s", opp.get("market", "")[:40])
         return False
     _plat = opp.get("platform", "").lower()
