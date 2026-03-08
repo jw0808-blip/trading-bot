@@ -2884,8 +2884,10 @@ async def auto_paper_execute(channel, opp):
         return False
     _plat = opp.get("platform", "").lower()
     if _plat in ("polymarket", "kalshi", "predictit"):
-        log.info("SUSPENDED: pred market disabled (%s)", opp.get("market", "")[:40])
-        return False
+        _cats=["fda","sec ","cpi","fed ","fomc","supreme court","earnings","tariff","iran","ceasefire","ukraine","russia","china","indictment","impeach","rate cut","rate hike","inflation","gdp","jobs report","nonfarm","sanctions"]
+        if not any(cat in opp.get("market","").lower() for cat in _cats):
+            log.info("FILTERED: non-catalyst pred market (%s)", opp.get("market","")[:40])
+            return False
     # === SQLITE DEDUP (1 per market, survives restarts) ===
     _mkey = opp.get("market", "")[:60]
     try:
