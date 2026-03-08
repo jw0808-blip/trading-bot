@@ -2893,7 +2893,7 @@ async def auto_paper_execute(channel, opp):
     try:
         _dconn = sqlite3.connect(DB_PATH)
         _dc = _dconn.cursor()
-        _dc.execute("SELECT COUNT(*) FROM paper_trades WHERE market = ?", (_mkey,))
+        _dc.execute("SELECT COUNT(*) FROM paper_trades WHERE market = ? AND status = 'open'", (_mkey,))
         _dcount = _dc.fetchone()[0]
         _dconn.close()
         if _dcount > 0:
@@ -2926,7 +2926,7 @@ async def auto_paper_execute(channel, opp):
     elif _edge >= 65:
         size = PAPER_PORTFOLIO.get("cash", 10000) * 0.005
     else:
-        size = PAPER_PORTFOLIO.get("cash", 10000) * 0.0025
+        size = PAPER_PORTFOLIO.get("cash", 10000) * 0.01
     log.info("Tiered size: edge=%d size=$%.2f", _edge, size)
     price = 0.50  # default for prediction markets
 
