@@ -2725,3 +2725,8 @@ BTC: 0.014797 ($993.41)
 - [Polymarket] Will Iran strike Israel on March 6?
 - EV: +8.8% | 2599 shares @ $0.087 = $227.47
 ---
+
+## Auto-Paper Trade — 19:33 UTC
+- [Crypto] SUI $0.98 (+9.5% 24h)
+- EV: +2.9% | 37 shares @ $6.050 = $225.19
+---
