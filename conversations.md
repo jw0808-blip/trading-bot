@@ -2670,3 +2670,8 @@ BTC: 0.014797 ($993.41)
 - [Polymarket] Will Iran announce a new supreme leader on March 8, 2026?
 - EV: +2.6% | 9615 shares @ $0.026 = $251.49
 ---
+
+## Auto-Paper Trade — 00:13 UTC
+- [Polymarket] Will the Iranian regime fall by March 31?
+- EV: +8.8% | 2873 shares @ $0.087 = $251.45
+---
