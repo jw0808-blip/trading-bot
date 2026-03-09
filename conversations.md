@@ -2675,3 +2675,8 @@ BTC: 0.014797 ($993.41)
 - [Polymarket] Will the Iranian regime fall by March 31?
 - EV: +8.8% | 2873 shares @ $0.087 = $251.45
 ---
+
+## Auto-Paper Trade — 13:43 UTC
+- [Crypto] ZEC $212.95 (+8.1% 24h)
+- EV: +2.4% | 102 shares @ $2.420 = $248.32
+---
