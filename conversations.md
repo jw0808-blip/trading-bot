@@ -2720,3 +2720,8 @@ BTC: 0.014797 ($993.41)
 - [Crypto] HYPE $34.32 (+13.7% 24h)
 - EV: +4.1% | 51 shares @ $4.430 = $227.29
 ---
+
+## Auto-Paper Trade — 18:53 UTC
+- [Polymarket] Will Iran strike Israel on March 6?
+- EV: +8.8% | 2599 shares @ $0.087 = $227.47
+---
