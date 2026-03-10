@@ -2770,3 +2770,8 @@ BTC: 0.014797 ($993.41)
 - [Crypto] DOGE $0.10 (+9.0% 24h)
 - EV: +2.7% | 5 shares @ $18.720 = $94.16
 ---
+
+## Auto-Paper Trade — 20:21 UTC
+- [Polymarket] Will the Iranian regime fall by March 31?
+- EV: +5.9% | 4237 shares @ $0.059 = $251.48
+---
