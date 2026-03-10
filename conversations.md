@@ -2745,3 +2745,8 @@ BTC: 0.014797 ($993.41)
 - [Crypto] HYPE $34.13 (+10.7% 24h)
 - EV: +3.2% | 45 shares @ $4.790 = $216.84
 ---
+
+## Auto-Paper Trade — 16:21 UTC
+- [Polymarket] US forces enter Iran by March 14?
+- EV: +7.5% | 1333 shares @ $0.075 = $100.57
+---
