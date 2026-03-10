@@ -6411,8 +6411,9 @@ def calculate_pair_zscore(ticker_a, ticker_b, lookback=252):
         data_b = yf.download(ticker_b, period=f"{lookback}d", progress=False)
         if len(data_a) < 100 or len(data_b) < 100:
             return None, None, None
-        prices_a = data_a["Close"].values[-lookback:]
-        prices_b = data_b["Close"].values[-lookback:]
+        # Flatten the arrays to fix the yfinance 2D DataFrame bug
+        prices_a = data_a["Close"].values.flatten()[-lookback:]
+        prices_b = data_b["Close"].values.flatten()[-lookback:]
         min_len = min(len(prices_a), len(prices_b))
         prices_a = prices_a[-min_len:]
         prices_b = prices_b[-min_len:]
