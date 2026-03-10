@@ -1115,6 +1115,25 @@ async def on_ready():
     init_redis()
     init_db()
     db_load_daily_state()
+    # Reload open positions from SQLite so exit manager works after restart
+    try:
+        _rconn = sqlite3.connect(DB_PATH)
+        _rc = _rconn.cursor()
+        _rc.execute("SELECT market, side, shares, entry_price, cost, timestamp, platform, ev FROM paper_trades WHERE status = 'open'")
+        _rows = _rc.fetchall()
+        _rconn.close()
+        if _rows and not PAPER_PORTFOLIO.get("positions"):
+            for _r in _rows:
+                PAPER_PORTFOLIO["positions"].append({
+                    "market": _r[0], "side": _r[1] or "BUY", "shares": _r[2] or 0,
+                    "entry_price": _r[3] or 0, "cost": _r[4] or 0, "value": _r[4] or 0,
+                    "timestamp": _r[5] or "", "platform": _r[6] or "",
+                    "ev": _r[7] or 0,
+                    "strategy": "crypto" if any(k in (_r[0] or "").lower() for k in ["btc","eth","sol","doge","zec","xlm","hype","sui","wbt"]) else "prediction",
+                })
+            log.info("Reloaded %d open positions from SQLite", len(_rows))
+    except Exception as _e:
+        log.warning("Position reload error: %s", _e)
     log.info("TraderJoes bot online as %s", bot.user)
     if not daily_report_task.is_running():
         daily_report_task.start()
@@ -2916,7 +2935,14 @@ async def auto_paper_execute(channel, opp):
             log.info("FILTERED: non-catalyst pred market (%s)", opp.get("market","")[:40])
             return False
     # === SQLITE DEDUP (1 per market, survives restarts) ===
-    _mkey = opp.get("market", "")[:60]
+    _raw_mkt = opp.get("market", "")[:60]
+    _mkt_l = _raw_mkt.lower()
+    _tickers = ["btc","eth","sol","doge","zec","xlm","hype","sui","wbt","xrp","hbar","shib","algo","ada","avax","matic","link"]
+    _mkey = _raw_mkt
+    for _tk in _tickers:
+        if _tk in _mkt_l:
+            _mkey = "CRYPTO:" + _tk.upper()
+            break
     try:
         _dconn = sqlite3.connect(DB_PATH)
         _dc = _dconn.cursor()
@@ -2988,7 +3014,7 @@ async def auto_paper_execute(channel, opp):
 
     PAPER_PORTFOLIO["cash"] -= total_cost
     position = {
-        "market": opp["market"][:60],
+        "market": _mkey if "_mkey" in dir() and _mkey.startswith("CRYPTO:") else opp["market"][:60],
         "side": "BUY",
         "shares": shares,
         "entry_price": price,
@@ -6304,6 +6330,14 @@ async def run_exit_manager(channel=None):
     for idx, pos, reason in sorted(positions_to_close, key=lambda x: x[0], reverse=True):
         if idx < len(PAPER_PORTFOLIO["positions"]):
             removed = PAPER_PORTFOLIO["positions"].pop(idx)
+            try:
+                _econn = sqlite3.connect(DB_PATH)
+                _ec = _econn.cursor()
+                _ec.execute("UPDATE paper_trades SET status = 'closed' WHERE market = ? AND status = 'open'", (removed.get("market", ""),))
+                _econn.commit()
+                _econn.close()
+            except Exception:
+                pass
             PAPER_PORTFOLIO["cash"] += removed.get("value", removed.get("cost", 0))
             closed += 1
             log.info("EXIT MANAGER: Closed %s | Reason: %s | Returned $%.2f", removed.get("market", "")[:40], reason, removed.get("value", 0))
