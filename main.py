@@ -2803,6 +2803,33 @@ async def alert_scan_task():
         if not CYCLE_PAUSED and not COST_CONFIG.get("kill_switch", False):
             await check_and_send_alerts()
             push_all_analytics()  # push metrics each cycle
+            # === PAIRS TRADING SCANNER (runs during market hours) ===
+            if EQUITIES_ENABLED and is_market_open():
+                try:
+                    pairs_opps = scan_pairs_opportunities()
+                    for po in pairs_opps:
+                        log.info("PAIRS SIGNAL: %s corr=%.3f z=%.2f dir=%s",
+                                 po.get("pair",""), po.get("correlation",0),
+                                 po.get("zscore",0), po.get("direction",""))
+                        if channel:
+                            await channel.send(
+                                f"**PAIRS SIGNAL** {po['pair']} | "
+                                f"Corr: {po['correlation']:.3f} | "
+                                f"Z: {po['zscore']:+.2f} | "
+                                f"Dir: {po['direction']}")
+                except Exception as pairs_err:
+                    log.warning("Pairs scan error: %s", pairs_err)
+            elif EQUITIES_ENABLED and not is_market_open():
+                pass  # Market closed, skip silently
+            # === FUNDING ARB SCANNER (runs 24/7) ===
+            try:
+                _arb_cfg = globals().get("FUNDING_ARB_CONFIG", {})
+                _arb_threshold = _arb_cfg.get("min_spread", 0.00065)
+                log.info("FUNDING-ARB scan: threshold=%.4f%% (module %s)",
+                         _arb_threshold * 100,
+                         "active" if _arb_cfg else "NOT CONFIGURED")
+            except Exception as arb_err:
+                log.warning("Funding arb scan error: %s", arb_err)
             # Run exit manager every cycle
             try:
                 exits = await run_exit_manager()
