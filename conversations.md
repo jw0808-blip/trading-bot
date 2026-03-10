@@ -2775,3 +2775,8 @@ BTC: 0.014797 ($993.41)
 - [Polymarket] Will the Iranian regime fall by March 31?
 - EV: +5.9% | 4237 shares @ $0.059 = $251.48
 ---
+
+## Auto-Paper Trade — 21:01 UTC
+- [Polymarket] US x Iran ceasefire by March 15?
+- EV: +5.5% | 4499 shares @ $0.055 = $248.93
+---
