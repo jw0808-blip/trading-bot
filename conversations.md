@@ -2800,3 +2800,8 @@ BTC: 0.014797 ($993.41)
 - [Crypto] ADA $0.29 (+8.0% 24h)
 - EV: +2.4% | 40 shares @ $5.910 = $237.82
 ---
+
+## Auto-Paper Trade — 11:01 UTC
+- [Polymarket] US x Iran ceasefire by March 31?
+- EV: +9.5% | 2477 shares @ $0.095 = $236.73
+---
