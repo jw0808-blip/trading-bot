@@ -2825,9 +2825,53 @@ async def alert_scan_task():
             try:
                 _arb_cfg = globals().get("FUNDING_ARB_CONFIG", {})
                 _arb_threshold = _arb_cfg.get("min_spread", 0.00065)
-                log.info("FUNDING-ARB scan: threshold=%.4f%% (module %s)",
-                         _arb_threshold * 100,
-                         "active" if _arb_cfg else "NOT CONFIGURED")
+                # Fetch LIVE funding rates from Phemex
+                import requests as _arb_req
+                _funding_pairs = [("BTC", "BTCUSD"), ("ETH", "ETHUSD")]
+                for _fname, _fsymbol in _funding_pairs:
+                    try:
+                        _fr = _arb_req.get(
+                            f"https://api.phemex.com/md/v2/ticker/24hr?symbol={_fsymbol}",
+                            timeout=5
+                        )
+                        if _fr.status_code == 200:
+                            _fdata = _fr.json()
+                            _result = _fdata.get("result", {})
+                            _funding_rate = _result.get("fundingRate", 0)
+                            # Phemex returns rate as integer, divide by 10^8
+                            if isinstance(_funding_rate, (int, float)) and _funding_rate != 0:
+                                _rate_pct = _funding_rate / 1e8 if abs(_funding_rate) > 1 else _funding_rate
+                            else:
+                                _rate_pct = 0
+                            _above = _rate_pct > _arb_threshold
+                            log.info("FUNDING-ARB %s: rate=%.4f%% threshold=%.4f%% %s",
+                                     _fname, _rate_pct * 100, _arb_threshold * 100,
+                                     ">>> SIGNAL" if _above else "below threshold")
+                            if _above and TRADING_MODE == "paper" and AUTO_PAPER_ENABLED:
+                                _arb_size = PAPER_PORTFOLIO.get("cash", 25000) * 0.02
+                                if _arb_size > 50 and len(PAPER_PORTFOLIO.get("positions", [])) < 25:
+                                    _arb_pos = {
+                                        "market": f"FUNDING-ARB:{_fname}",
+                                        "side": "ARB", "shares": 1,
+                                        "entry_price": _rate_pct,
+                                        "cost": _arb_size, "value": _arb_size,
+                                        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                                        "platform": "Phemex+Coinbase",
+                                        "ev": _rate_pct, "strategy": "funding_arb",
+                                    }
+                                    PAPER_PORTFOLIO["positions"].append(_arb_pos)
+                                    PAPER_PORTFOLIO["cash"] -= _arb_size
+                                    db_log_paper_trade(_arb_pos)
+                                    log.info("FUNDING-ARB TRADE: %s rate=%.4f%% size=$%.0f",
+                                             _fname, _rate_pct * 100, _arb_size)
+                                    if channel:
+                                        await channel.send(
+                                            f"**FUNDING ARB** {_fname} | Rate: {_rate_pct*100:.4f}% | "
+                                            f"Size: ${_arb_size:.0f} | Spot+Short")
+                        else:
+                            log.warning("Phemex API %s: status %d", _fname, _fr.status_code)
+                    except Exception as _fe:
+                        log.warning("Phemex %s fetch error: %s", _fname, _fe)
             except Exception as arb_err:
                 log.warning("Funding arb scan error: %s", arb_err)
             # Run exit manager every cycle
@@ -6398,6 +6442,13 @@ async def run_exit_manager(channel=None):
             positions_to_close.append((i, pos, "TTL: PEAD 72h limit"))
         elif strategy in ("crypto", "momentum") and age_hours > EXIT_CONFIG["crypto_ttl_hours"]:
             positions_to_close.append((i, pos, "TTL: crypto 72h limit"))
+        elif strategy == "funding_arb":
+            # Exit funding arb when rate drops below threshold
+            _arb_age = age_hours
+            if _arb_age > 24:  # Re-evaluate after 24h
+                positions_to_close.append((i, pos, f"FUNDING-ARB TTL: {_arb_age:.0f}h"))
+                continue
+            log.info("ARB POS: %s age=%.0fh rate=%.4f%%", market[:20], _arb_age, pos.get("entry_price", 0) * 100)
         elif strategy == "prediction":
             # Hold to resolution but log status
             log.info("PRED POS: %s age=%.0fh ev=%.1f%%", market[:30], age_hours, pos.get("ev",0)*100)
@@ -6440,7 +6491,8 @@ EQUITIES_CONFIG = {
     "max_concurrent": 5,
     "max_sector_pct": 0.30,
     "pairs": {
-        "seed": [("V", "MA"), ("XOM", "CVX"), ("GOOGL", "META"), ("KO", "PEP"), ("JPM", "BAC")],
+        "seed": [("V", "MA"), ("XOM", "CVX"), ("GOOGL", "META"), ("KO", "PEP"), ("JPM", "BAC"),
+                 ("MS", "GS"), ("NVDA", "AMD"), ("HD", "LOW"), ("UNH", "CI"), ("DIS", "CMCSA")],
         "min_correlation": 0.85,
         "lookback_days": 252,
         "zscore_entry": 1.5,
@@ -6469,6 +6521,7 @@ def calculate_pair_zscore(ticker_a, ticker_b, lookback=252):
         data_a = yf.download(ticker_a, period=f"{lookback}d", progress=False)
         data_b = yf.download(ticker_b, period=f"{lookback}d", progress=False)
         if len(data_a) < 100 or len(data_b) < 100:
+            log.warning("PAIRS SKIP: %s/%s insufficient data (%d/%d rows)", ticker_a, ticker_b, len(data_a), len(data_b))
             return None, None, None
         # Flatten the arrays to fix the yfinance 2D DataFrame bug
         prices_a = data_a["Close"].values.flatten()[-lookback:]
@@ -6477,7 +6530,11 @@ def calculate_pair_zscore(ticker_a, ticker_b, lookback=252):
         prices_a = prices_a[-min_len:]
         prices_b = prices_b[-min_len:]
         ratio = prices_a / prices_b
-        correlation = float(np.corrcoef(prices_a, prices_b)[0, 1])
+        _corr_matrix = np.corrcoef(prices_a, prices_b)
+        correlation = float(_corr_matrix[0, 1])
+        if np.isnan(correlation):
+            log.warning("PAIRS NaN: %s/%s - insufficient variance in price data", ticker_a, ticker_b)
+            return None, None, None
         mean_ratio = float(np.mean(ratio))
         std_ratio = float(np.std(ratio))
         if std_ratio == 0:
