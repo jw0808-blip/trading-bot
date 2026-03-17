@@ -6449,6 +6449,13 @@ async def run_exit_manager(channel=None):
                 positions_to_close.append((i, pos, f"FUNDING-ARB TTL: {_arb_age:.0f}h"))
                 continue
             log.info("ARB POS: %s age=%.0fh rate=%.4f%%", market[:20], _arb_age, pos.get("entry_price", 0) * 100)
+        elif strategy == "funding_arb":
+            # Exit funding arb when rate drops below threshold
+            _arb_age = age_hours
+            if _arb_age > 24:  # Re-evaluate after 24h
+                positions_to_close.append((i, pos, f"FUNDING-ARB TTL: {_arb_age:.0f}h"))
+                continue
+            log.info("ARB POS: %s age=%.0fh rate=%.4f%%", market[:20], _arb_age, pos.get("entry_price", 0) * 100)
         elif strategy == "prediction":
             # Hold to resolution but log status
             log.info("PRED POS: %s age=%.0fh ev=%.1f%%", market[:30], age_hours, pos.get("ev",0)*100)
