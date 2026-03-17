@@ -1916,7 +1916,7 @@ CONTEXT_MEMORY = {
     },
     "domain": {  # Per-skill expert knowledge
         "prediction_markets": {
-            "min_ev_threshold": 0.02,
+            "min_ev_threshold": 0.015,
             "prefer_liquid_markets": True,
             "arb_min_spread": 0.02,
         },
@@ -2990,11 +2990,11 @@ async def auto_paper_execute(channel, opp):
     _is_crypto = any(k in _mkt_lower for k in ["btc","eth","sol","doge","zec","xlm","crypto","wbt","xrp","hbar","shib"])
     if _is_crypto:
         _cc = sum(1 for _p in PAPER_PORTFOLIO.get("positions", []) if any(k in _p.get("market","").lower() for k in ["btc","eth","sol","doge","zec","xlm","crypto","wbt"]))
-        if _cc >= 3:
+        if _cc >= 5:
             log.info("CRYPTO-CAP: skip %s (%d open)", _mkey[:30], _cc)
             return False
     # === GLOBAL POSITION CAP (max 15) ===
-    if len(PAPER_PORTFOLIO.get("positions", [])) >= 15:
+    if len(PAPER_PORTFOLIO.get("positions", [])) >= 25:
         log.info("GLOBAL-CAP: 15 positions open, skip")
         return False
 
@@ -6311,13 +6311,49 @@ def is_market_open():
 
 # --- DYNAMIC EXIT MANAGER ---
 EXIT_CONFIG = {
-    "crypto_ttl_hours": 48,
+    "crypto_ttl_hours": 12,
     "prediction_ttl_hours": 72,
     "pairs_ttl_days": 7,
     "pead_ttl_hours": 72,
     "pead_tp_pct": 0.08,
     "pairs_zscore_exit": 0.5,
 }
+
+
+# === LIVE PRICE FETCHING FOR EXIT DECISIONS ===
+_PRICE_CACHE = {}
+_PRICE_CACHE_TIME = {}
+
+def fetch_live_price(ticker):
+    """Fetch current price for a crypto ticker. Cached for 5 min."""
+    import time as _time
+    tk = ticker.lower().replace("crypto:", "").split(" ")[0].split("$")[0].strip()
+    # Check cache (5 min)
+    if tk in _PRICE_CACHE and _time.time() - _PRICE_CACHE_TIME.get(tk, 0) < 300:
+        return _PRICE_CACHE[tk]
+    try:
+        import requests as _req
+        _cg_map = {
+            "btc": "bitcoin", "eth": "ethereum", "sol": "solana",
+            "doge": "dogecoin", "zec": "zcash", "xlm": "stellar",
+            "hype": "hyperliquid", "sui": "sui", "xrp": "ripple",
+            "hbar": "hedera-hashgraph", "shib": "shiba-inu",
+            "algo": "algorand", "ada": "cardano", "avax": "avalanche-2",
+            "matic": "matic-network", "link": "chainlink",
+        }
+        cg_id = _cg_map.get(tk)
+        if not cg_id:
+            return None
+        r = _req.get(f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd", timeout=5)
+        if r.status_code == 200:
+            price = r.json().get(cg_id, {}).get("usd")
+            if price:
+                _PRICE_CACHE[tk] = float(price)
+                _PRICE_CACHE_TIME[tk] = _time.time()
+                return float(price)
+    except Exception:
+        pass
+    return None
 
 async def run_exit_manager(channel=None):
     """Check all open paper positions for TTL/TP exits. Runs every cycle."""
@@ -6335,14 +6371,37 @@ async def run_exit_manager(channel=None):
         strategy = pos.get("strategy", "prediction")
         market = pos.get("market", "")
         # TTL exits
-        if strategy == "pairs" and age_hours > EXIT_CONFIG["pairs_ttl_days"] * 24:
-            positions_to_close.append((i, pos, "TTL: pairs 7-day limit"))
+        if strategy == "pairs":
+            # Z-score mean reversion exit
+            _pa = pos.get("long_leg", "")
+            _pb = pos.get("short_leg", "")
+            _entry_z = pos.get("entry_zscore", 0)
+            if _pa and _pb:
+                try:
+                    _corr, _current_z, _mr = calculate_pair_zscore(_pa, _pb, 252)
+                    if _current_z is not None:
+                        log.info("PAIRS POS: %s/%s entry_z=%.2f current_z=%.2f", _pa, _pb, _entry_z, _current_z)
+                        # EXIT: Z-score crossed zero (mean reverted)
+                        if abs(_current_z) < 0.3:
+                            positions_to_close.append((i, pos, f"Z-REVERT: z={_current_z:.2f}"))
+                            continue
+                        # STOP: Z-score blew past 3.0 (regime break)
+                        if abs(_current_z) > 3.0:
+                            positions_to_close.append((i, pos, f"Z-BREAK: z={_current_z:.2f}"))
+                            continue
+                except Exception:
+                    pass
+            # TTL FALLBACK: 7 days
+            if age_hours > EXIT_CONFIG.get("pairs_ttl_days", 7) * 24:
+                positions_to_close.append((i, pos, "TTL: pairs 7d"))
         elif strategy == "pead" and age_hours > EXIT_CONFIG["pead_ttl_hours"]:
             positions_to_close.append((i, pos, "TTL: PEAD 72h limit"))
         elif strategy in ("crypto", "momentum") and age_hours > EXIT_CONFIG["crypto_ttl_hours"]:
             positions_to_close.append((i, pos, "TTL: crypto 72h limit"))
         elif strategy == "prediction":
-            continue  # Hold predictions to resolution - no TTL
+            # Hold to resolution but log status
+            log.info("PRED POS: %s age=%.0fh ev=%.1f%%", market[:30], age_hours, pos.get("ev",0)*100)
+            continue  # Hold to resolution
             positions_to_close.append((i, pos, "TTL: prediction 72h limit"))
         # TP exit for PEAD
         if strategy == "pead":
@@ -6384,7 +6443,7 @@ EQUITIES_CONFIG = {
         "seed": [("V", "MA"), ("XOM", "CVX"), ("GOOGL", "META"), ("KO", "PEP"), ("JPM", "BAC")],
         "min_correlation": 0.85,
         "lookback_days": 252,
-        "zscore_entry": 2.0,
+        "zscore_entry": 1.5,
         "zscore_exit": 0.5,
         "ttl_days": 7,
     },
@@ -6442,6 +6501,10 @@ def scan_pairs_opportunities():
         corr, zscore, mean_ratio = calculate_pair_zscore(ticker_a, ticker_b, cfg["lookback_days"])
         if corr is None:
             continue
+            
+        # Telemetry: Print every calculation before filtering
+        log.info("[PAIRS DATA] %s/%s | Corr: %.3f | Z-Score: %.2f", ticker_a, ticker_b, corr, zscore)
+            
         if corr < cfg["min_correlation"]:
             continue
         if abs(zscore) >= cfg["zscore_entry"]:
@@ -6457,6 +6520,29 @@ def scan_pairs_opportunities():
                 "mean_ratio": mean_ratio,
             })
             log.info("PAIRS SIGNAL: %s/%s corr=%.3f zscore=%.2f dir=%s", ticker_a, ticker_b, corr, zscore, direction)
+            # Auto-execute pairs trade in paper mode
+            if TRADING_MODE == "paper" and AUTO_PAPER_ENABLED:
+                _pair_size = PAPER_PORTFOLIO.get("cash", 25000) * 0.015  # 1.5% per leg
+                if direction == "short_a_long_b":
+                    _long_tk, _short_tk = ticker_b, ticker_a
+                else:
+                    _long_tk, _short_tk = ticker_a, ticker_b
+                _pair_pos = {
+                    "market": f"PAIRS:{ticker_a}/{ticker_b}",
+                    "side": direction, "shares": 1,
+                    "entry_price": zscore, "cost": _pair_size * 2,
+                    "value": _pair_size * 2,
+                    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                    "platform": "Alpaca", "ev": abs(zscore) / 10,
+                    "strategy": "pairs", "long_leg": _long_tk, "short_leg": _short_tk,
+                    "entry_zscore": zscore, "correlation": corr,
+                }
+                PAPER_PORTFOLIO["positions"].append(_pair_pos)
+                PAPER_PORTFOLIO["cash"] -= _pair_size * 2
+                db_log_paper_trade(_pair_pos)
+                db_save_daily_state()
+                log.info("PAIRS TRADE: Long %s / Short %s | Z=%.2f | Size=$%.0f per leg",
+                         _long_tk, _short_tk, zscore, _pair_size)
     return opportunities
 
 # --- PEAD ENGINE (RULE-BASED) ---
