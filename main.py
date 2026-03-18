@@ -2855,7 +2855,7 @@ async def alert_scan_task():
                                 _rate_pct = 0
                             _above = _rate_pct > (0.0005 if _fname in ("SOL","XRP") else _arb_threshold)
                             log.info("FUNDING-ARB %s: rate=%.4f%% threshold=%.4f%% %s",
-                                     _fname, _rate_pct * 100, _arb_threshold * 100,
+                                     _fname, _rate_pct * 100, (0.0005 if _fname in ("SOL","XRP") else _arb_threshold) * 100,
                                      ">>> SIGNAL" if _above else "below threshold")
                             if _above and TRADING_MODE == "paper" and AUTO_PAPER_ENABLED:
                                 _arb_size = PAPER_PORTFOLIO.get("cash", 25000) * 0.02
