@@ -2811,7 +2811,7 @@ async def alert_scan_task():
                         log.info("PAIRS SIGNAL: %s corr=%.3f z=%.2f dir=%s",
                                  po.get("pair",""), po.get("correlation",0),
                                  po.get("zscore",0), po.get("direction",""))
-                        if channel:
+                        if channel and channel is not None:
                             await channel.send(
                                 f"**PAIRS SIGNAL** {po['pair']} | "
                                 f"Corr: {po['correlation']:.3f} | "
@@ -6632,6 +6632,10 @@ def scan_pairs_opportunities():
                 "direction": direction,
                 "mean_ratio": mean_ratio,
             })
+            _pair_key = f"PAIRS:{ticker_a}/{ticker_b}"
+            if any(p.get("market","") == _pair_key for p in PAPER_PORTFOLIO.get("positions",[])):
+                log.info("PAIRS DEDUP: %s already open", _pair_key)
+                continue
             log.info("PAIRS SIGNAL: %s/%s corr=%.3f zscore=%.2f dir=%s", ticker_a, ticker_b, corr, zscore, direction)
             # Auto-execute pairs trade in paper mode
             if TRADING_MODE == "paper" and AUTO_PAPER_ENABLED:
