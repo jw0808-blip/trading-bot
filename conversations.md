@@ -2845,3 +2845,8 @@ BTC: 0.014797 ($1,098.54)
 - [Crypto] ZEC $249.22 (-9.3% 24h)
 - EV: +2.8% | 20 shares @ $4.960 = $99.80
 ---
+
+## Auto-Paper Trade — 22:08 UTC
+- [Polymarket] Netanyahu out by March 31?
+- EV: +3.1% | 7812 shares @ $0.032 = $251.48
+---
