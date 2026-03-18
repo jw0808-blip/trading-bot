@@ -2828,7 +2828,7 @@ async def alert_scan_task():
                 _arb_threshold = _arb_cfg.get("min_spread", 0.0003)
                 # Fetch LIVE funding rates from Phemex
                 import requests as _arb_req
-                _funding_pairs = [("BTC", "BTCUSDT"), ("ETH", "ETHUSDT")]
+                _funding_pairs = [("BTC", "BTCUSDT"), ("ETH", "ETHUSDT"), ("SOL", "SOLUSDT"), ("XRP", "XRPUSDT")]
                 for _fname, _fsymbol in _funding_pairs:
                     try:
                         _fr = _arb_req.get(
