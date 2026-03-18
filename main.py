@@ -6469,7 +6469,7 @@ async def run_exit_manager(channel=None):
                     if _current_z is not None:
                         log.info("PAIRS POS: %s/%s entry_z=%.2f current_z=%.2f", _pa, _pb, _entry_z, _current_z)
                         # EXIT: Z-score crossed zero (mean reverted)
-                        if abs(_current_z) < 0.3:
+                        if abs(_current_z) < 0.5 or (_entry_z > 0 and _current_z < 0) or (_entry_z < 0 and _current_z > 0):
                             positions_to_close.append((i, pos, f"Z-REVERT: z={_current_z:.2f}"))
                             continue
                         # STOP: Z-score blew past 3.0 (regime break)
