@@ -2806,6 +2806,7 @@ async def alert_scan_task():
             # === PAIRS TRADING SCANNER (runs during market hours) ===
             if EQUITIES_ENABLED and is_market_open():
                 try:
+                    channel = bot.get_channel(int(DISCORD_CHANNEL_ID))
                     pairs_opps = scan_pairs_opportunities()
                     for po in pairs_opps:
                         log.info("PAIRS SIGNAL: %s corr=%.3f z=%.2f dir=%s",
@@ -3007,7 +3008,7 @@ async def auto_paper_execute(channel, opp):
         return False
     _plat = opp.get("platform", "").lower()
     if _plat in ("polymarket", "kalshi", "predictit"):
-        _cats=["fda","sec ","cpi","fed ","fomc","supreme court","earnings","tariff","iran","ceasefire","ukraine","russia","china","indictment","impeach","rate cut","rate hike","inflation","gdp","jobs report","nonfarm","sanctions"]
+        _cats=["fda","sec ","cpi","fed ","fomc","supreme court","earnings","tariff","iran","ceasefire","ukraine","russia","china","indictment","impeach","rate cut","rate hike","inflation","gdp","jobs report","nonfarm","sanctions","netanyahu","trudeau","macron","zelensky","zelenskyy","putin","modi","erdogan","mbs","kim jong","opec","taiwan","gaza","debt ceiling","executive order","pce","retail sales","recession","yield curve","merger","antitrust"]
         if not any(cat in opp.get("market","").lower() for cat in _cats):
             log.info("FILTERED: non-catalyst pred market (%s)", opp.get("market","")[:40])
             return False
@@ -6546,7 +6547,7 @@ EQUITIES_CONFIG = {
                  ("MS", "GS"), ("NVDA", "AMD"), ("HD", "LOW"), ("UNH", "CI"), ("DIS", "CMCSA"),
                  ("AAPL", "MSFT"), ("PG", "CL"), ("WMT", "COST"), ("T", "VZ"), ("BA", "LMT"),
                  ("CAT", "DE"), ("FDX", "UPS"), ("INTC", "TXN"), ("MCD", "SBUX"), ("NKE", "LULU"),
-                 ("PFE", "MRK"), ("COP", "EOG"), ("ADBE", "CRM"), ("NFLX", "DIS"), ("PYPL", "SQ"),
+                 ("PFE", "MRK"), ("COP", "EOG"), ("ADBE", "CRM"), ("NFLX", "DIS"), ("PYPL", "AFRM"),
                  ("GM", "F"), ("USB", "PNC"), ("MMM", "HON"), ("ABT", "MDT"), ("AMZN", "EBAY"),
         ],
         "min_correlation": 0.85,
