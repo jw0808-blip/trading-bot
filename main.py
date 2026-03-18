@@ -2807,6 +2807,8 @@ async def alert_scan_task():
             if EQUITIES_ENABLED and is_market_open():
                 try:
                     channel = bot.get_channel(int(DISCORD_CHANNEL_ID))
+                    channel = bot.get_channel(int(DISCORD_CHANNEL_ID))
+                    channel = bot.get_channel(int(DISCORD_CHANNEL_ID))
                     pairs_opps = scan_pairs_opportunities()
                     for po in pairs_opps:
                         log.info("PAIRS SIGNAL: %s corr=%.3f z=%.2f dir=%s",
