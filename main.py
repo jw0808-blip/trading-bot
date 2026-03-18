@@ -2824,7 +2824,7 @@ async def alert_scan_task():
             # === FUNDING ARB SCANNER (runs 24/7) ===
             try:
                 _arb_cfg = globals().get("FUNDING_ARB_CONFIG", {})
-                _arb_threshold = _arb_cfg.get("min_spread", 0.00065)
+                _arb_threshold = _arb_cfg.get("min_spread", 0.0003)
                 # Fetch LIVE funding rates from Phemex
                 import requests as _arb_req
                 _funding_pairs = [("BTC", "BTCUSDT"), ("ETH", "ETHUSDT")]
@@ -2879,6 +2879,12 @@ async def alert_scan_task():
                 exits = await run_exit_manager()
                 if exits > 0:
                     log.info("Exit manager closed %d positions this cycle", exits)
+                try:
+                    _ar = auto_resolve_expired()
+                    if _ar > 0:
+                        log.info("Auto-resolver closed %d expired markets", _ar)
+                except Exception as _are:
+                    log.warning("Auto-resolver error: %s", _are)
             except Exception as ex:
                 log.warning("Exit manager error: %s", ex)
             # Enforce minimum paper trade floor
@@ -3034,11 +3040,11 @@ async def auto_paper_execute(channel, opp):
     _is_crypto = any(k in _mkt_lower for k in ["btc","eth","sol","doge","zec","xlm","crypto","wbt","xrp","hbar","shib"])
     if _is_crypto:
         _cc = sum(1 for _p in PAPER_PORTFOLIO.get("positions", []) if any(k in _p.get("market","").lower() for k in ["btc","eth","sol","doge","zec","xlm","crypto","wbt"]))
-        if _cc >= 5:
+        if _cc >= 20:  # Paper: stress test
             log.info("CRYPTO-CAP: skip %s (%d open)", _mkey[:30], _cc)
             return False
     # === GLOBAL POSITION CAP (max 15) ===
-    if len(PAPER_PORTFOLIO.get("positions", [])) >= 25:
+    if len(PAPER_PORTFOLIO.get("positions", [])) >= 100:  # Paper: no real cap
         log.info("GLOBAL-CAP: 15 positions open, skip")
         return False
 
@@ -6355,7 +6361,7 @@ def is_market_open():
 
 # --- DYNAMIC EXIT MANAGER ---
 EXIT_CONFIG = {
-    "crypto_ttl_hours": 12,
+    "crypto_ttl_hours": 4,
     "prediction_ttl_hours": 72,
     "pairs_ttl_days": 7,
     "pead_ttl_hours": 72,
@@ -6369,35 +6375,72 @@ _PRICE_CACHE = {}
 _PRICE_CACHE_TIME = {}
 
 def fetch_live_price(ticker):
-    """Fetch current price for a crypto ticker. Cached for 5 min."""
+    """Fetch current price using Coinbase public API (no rate limits)."""
     import time as _time
     tk = ticker.lower().replace("crypto:", "").split(" ")[0].split("$")[0].strip()
-    # Check cache (5 min)
-    if tk in _PRICE_CACHE and _time.time() - _PRICE_CACHE_TIME.get(tk, 0) < 300:
+    if tk in _PRICE_CACHE and _time.time() - _PRICE_CACHE_TIME.get(tk, 0) < 60:
         return _PRICE_CACHE[tk]
+    _cb = {"btc":"BTC-USD","eth":"ETH-USD","sol":"SOL-USD","doge":"DOGE-USD",
+           "zec":"ZEC-USD","xlm":"XLM-USD","xrp":"XRP-USD","hbar":"HBAR-USD",
+           "shib":"SHIB-USD","algo":"ALGO-USD","ada":"ADA-USD","avax":"AVAX-USD",
+           "matic":"MATIC-USD","link":"LINK-USD","sui":"SUI-USD","hype":"HYPE-USD"}
+    pair = _cb.get(tk)
+    if not pair:
+        return None
     try:
         import requests as _req
-        _cg_map = {
-            "btc": "bitcoin", "eth": "ethereum", "sol": "solana",
-            "doge": "dogecoin", "zec": "zcash", "xlm": "stellar",
-            "hype": "hyperliquid", "sui": "sui", "xrp": "ripple",
-            "hbar": "hedera-hashgraph", "shib": "shiba-inu",
-            "algo": "algorand", "ada": "cardano", "avax": "avalanche-2",
-            "matic": "matic-network", "link": "chainlink",
-        }
-        cg_id = _cg_map.get(tk)
-        if not cg_id:
-            return None
-        r = _req.get(f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd", timeout=5)
+        r = _req.get(f"https://api.coinbase.com/v2/prices/{pair}/spot", timeout=5)
         if r.status_code == 200:
-            price = r.json().get(cg_id, {}).get("usd")
-            if price:
-                _PRICE_CACHE[tk] = float(price)
+            price = float(r.json().get("data", {}).get("amount", 0))
+            if price > 0:
+                _PRICE_CACHE[tk] = price
                 _PRICE_CACHE_TIME[tk] = _time.time()
-                return float(price)
-    except Exception:
-        pass
+                return price
+    except Exception as _e:
+        log.warning("Price fetch %s: %s", tk, _e)
     return None
+
+
+# === AUTO-RESOLVER FOR EXPIRED PREDICTION MARKETS ===
+def auto_resolve_expired():
+    """Auto-close prediction markets where the expiry date has passed."""
+    import re as _ar_re
+    now = datetime.now(timezone.utc)
+    to_close = []
+    for i, pos in enumerate(PAPER_PORTFOLIO.get("positions", [])):
+        if pos.get("strategy") != "prediction":
+            continue
+        mkt = pos.get("market", "")
+        # Match "by March 14" or "on March 8" patterns
+        for pattern in [r'by (\w+)\s+(\d{1,2})', r'on (\w+)\s+(\d{1,2})']:
+            m = _ar_re.search(pattern, mkt)
+            if m:
+                months = {"January":1,"February":2,"March":3,"April":4,"May":5,"June":6,
+                          "July":7,"August":8,"September":9,"October":10,"November":11,"December":12}
+                mo = months.get(m.group(1), 0)
+                if mo > 0:
+                    try:
+                        exp = datetime(now.year, mo, int(m.group(2)), 23, 59, tzinfo=timezone.utc)
+                        if now > exp:
+                            to_close.append((i, pos, f"EXPIRED: {m.group(1)} {m.group(2)}"))
+                    except ValueError:
+                        pass
+    closed = 0
+    for idx, pos, reason in sorted(to_close, key=lambda x: x[0], reverse=True):
+        if idx < len(PAPER_PORTFOLIO["positions"]):
+            removed = PAPER_PORTFOLIO["positions"].pop(idx)
+            salvage = removed.get("cost", 0) * 0.05
+            PAPER_PORTFOLIO["cash"] += salvage
+            closed += 1
+            log.info("AUTO-RESOLVE: %s | %s | Salvage $%.2f", removed.get("market","")[:35], reason, salvage)
+            try:
+                _c = sqlite3.connect(DB_PATH)
+                _c.execute("UPDATE paper_trades SET status='resolved_loss' WHERE market=? AND status='open'", (removed.get("market",""),))
+                _c.commit()
+                _c.close()
+            except Exception:
+                pass
+    return closed
 
 async def run_exit_manager(channel=None):
     """Check all open paper positions for TTL/TP exits. Runs every cycle."""
@@ -6498,11 +6541,17 @@ EQUITIES_CONFIG = {
     "max_concurrent": 5,
     "max_sector_pct": 0.30,
     "pairs": {
-        "seed": [("V", "MA"), ("XOM", "CVX"), ("GOOGL", "META"), ("KO", "PEP"), ("JPM", "BAC"),
-                 ("MS", "GS"), ("NVDA", "AMD"), ("HD", "LOW"), ("UNH", "CI"), ("DIS", "CMCSA")],
+        "seed": [
+                 ("V", "MA"), ("XOM", "CVX"), ("GOOGL", "META"), ("KO", "PEP"), ("JPM", "BAC"),
+                 ("MS", "GS"), ("NVDA", "AMD"), ("HD", "LOW"), ("UNH", "CI"), ("DIS", "CMCSA"),
+                 ("AAPL", "MSFT"), ("PG", "CL"), ("WMT", "COST"), ("T", "VZ"), ("BA", "LMT"),
+                 ("CAT", "DE"), ("FDX", "UPS"), ("INTC", "TXN"), ("MCD", "SBUX"), ("NKE", "LULU"),
+                 ("PFE", "MRK"), ("COP", "EOG"), ("ADBE", "CRM"), ("NFLX", "DIS"), ("PYPL", "SQ"),
+                 ("GM", "F"), ("USB", "PNC"), ("MMM", "HON"), ("ABT", "MDT"), ("AMZN", "EBAY"),
+        ],
         "min_correlation": 0.85,
         "lookback_days": 252,
-        "zscore_entry": 1.5,
+        "zscore_entry": 1.0,
         "zscore_exit": 0.5,
         "ttl_days": 7,
     },
