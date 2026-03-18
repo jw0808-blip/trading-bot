@@ -2850,3 +2850,8 @@ BTC: 0.014797 ($1,098.54)
 - [Polymarket] Netanyahu out by March 31?
 - EV: +3.1% | 7812 shares @ $0.032 = $251.48
 ---
+
+## Auto-Paper Trade — 22:15 UTC
+- [Polymarket] Will the Iranian regime fall by March 31?
+- EV: +3.2% | 7733 shares @ $0.032 = $248.94
+---
