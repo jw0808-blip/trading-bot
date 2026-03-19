@@ -2212,6 +2212,7 @@ def push_all_analytics():
         std_pnl = statistics.stdev(a["daily_pnl_history"]) or 1
         sharpe = (mean_pnl / std_pnl) * (252 ** 0.5)
         push_netdata_metric("sharpe_ratio", round(sharpe, 2))
+    save_all_state()  # Auto-save every cycle
 
 
 def track_openai_usage(tokens_used, model="gpt-4o-mini"):
