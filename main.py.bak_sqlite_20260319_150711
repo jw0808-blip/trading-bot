@@ -2581,42 +2581,30 @@ async def scan_pairs_cmd(ctx):
 
 @bot.command(name="paper-pnl")
 async def paper_pnl_cmd(ctx):
-    import sqlite3 as _sq, json as _js
+    positions = PAPER_PORTFOLIO.get("positions", [])
+    if not positions:
+        await ctx.send("No open paper positions.")
+        return
+    total_cost = sum(p.get("cost", 0) for p in positions)
+    total_value = sum(p.get("value", 0) for p in positions)
     cash = PAPER_PORTFOLIO.get("cash", 0)
-    try:
-        conn = _sq.connect(DB_PATH)
-        conn.row_factory = _sq.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM positions WHERE status='open' ORDER BY created_at DESC")
-        rows = [dict(r) for r in c.fetchall()]
-        conn.close()
-    except Exception as e:
-        await ctx.send(f"DB error: {e}")
-        return
-    if not rows:
-        await ctx.send(f"No open positions. Cash: ${cash:,.2f}")
-        return
-    total_cost = sum(r.get("size_usd", 0) for r in rows)
-    pairs_pos = [r for r in rows if r.get("strategy") == "pairs"]
-    crypto_pos = [r for r in rows if r.get("strategy") == "crypto"]
-    pred_pos = [r for r in rows if r.get("strategy") not in ("pairs","crypto","pead","options_spread")]
-    other_pos = [r for r in rows if r.get("strategy") in ("pead","options_spread")]
-    msg = f"**Paper P&L** (SQLite)\n================================\n"
+    unrealized = total_value - total_cost
+    crypto_pos = sum(1 for p in positions if "crypto" in p.get("platform", "").lower() or any(k in p.get("market", "").lower() for k in ["btc","eth","sol","doge","zec","xlm","wbt"]))
+    pred_pos = len(positions) - crypto_pos
+    msg = f"**Paper P&L**\n================================\n"
     msg += f"Cash: ${cash:,.2f}\n"
-    msg += f"Positions: {len(rows)} ({len(pairs_pos)} pairs, {len(crypto_pos)} crypto, {len(pred_pos)} prediction, {len(other_pos)} other)\n"
+    msg += f"Positions: {len(positions)} ({crypto_pos} crypto, {pred_pos} prediction)\n"
     msg += f"Cost basis: ${total_cost:,.2f}\n"
-    msg += f"Total portfolio: ${cash+total_cost:,.2f}\n================================\n"
-    for r in rows[:15]:
-        meta = {}
-        try: meta = _js.loads(r.get("metadata") or "{}")
-        except: pass
-        ev = meta.get("ev", r.get("ev", 0))
-        z = r.get("entry_zscore", 0)
-        strat = r.get("strategy","?")
-        extra = f"Z:{z:+.2f}" if strat == "pairs" else f"EV:{ev*100:.1f}%"
-        msg += f"  {r.get('market_id','')[:30]} | ${r.get('size_usd',0):.0f} | {extra} | {r.get('platform','')}\n"
-    if len(rows) > 15:
-        msg += f"  +{len(rows)-15} more\n"
+    msg += f"Current value: ${total_value:,.2f}\n"
+    msg += f"Unrealized P&L: ${unrealized:+,.2f} ({unrealized/max(total_cost,1)*100:+.1f}%)\n"
+    msg += f"Total portfolio: ${cash+total_value:,.2f}\n================================\n"
+    for p in positions[:15]:
+        cost = p.get("cost", 0)
+        val = p.get("value", 0)
+        ev = p.get("ev", 0)
+        msg += f"  {p.get('market','')[:30]} | ${cost:.0f} | EV:{ev*100:.1f}% | {p.get('platform','')}\n"
+    if len(positions) > 15:
+        msg += f"  +{len(positions)-15} more\n"
     await ctx.send(msg)
 
 @bot.command(name="paper-reset")

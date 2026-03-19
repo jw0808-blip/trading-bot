@@ -1,0 +1,17 @@
+{
+  "open": [],
+  "closed": [],
+  "audit_log": [],
+  "config": {
+    "enabled": true,
+    "min_ev": 0.025,
+    "min_edge_score": 65,
+    "max_position_pct": 0.0025,
+    "max_daily_trades": 20,
+    "max_concurrent_positions": 10,
+    "daily_loss_halt": -200,
+    "drawdown_halt_pct": 5.0,
+    "trades_today": 0,
+    "last_trade_reset": ""
+  }
+}

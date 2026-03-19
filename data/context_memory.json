@@ -1,6 +1,6 @@
 {
   "hot": {
-    "max_position_pct": 0.01,
+    "max_position_pct": 0.015,
     "daily_loss_limit": -500,
     "trading_mode": "paper",
     "risk_tolerance": "conservative",
@@ -14,7 +14,7 @@
   },
   "domain": {
     "prediction_markets": {
-      "min_ev_threshold": 0.02,
+      "min_ev_threshold": 0.015,
       "prefer_liquid_markets": true,
       "arb_min_spread": 0.02
     },
