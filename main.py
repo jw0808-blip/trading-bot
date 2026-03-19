@@ -6550,7 +6550,9 @@ async def run_exit_manager(channel=None):
                 pass
             PAPER_PORTFOLIO["cash"] += removed.get("value", removed.get("cost", 0))
             closed += 1
-            log.info("EXIT MANAGER: Closed %s | Reason: %s | Returned $%.2f", removed.get("market", "")[:40], reason, removed.get("value", 0))
+            _exit_pnl = removed.get("value", 0) - removed.get("cost", 0)
+            db_close_position(removed.get("market", ""), removed.get("value", 0), reason, _exit_pnl)
+            log.info("EXIT MANAGER: Closed %s | Reason: %s | Returned $%.2f | PnL $%.2f", removed.get("market", "")[:40], reason, removed.get("value", 0), _exit_pnl)
             if channel:
                 await channel.send(f"Exit Manager closed: {removed.get('market', '')[:40]} | {reason}")
     if closed > 0:
@@ -6680,6 +6682,14 @@ def scan_pairs_opportunities():
                 PAPER_PORTFOLIO["positions"].append(_pair_pos)
                 PAPER_PORTFOLIO["cash"] -= _pair_size * 2
                 db_log_paper_trade(_pair_pos)
+                db_open_position(
+                    market_id=f"PAIRS:{ticker_a}/{ticker_b}",
+                    platform="Alpaca", strategy="pairs", direction=direction,
+                    size_usd=_pair_size * 2, shares=1, entry_price=zscore,
+                    long_leg=_long_tk, short_leg=_short_tk, entry_zscore=zscore,
+                    regime=get_regime("equities").get("regime","normal"),
+                    metadata={"correlation": corr, "long": _long_tk, "short": _short_tk}
+                )
                 db_save_daily_state()
                 log.info("PAIRS TRADE: Long %s / Short %s | Z=%.2f | Size=$%.0f per leg",
                          _long_tk, _short_tk, zscore, _pair_size)
