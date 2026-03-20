@@ -2890,3 +2890,8 @@ BTC: 0.014797 ($1,098.54)
 - [Crypto] ZEC $232.82 (-8.4% 24h)
 - EV: +2.5% | 63 shares @ $3.490 = $221.19
 ---
+
+## Auto-Paper Trade — 15:50 UTC
+- [Polymarket] Kharg Island no longer under Iranian control by March 31?
+- EV: +8.5% | 2591 shares @ $0.085 = $221.56
+---
