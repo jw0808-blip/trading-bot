@@ -7072,3 +7072,81 @@ async def run_pead_scanner(discord_channel=None):
 # ═══════════════════════════════════════════════════════════════════
 # END v15 MODULES
 # ═══════════════════════════════════════════════════════════════════
+
+def db_open_position(market_id, platform, strategy, direction,
+                     size_usd, shares, entry_price,
+                     stop_price=0, target_price=0,
+                     long_leg="", short_leg="", entry_zscore=0,
+                     regime="normal", metadata=None):
+    try:
+        import sqlite3 as _sq, json as _js
+        conn = _sq.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM positions WHERE market_id=? AND status='open'", (market_id,))
+        if c.fetchone()[0] > 0:
+            conn.close()
+            log.info("DB-DEDUP: %s already open", market_id)
+            return None
+        c.execute("""INSERT INTO positions
+            (market_id,platform,strategy,direction,size_usd,shares,entry_price,
+             stop_price,target_price,long_leg,short_leg,entry_zscore,
+             status,regime,created_at,metadata)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',?,datetime('now'),?)""",
+            (market_id,platform,strategy,direction,size_usd,shares,entry_price,
+             stop_price,target_price,long_leg,short_leg,entry_zscore,
+             regime, _js.dumps(metadata or {})))
+        row_id = c.lastrowid
+        conn.commit(); conn.close()
+        log.info("DB-OPEN: %s | %s | $%.2f", market_id, strategy, size_usd)
+        return row_id
+    except Exception as e:
+        log.warning("db_open_position error: %s", e)
+        return None
+
+def db_close_position(market_id, exit_price, exit_reason, realized_pnl=0):
+    try:
+        import sqlite3 as _sq
+        conn = _sq.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""UPDATE positions SET status='closed', current_price=?,
+            closed_at=datetime('now'), exit_reason=?, realized_pnl=?
+            WHERE market_id=? AND status='open'""",
+            (exit_price, exit_reason, realized_pnl, market_id))
+        rows = c.rowcount
+        conn.commit(); conn.close()
+        if rows > 0:
+            log.info("DB-CLOSE: %s | %s | pnl=$%.2f", market_id, exit_reason, realized_pnl)
+        return rows > 0
+    except Exception as e:
+        log.warning("db_close_position error: %s", e)
+        return False
+
+def db_get_open_positions(strategy=None):
+    try:
+        import sqlite3 as _sq
+        conn = _sq.connect(DB_PATH)
+        conn.row_factory = _sq.Row
+        c = conn.cursor()
+        if strategy:
+            c.execute("SELECT * FROM positions WHERE status='open' AND strategy=?", (strategy,))
+        else:
+            c.execute("SELECT * FROM positions WHERE status='open'")
+        rows = [dict(r) for r in c.fetchall()]
+        conn.close()
+        return rows
+    except Exception as e:
+        log.warning("db_get_open_positions error: %s", e)
+        return []
+
+def db_position_count(strategy=None):
+    try:
+        import sqlite3 as _sq
+        conn = _sq.connect(DB_PATH)
+        c = conn.cursor()
+        if strategy:
+            c.execute("SELECT COUNT(*) FROM positions WHERE status='open' AND strategy=?", (strategy,))
+        else:
+            c.execute("SELECT COUNT(*) FROM positions WHERE status='open'")
+        n = c.fetchone()[0]; conn.close(); return n
+    except:
+        return 0

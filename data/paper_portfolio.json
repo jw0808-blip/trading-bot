@@ -1,5 +1,5 @@
 {
-  "cash": 22684.387500829,
+  "cash": 21363.509630820005,
   "positions": [
     {
       "market": "Netanyahu out by March 31?",
@@ -38,18 +38,6 @@
       "strategy": "prediction"
     },
     {
-      "market": "CRYPTO:ZEC",
-      "side": "BUY",
-      "shares": 52.0,
-      "entry_price": 4.63,
-      "cost": 242.20456,
-      "value": 242.20456,
-      "timestamp": "2026-03-19 11:16 UTC",
-      "platform": "Crypto",
-      "ev": 0.038625419999999994,
-      "strategy": "crypto"
-    },
-    {
       "market": "PAIRS:PFE/MRK",
       "side": "long_a_short_b",
       "shares": 1.0,
@@ -72,8 +60,89 @@
       "platform": "Alpaca",
       "ev": 0.2249700670713762,
       "strategy": "prediction"
+    },
+    {
+      "market": "CRYPTO:HYPE",
+      "side": "BUY",
+      "shares": 44,
+      "entry_price": 5.09,
+      "cost": 225.30375999999998,
+      "value": 223.95999999999998,
+      "timestamp": "2026-03-19 17:06 UTC",
+      "platform": "Crypto",
+      "ev": 0.02401977,
+      "strategy": "prediction"
+    },
+    {
+      "market": "PAIRS:MS/GS",
+      "side": "long_a_short_b",
+      "shares": 1,
+      "entry_price": -1.0262300187423397,
+      "cost": 674.41564802487,
+      "value": 674.41564802487,
+      "timestamp": "2026-03-19 19:06 UTC",
+      "platform": "Alpaca",
+      "ev": 0.10262300187423397,
+      "strategy": "pairs",
+      "long_leg": "MS",
+      "short_leg": "GS",
+      "entry_zscore": -1.0262300187423397,
+      "correlation": 0.9878239407066101
+    },
+    {
+      "market": "PAIRS:GM/F",
+      "side": "short_a_long_b",
+      "shares": 1,
+      "entry_price": 1.9197375545741955,
+      "cost": 660.7271019841238,
+      "value": 660.7271019841238,
+      "timestamp": "2026-03-20 15:16 UTC",
+      "platform": "Alpaca",
+      "ev": 0.19197375545741954,
+      "strategy": "pairs",
+      "long_leg": "F",
+      "short_leg": "GM",
+      "entry_zscore": 1.9197375545741955,
+      "correlation": 0.9508926542189636
     }
   ],
-  "trades": [],
+  "trades": [
+    {
+      "market": "CRYPTO:ZEC",
+      "side": "BUY",
+      "shares": 55,
+      "entry_price": 3.99,
+      "cost": 220.76670000000001,
+      "value": 219.45000000000002,
+      "timestamp": "2026-03-19 16:06 UTC",
+      "platform": "Crypto",
+      "ev": 0.02457603,
+      "strategy": "crypto"
+    },
+    {
+      "market": "CRYPTO:HYPE",
+      "side": "BUY",
+      "shares": 44,
+      "entry_price": 5.09,
+      "cost": 225.30375999999998,
+      "value": 223.95999999999998,
+      "timestamp": "2026-03-19 17:06 UTC",
+      "platform": "Crypto",
+      "ev": 0.02401977,
+      "strategy": "prediction"
+    },
+    {
+      "market": "CRYPTO:ZEC",
+      "side": "BUY",
+      "shares": 63,
+      "entry_price": 3.49,
+      "cost": 221.18921999999998,
+      "value": 219.87,
+      "timestamp": "2026-03-20 02:36 UTC",
+      "platform": "Crypto",
+      "ev": 0.025158149999999997,
+      "strategy": "crypto"
+    }
+  ],
   "pnl": 0.0
 }
