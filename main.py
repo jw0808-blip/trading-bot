@@ -139,6 +139,105 @@ def db_position_count(strategy=None):
     except:
         return 0
 
+
+def _fetch_vix_price():
+    try:
+        import yfinance as yf
+        h = yf.Ticker("^VIX").history(period="5d")
+        if not h.empty:
+            return float(h["Close"].iloc[-1])
+    except Exception as e:
+        print(f"[Regime] VIX fetch failed: {e}")
+    return None
+
+def _fetch_crypto_vol_24h(symbol):
+    try:
+        import requests
+        sym = symbol.replace("CRYPTO:","")
+        r = requests.get(
+            f"https://api.exchange.coinbase.com/products/{sym}-USD/candles",
+            params={"granularity": 3600}, timeout=8)
+        if r.status_code != 200:
+            return None
+        candles = r.json()[:24]
+        closes = [float(c[4]) for c in candles]
+        if len(closes) < 4:
+            return None
+        rets = [(closes[i]-closes[i+1])/closes[i+1] for i in range(len(closes)-1)]
+        return _stats.stdev(rets)
+    except Exception as e:
+        print(f"[Regime] Crypto vol fetch failed {symbol}: {e}")
+    return None
+
+def get_regime(asset="equities"):
+    from datetime import datetime
+    global REGIME_CACHE
+    cached = REGIME_CACHE.get(asset)
+    if cached and (datetime.now()-cached["ts"]).total_seconds() < REGIME_CACHE_TTL:
+        return cached
+
+    base = {"regime":"normal","multiplier":1.0,"zscore_entry":1.0,
+            "tp_mult":1.0,"sl_mult":1.0,"halt":False,"vix":None}
+
+    if asset in ("equities","pairs"):
+        vix = _fetch_vix_price()
+        base["vix"] = vix
+        if vix is None:
+            pass
+        elif vix < 15:
+            base.update({"regime":"low","multiplier":0.75,"zscore_entry":1.3,
+                         "tp_mult":0.8,"sl_mult":0.7})
+        elif vix < 25:
+            pass  # normal defaults
+        elif vix < 35:
+            base.update({"regime":"elevated","multiplier":1.3,"zscore_entry":1.5,
+                         "tp_mult":1.4,"sl_mult":1.5})
+        else:
+            base.update({"regime":"extreme","multiplier":2.0,"zscore_entry":2.0,
+                         "tp_mult":2.0,"sl_mult":2.0,"halt":True})
+        print(f"[Regime] {asset}: VIX={vix} regime={base['regime']}")
+
+    elif asset == "options":
+        # Options adapt but never halt — high VIX = richer premium
+        vix = _fetch_vix_price()
+        base["vix"] = vix
+        if vix and vix > 25:
+            # Shift to wider strikes, longer expiry — handled in options engine
+            base.update({"regime":"elevated","use_2dte":True,"delta_target":0.10})
+        else:
+            base.update({"use_2dte":False,"delta_target":0.15})
+        print(f"[Regime] options: VIX={vix} regime={base['regime']}")
+
+    else:
+        # Crypto — own rolling vol
+        vol = _fetch_crypto_vol_24h(asset)
+        if vol is None:
+            pass
+        elif vol < 0.02:
+            base.update({"regime":"low","multiplier":0.8,"tp_mult":0.8,"sl_mult":0.75})
+        elif vol < 0.05:
+            pass
+        elif vol < 0.10:
+            base.update({"regime":"elevated","multiplier":1.4,"tp_mult":1.5,"sl_mult":1.6})
+        else:
+            base.update({"regime":"extreme","multiplier":2.0,"tp_mult":2.5,
+                         "sl_mult":2.5,"halt":True})
+        print(f"[Regime] {asset}: 24h_vol={vol} regime={base['regime']}")
+
+    base["ts"] = datetime.now()
+    REGIME_CACHE[asset] = base
+    return base
+
+def regime_adjusted_tp_sl(base_tp, base_sl, asset="equities"):
+    r = get_regime(asset)
+    return (min(base_tp*r["tp_mult"], base_tp*2.5),
+            min(base_sl*r["sl_mult"], base_sl*2.5))
+
+def regime_adjusted_zscore(base_z=1.0, asset="equities"):
+    return get_regime(asset).get("zscore_entry", base_z)
+
+# ═══════════════════════════════════════════════════════════════════
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ---------------------------------------------------------------------------
@@ -6889,103 +6988,6 @@ import statistics as _stats
 REGIME_CACHE = {}
 REGIME_CACHE_TTL = 300
 
-def _fetch_vix_price():
-    try:
-        import yfinance as yf
-        h = yf.Ticker("^VIX").history(period="5d")
-        if not h.empty:
-            return float(h["Close"].iloc[-1])
-    except Exception as e:
-        print(f"[Regime] VIX fetch failed: {e}")
-    return None
-
-def _fetch_crypto_vol_24h(symbol):
-    try:
-        import requests
-        sym = symbol.replace("CRYPTO:","")
-        r = requests.get(
-            f"https://api.exchange.coinbase.com/products/{sym}-USD/candles",
-            params={"granularity": 3600}, timeout=8)
-        if r.status_code != 200:
-            return None
-        candles = r.json()[:24]
-        closes = [float(c[4]) for c in candles]
-        if len(closes) < 4:
-            return None
-        rets = [(closes[i]-closes[i+1])/closes[i+1] for i in range(len(closes)-1)]
-        return _stats.stdev(rets)
-    except Exception as e:
-        print(f"[Regime] Crypto vol fetch failed {symbol}: {e}")
-    return None
-
-def get_regime(asset="equities"):
-    from datetime import datetime
-    global REGIME_CACHE
-    cached = REGIME_CACHE.get(asset)
-    if cached and (datetime.now()-cached["ts"]).total_seconds() < REGIME_CACHE_TTL:
-        return cached
-
-    base = {"regime":"normal","multiplier":1.0,"zscore_entry":1.0,
-            "tp_mult":1.0,"sl_mult":1.0,"halt":False,"vix":None}
-
-    if asset in ("equities","pairs"):
-        vix = _fetch_vix_price()
-        base["vix"] = vix
-        if vix is None:
-            pass
-        elif vix < 15:
-            base.update({"regime":"low","multiplier":0.75,"zscore_entry":1.3,
-                         "tp_mult":0.8,"sl_mult":0.7})
-        elif vix < 25:
-            pass  # normal defaults
-        elif vix < 35:
-            base.update({"regime":"elevated","multiplier":1.3,"zscore_entry":1.5,
-                         "tp_mult":1.4,"sl_mult":1.5})
-        else:
-            base.update({"regime":"extreme","multiplier":2.0,"zscore_entry":2.0,
-                         "tp_mult":2.0,"sl_mult":2.0,"halt":True})
-        print(f"[Regime] {asset}: VIX={vix} regime={base['regime']}")
-
-    elif asset == "options":
-        # Options adapt but never halt — high VIX = richer premium
-        vix = _fetch_vix_price()
-        base["vix"] = vix
-        if vix and vix > 25:
-            # Shift to wider strikes, longer expiry — handled in options engine
-            base.update({"regime":"elevated","use_2dte":True,"delta_target":0.10})
-        else:
-            base.update({"use_2dte":False,"delta_target":0.15})
-        print(f"[Regime] options: VIX={vix} regime={base['regime']}")
-
-    else:
-        # Crypto — own rolling vol
-        vol = _fetch_crypto_vol_24h(asset)
-        if vol is None:
-            pass
-        elif vol < 0.02:
-            base.update({"regime":"low","multiplier":0.8,"tp_mult":0.8,"sl_mult":0.75})
-        elif vol < 0.05:
-            pass
-        elif vol < 0.10:
-            base.update({"regime":"elevated","multiplier":1.4,"tp_mult":1.5,"sl_mult":1.6})
-        else:
-            base.update({"regime":"extreme","multiplier":2.0,"tp_mult":2.5,
-                         "sl_mult":2.5,"halt":True})
-        print(f"[Regime] {asset}: 24h_vol={vol} regime={base['regime']}")
-
-    base["ts"] = datetime.now()
-    REGIME_CACHE[asset] = base
-    return base
-
-def regime_adjusted_tp_sl(base_tp, base_sl, asset="equities"):
-    r = get_regime(asset)
-    return (min(base_tp*r["tp_mult"], base_tp*2.5),
-            min(base_sl*r["sl_mult"], base_sl*2.5))
-
-def regime_adjusted_zscore(base_z=1.0, asset="equities"):
-    return get_regime(asset).get("zscore_entry", base_z)
-
-# ═══════════════════════════════════════════════════════════════════
 # PEAD SCANNER v1 — TraderJoes v15
 # 8% EPS surprise + 2.5x volume + 15-min candle confirmation
 # Gated by equities regime. 48h hold.
