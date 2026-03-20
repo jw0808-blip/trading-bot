@@ -1,1 +1,17 @@
-[]
+[
+  {
+    "timestamp": "2026-03-20 15:50 UTC",
+    "platform": "Polymarket",
+    "market": "Kharg Island no longer under Iranian control by March 31?",
+    "ev": 0.085,
+    "type": "Low-Price YES",
+    "detail": "YES @ $0.085 / NO @ $0.915 | Vol 24h: $732K | Liq: $235K",
+    "executed": true,
+    "paper": true,
+    "entry_price": null,
+    "exit_price": null,
+    "pnl": null,
+    "size": 220.0,
+    "fng": 11
+  }
+]

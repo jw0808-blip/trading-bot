@@ -238,6 +238,9 @@ def regime_adjusted_zscore(base_z=1.0, asset="equities"):
 
 # ═══════════════════════════════════════════════════════════════════
 
+REGIME_CACHE = {}
+REGIME_CACHE_TTL = 300
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ---------------------------------------------------------------------------

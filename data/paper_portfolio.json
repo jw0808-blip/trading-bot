@@ -1,5 +1,5 @@
 {
-  "cash": 21804.36673280413,
+  "cash": 21808.114082804128,
   "positions": [
     {
       "market": "Netanyahu out by March 31?",
@@ -62,18 +62,6 @@
       "strategy": "prediction"
     },
     {
-      "market": "CRYPTO:HYPE",
-      "side": "BUY",
-      "shares": 44.0,
-      "entry_price": 5.09,
-      "cost": 225.30375999999998,
-      "value": 225.30375999999998,
-      "timestamp": "2026-03-19 17:06 UTC",
-      "platform": "Crypto",
-      "ev": 0.02401977,
-      "strategy": "crypto"
-    },
-    {
       "market": "PAIRS:MS/GS",
       "side": "long_a_short_b",
       "shares": 1.0,
@@ -84,8 +72,33 @@
       "platform": "Alpaca",
       "ev": 0.10262300187423397,
       "strategy": "prediction"
+    },
+    {
+      "market": "Kharg Island no longer under Iranian control by March 31?",
+      "side": "BUY",
+      "shares": 2591,
+      "entry_price": 0.085,
+      "cost": 221.55641000000003,
+      "value": 220.235,
+      "timestamp": "2026-03-20 15:50 UTC",
+      "platform": "Polymarket",
+      "ev": 0.085,
+      "strategy": "prediction"
     }
   ],
-  "trades": [],
+  "trades": [
+    {
+      "market": "Kharg Island no longer under Iranian control by March 31?",
+      "side": "BUY",
+      "shares": 2591,
+      "entry_price": 0.085,
+      "cost": 221.55641000000003,
+      "value": 220.235,
+      "timestamp": "2026-03-20 15:50 UTC",
+      "platform": "Polymarket",
+      "ev": 0.085,
+      "strategy": "prediction"
+    }
+  ],
   "pnl": 0.0
 }
