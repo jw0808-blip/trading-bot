@@ -1237,6 +1237,8 @@ def get_market_forecast():
     }
 
 def find_crypto_momentum():
+    return []  # DISABLED: momentum scanner burning capital on penny cryptos
+    return []  # DISABLED: momentum scanner burning capital on penny cryptos
     opportunities = []
     try:
         r = requests.get("https://api.coingecko.com/api/v3/coins/markets",
@@ -5470,7 +5472,7 @@ def get_alpaca_balance():
     try:
         hdrs = {
             "APCA-API-KEY-ID": ALPACA_API_KEY,
-            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
         }
         r = requests.get(f"{ALPACA_BASE_URL}/v2/account", headers=hdrs, timeout=10)
         if r.status_code == 200:
@@ -5522,7 +5524,7 @@ async def execute_alpaca_order(action, symbol, amount):
     try:
         hdrs = {
             "APCA-API-KEY-ID": ALPACA_API_KEY,
-            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
             "Content-Type": "application/json",
         }
         
