@@ -3100,11 +3100,11 @@ async def alert_scan_task():
                     await enforce_paper_trade_floor(ch)
             except Exception as pfe:
                 log.warning("Paper floor error: %s", pfe)
-            # V9 EXIT CHECK
+            # Unified exit check (run_exit_manager is the single exit path)
             try:
                 ch = bot.get_channel(int(DISCORD_CHANNEL_ID))
                 if ch:
-                    await check_and_manage_exits(ch)
+                    await run_exit_manager(ch)
             except Exception as eex:
                 log.warning("Exit check error: %s", eex)
     except Exception as exc:
@@ -3458,7 +3458,6 @@ def _ensure_data_dir():
 
 
 def save_all_state():
-    save_positions()  # V9: save positions too
     """Save all persistent state to JSON files."""
     _ensure_data_dir()
     try:
@@ -4718,45 +4717,7 @@ AUTO_LIVE_CONFIG = {
     "last_trade_reset": "",
 }
 
-# Position tracker for open trades
-OPEN_POSITIONS = []
-CLOSED_POSITIONS = []
-POSITION_FILE = "/app/data/positions.json"
 TRADE_AUDIT_LOG = []
-
-
-def save_positions():
-    """Save open and closed positions to disk."""
-    try:
-        data = {
-            "open": OPEN_POSITIONS,
-            "closed": CLOSED_POSITIONS[-100:],  # Keep last 100 closed
-            "audit_log": TRADE_AUDIT_LOG[-200:],
-            "config": AUTO_LIVE_CONFIG,
-        }
-        with open(POSITION_FILE, "w") as f:
-            _json.dump(data, f, indent=2, default=str)
-    except Exception as exc:
-        log.warning("Save positions error: %s", exc)
-
-
-def load_positions():
-    """Load positions from disk on startup."""
-    global OPEN_POSITIONS, CLOSED_POSITIONS, TRADE_AUDIT_LOG
-    try:
-        if _os.path.exists(POSITION_FILE):
-            with open(POSITION_FILE, "r") as f:
-                data = _json.load(f)
-            OPEN_POSITIONS = data.get("open", [])
-            CLOSED_POSITIONS = data.get("closed", [])
-            TRADE_AUDIT_LOG = data.get("audit_log", [])
-            saved_config = data.get("config", {})
-            for k, v in saved_config.items():
-                if k in AUTO_LIVE_CONFIG:
-                    AUTO_LIVE_CONFIG[k] = v
-            log.info("Loaded %d open positions, %d closed", len(OPEN_POSITIONS), len(CLOSED_POSITIONS))
-    except Exception as exc:
-        log.warning("Load positions error: %s", exc)
 
 
 def audit_log(action, details):
@@ -4795,7 +4756,7 @@ def check_safety_gates():
         return False, f"Daily trade limit reached ({AUTO_LIVE_CONFIG['max_daily_trades']})"
     
     # Max concurrent positions
-    if len(OPEN_POSITIONS) >= AUTO_LIVE_CONFIG["max_concurrent_positions"]:
+    if len(PAPER_PORTFOLIO.get("positions", [])) >= AUTO_LIVE_CONFIG["max_concurrent_positions"]:
         return False, f"Max concurrent positions ({AUTO_LIVE_CONFIG['max_concurrent_positions']})"
     
     # Daily loss halt
@@ -4856,13 +4817,28 @@ async def auto_execute_opportunity(opp, channel):
     stop_price = max(entry_price * 0.7, 0.01)  # 30% stop
     target_price = min(entry_price * 1.6, 0.99)  # 60% target (2:1 R:R)
     
+    asset = opp.get("ticker", opp.get("slug", market[:20]))
+    # Infer strategy for exit manager routing
+    crypto_syms = ("btc","eth","sol","doge","zec","xlm","hype","sui","wbt","xrp","algo","shib","hbar")
+    if any(k in asset.lower() or k in market.lower() for k in crypto_syms):
+        strategy = "crypto"
+    elif platform in ("Kalshi", "Polymarket"):
+        strategy = "prediction"
+    else:
+        strategy = "prediction"
+
+    shares = max(1, int(size / max(entry_price, 0.01)))
+    opened_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
     position = {
-        "id": f"POS-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{len(OPEN_POSITIONS)}",
         "market": market,
         "platform": platform,
-        "action": "BUY",
-        "asset": opp.get("ticker", opp.get("slug", market[:20])),
+        "side": "BUY",
+        "asset": asset,
+        "shares": shares,
         "size_usd": size,
+        "cost": size,
+        "value": size,
         "entry_price": entry_price,
         "stop_price": stop_price,
         "target_price": target_price,
@@ -4871,23 +4847,19 @@ async def auto_execute_opportunity(opp, channel):
         "edge_score": edge_score,
         "confidence": confidence,
         "signals": signals,
-        "opened_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        "status": "OPEN",
-        "pnl": 0,
+        "strategy": strategy,
+        "timestamp": opened_at,
     }
-    
+
     # Execute the order
     success = False
     exec_msg = ""
-    
+
     if TRADING_MODE == "live":
         # Route to correct exchange
-        asset = position["asset"]
         if platform == "Kalshi" or asset.startswith("KX"):
             success, exec_msg = await execute_kalshi_order("BUY", asset, size)
         elif platform == "Polymarket":
-            # Polymarket needs on-chain execution — log as pending
-            # Route to Polymarket CLOB
             if POLYMARKET_PK:
                 token_id = opp.get("token_id", opp.get("slug", ""))
                 success, exec_msg = await execute_polymarket_order("BUY", token_id, size)
@@ -4905,21 +4877,30 @@ async def auto_execute_opportunity(opp, channel):
         # Paper mode — always succeeds
         success = True
         exec_msg = "Paper trade executed"
-        PAPER_PORTFOLIO["trades"].append({
-            "action": "BUY",
-            "market": market,
-            "price": entry_price,
-            "size": size,
-            "timestamp": position["opened_at"],
-        })
-    
+
     if success:
-        OPEN_POSITIONS.append(position)
+        # === UNIFIED LEDGER: single source of truth ===
+        if size > PAPER_PORTFOLIO["cash"]:
+            audit_log("BLOCKED", {"reason": "Insufficient cash", "market": market[:50], "need": size, "have": PAPER_PORTFOLIO["cash"]})
+            return False
+        PAPER_PORTFOLIO["cash"] -= size
+        PAPER_PORTFOLIO["positions"].append(position)
+        PAPER_PORTFOLIO["trades"].append(position)
+
+        # Persist to SQLite
+        db_open_position(
+            market_id=market, platform=platform, strategy=strategy,
+            direction="BUY", size_usd=size, shares=shares,
+            entry_price=entry_price, stop_price=stop_price,
+            target_price=target_price,
+            metadata={"ev": ev, "edge_score": edge_score, "confidence": confidence},
+        )
+        db_log_paper_trade(position)
+
         AUTO_LIVE_CONFIG["trades_today"] += 1
         ANALYTICS["total_trades"] += 1
-        
+
         audit_log("TRADE_OPENED", {
-            "id": position["id"],
             "market": market[:50],
             "platform": platform,
             "size": size,
@@ -4930,7 +4911,7 @@ async def auto_execute_opportunity(opp, channel):
             "confidence": confidence,
             "mode": TRADING_MODE,
         })
-        
+
         # Discord notification
         ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
         mode_tag = "LIVE" if TRADING_MODE == "live" else "PAPER"
@@ -4945,166 +4926,38 @@ async def auto_execute_opportunity(opp, channel):
             )
         except Exception:
             pass
-        
-        save_positions()
+
+        save_all_state()
         return True
-    
+
     audit_log("TRADE_FAILED", {"market": market[:50], "error": exec_msg[:100]})
     return False
 
 
-# ============================================================================
-# V9: AUTO-EXIT MANAGER
-# ============================================================================
-
-async def check_and_manage_exits(channel):
-    """Enhanced exit management: trailing stops, 24h pre-resolution, ATR-based."""
-    global PAPER_TRADES_TODAY
-    """Check all open positions and auto-exit when conditions are met."""
-    if not OPEN_POSITIONS:
-        return
-    
-    positions_to_close = []
-    
-    for pos in OPEN_POSITIONS:
-        if pos["status"] != "OPEN":
-            continue
-        
-        # For prediction markets: check current price
-        current_price = pos["entry_price"]  # Default to entry if can't fetch
-        
-        # Try to get current price from platform
-        platform = pos.get("platform", "")
-        market_title = pos.get("market", "")
-        
-        if platform == "Polymarket":
-            # Check Polymarket prices
-            try:
-                poly_markets = find_polymarket_markets_for_arb()
-                for pm in poly_markets:
-                    if pm["title"][:30].lower() in market_title[:30].lower() or market_title[:30].lower() in pm["title"][:30].lower():
-                        current_price = pm["yes_price"]
-                        break
-            except Exception:
-                pass
-        
-        # Calculate P&L
-        entry = pos["entry_price"]
-        if entry > 0:
-            pnl_pct = (current_price - entry) / entry * 100
-            pnl_usd = pos["size_usd"] * (current_price - entry) / entry
-        else:
-            pnl_pct = 0
-            pnl_usd = 0
-        
-        pos["current_price"] = current_price
-        pos["pnl"] = pnl_usd
-        
-        exit_reason = None
-        
-        # 1. Stop-loss hit
-        if current_price <= pos["stop_price"]:
-            exit_reason = f"STOP-LOSS hit (${pos['stop_price']:.3f})"
-        
-        # 2. Target hit
-        elif current_price >= pos["target_price"]:
-            exit_reason = f"TARGET hit (${pos['target_price']:.3f})"
-        
-        # 3. Trailing stop update
-        elif current_price > pos.get("trailing_stop", pos["stop_price"]):
-            # Move trailing stop up (ratchet only)
-            new_trail = current_price * 0.85  # 15% trailing stop
-            if new_trail > pos.get("trailing_stop", 0):
-                pos["trailing_stop"] = new_trail
-        
-        # 4. Check if trailing stop hit
-        if not exit_reason and current_price <= pos.get("trailing_stop", 0):
-            exit_reason = f"TRAILING STOP hit (${pos['trailing_stop']:.3f})"
-        
-        # 5. Time-based exit: close 24h before resolution (if we knew resolution time)
-        # For now, close positions older than 7 days
-        try:
-            opened = datetime.strptime(pos["opened_at"], "%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc)
-            age_hours = (datetime.now(timezone.utc) - opened).total_seconds() / 3600
-            if age_hours > 168:  # 7 days
-                exit_reason = "TIME EXIT: Position open >7 days"
-        except Exception:
-            pass
-        
-        if exit_reason:
-            positions_to_close.append((pos, exit_reason, pnl_usd))
-    
-    # Execute exits
-    for pos, reason, pnl in positions_to_close:
-        pos["status"] = "CLOSED"
-        pos["closed_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        pos["exit_reason"] = reason
-        pos["final_pnl"] = pnl
-        
-        # Update analytics
-        ANALYTICS["total_pnl"] += pnl
-        DAILY_PNL_TRACKER = globals().get("DAILY_PNL", 0)
-        if pnl > 0:
-            ANALYTICS["winning_trades"] += 1
-        else:
-            ANALYTICS["losing_trades"] += 1
-        
-        # Move to closed
-        OPEN_POSITIONS.remove(pos)
-        CLOSED_POSITIONS.append(pos)
-        
-        audit_log("TRADE_CLOSED", {
-            "id": pos["id"],
-            "market": pos["market"][:50],
-            "reason": reason,
-            "pnl": f"${pnl:+,.2f}",
-            "entry": pos["entry_price"],
-            "exit": pos.get("current_price", 0),
-        })
-        
-        # Discord notification
-        pnl_icon = "PROFIT" if pnl >= 0 else "LOSS"
-        mode_tag = "LIVE" if TRADING_MODE == "live" else "PAPER"
-        try:
-            await channel.send(
-                f"**Auto-Exit [{mode_tag}] [{pnl_icon}]**\n"
-                f"{pos['market'][:50]}\n"
-                f"Reason: {reason}\n"
-                f"P&L: ${pnl:+,.2f} | Entry: ${pos['entry_price']:.3f} → Exit: ${pos.get('current_price', 0):.3f}\n"
-                f"Position held: {pos['opened_at']} → {pos['closed_at']}"
-            )
-        except Exception:
-            pass
-    
-    if positions_to_close:
-        save_positions()
-
-
 @bot.command(name="positions")
 async def positions_cmd(ctx):
-    """Show all open positions with live P&L."""
-    if not OPEN_POSITIONS:
+    """Show all open positions with live P&L (unified ledger)."""
+    positions = PAPER_PORTFOLIO.get("positions", [])
+    if not positions:
         await ctx.send("No open positions.")
         return
-    
+
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"**Open Positions** | {ts}", f"Mode: {TRADING_MODE.upper()}", "================================"]
-    
-    total_pnl = 0
-    for i, pos in enumerate(OPEN_POSITIONS):
-        pnl = pos.get("pnl", 0)
-        total_pnl += pnl
-        pnl_icon = "+" if pnl >= 0 else ""
+
+    total_cost = 0
+    for i, pos in enumerate(positions[-20:]):
+        cost = pos.get("cost", 0)
+        total_cost += cost
         lines.append(
-            f"**{i+1}. {pos['platform']}** | {pos['market'][:45]}\n"
-            f"  Size: ${pos['size_usd']:.2f} | Entry: ${pos['entry_price']:.3f}\n"
-            f"  Stop: ${pos['stop_price']:.3f} | Target: ${pos['target_price']:.3f} | Trail: ${pos.get('trailing_stop', 0):.3f}\n"
-            f"  P&L: ${pnl_icon}{pnl:.2f} | Edge: {pos.get('edge_score', 0)}/100 | {pos['opened_at']}"
+            f"**{i+1}. {pos.get('platform', '?')}** | {pos.get('market', '?')[:45]}\n"
+            f"  Cost: ${cost:.2f} | Entry: ${pos.get('entry_price', 0):.3f} | {pos.get('strategy', '?')}\n"
+            f"  {pos.get('timestamp', '')}"
         )
-    
-    lines.append(f"\n**Total open P&L: ${total_pnl:+,.2f}** | Positions: {len(OPEN_POSITIONS)}")
+
+    lines.append(f"\n**Total deployed: ${total_cost:,.2f}** | Positions: {len(positions)} | Cash: ${PAPER_PORTFOLIO['cash']:,.2f}")
     lines.append("================================")
-    
+
     report = "\n".join(lines)
     if len(report) > 1900:
         report = report[:1900] + "\n*...truncated*"
@@ -5113,25 +4966,30 @@ async def positions_cmd(ctx):
 
 @bot.command(name="closed")
 async def closed_cmd(ctx):
-    """Show recently closed positions."""
-    recent = CLOSED_POSITIONS[-10:]
-    if not recent:
+    """Show recently closed positions from SQLite."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT market_id, exit_reason, realized_pnl, closed_at FROM positions WHERE status='closed' ORDER BY closed_at DESC LIMIT 10")
+        rows = c.fetchall()
+        conn.close()
+    except Exception:
+        rows = []
+
+    if not rows:
         await ctx.send("No closed positions yet.")
         return
-    
+
     lines = ["**Recently Closed Positions**", "================================"]
-    total_pnl = sum(p.get("final_pnl", 0) for p in recent)
-    wins = sum(1 for p in recent if p.get("final_pnl", 0) > 0)
-    
-    for pos in reversed(recent):
-        pnl = pos.get("final_pnl", 0)
+    total_pnl = sum(r[2] or 0 for r in rows)
+    wins = sum(1 for r in rows if (r[2] or 0) > 0)
+
+    for r in rows:
+        pnl = r[2] or 0
         icon = "WIN" if pnl > 0 else "LOSS"
-        lines.append(
-            f"[{icon}] ${pnl:+,.2f} | {pos['platform']}: {pos['market'][:40]}\n"
-            f"  {pos.get('exit_reason', 'N/A')} | {pos.get('closed_at', '')}"
-        )
-    
-    lines.append(f"\n**Net P&L: ${total_pnl:+,.2f}** | {wins}/{len(recent)} wins")
+        lines.append(f"[{icon}] ${pnl:+,.2f} | {(r[0] or '')[:40]}\n  {r[1] or 'N/A'} | {r[3] or ''}")
+
+    lines.append(f"\n**Net P&L: ${total_pnl:+,.2f}** | {wins}/{len(rows)} wins")
     lines.append("================================")
     await ctx.send("\n".join(lines))
 
@@ -5186,7 +5044,7 @@ async def auto_config_cmd(ctx, key: str = "", value: str = ""):
         await ctx.send(f"Invalid value for `{key}`: {value}")
         return
     
-    save_positions()
+    save_all_state()
     audit_log("CONFIG_CHANGED", {"key": key, "old": old, "new": AUTO_LIVE_CONFIG[key]})
     await ctx.send(f"Updated `{key}`: {old} → {AUTO_LIVE_CONFIG[key]}")
 
@@ -5234,14 +5092,20 @@ async def run_ai_oversight(channel):
         alerts.append(f"Daily P&L ${DAILY_PNL:,.2f} below halt threshold (${OVERSIGHT_CONFIG['max_daily_loss']:,.2f})")
         halt_trading = True
     
-    # Check consecutive losses
-    recent_closed = CLOSED_POSITIONS[-5:]
+    # Check consecutive losses (from SQLite)
     consecutive_losses = 0
-    for p in reversed(recent_closed):
-        if p.get("final_pnl", 0) < 0:
-            consecutive_losses += 1
-        else:
-            break
+    try:
+        _oc = sqlite3.connect(DB_PATH)
+        _occ = _oc.cursor()
+        _occ.execute("SELECT realized_pnl FROM positions WHERE status='closed' ORDER BY closed_at DESC LIMIT 5")
+        for (_rpnl,) in _occ.fetchall():
+            if (_rpnl or 0) < 0:
+                consecutive_losses += 1
+            else:
+                break
+        _oc.close()
+    except Exception:
+        pass
     if consecutive_losses >= OVERSIGHT_CONFIG["consecutive_loss_halt"]:
         alerts.append(f"{consecutive_losses} consecutive losses — halt threshold is {OVERSIGHT_CONFIG['consecutive_loss_halt']}")
         halt_trading = True
@@ -5274,7 +5138,7 @@ async def run_ai_oversight(channel):
         f"  Daily P&L: ${DAILY_PNL:+,.2f}\n"
         f"  Max drawdown: {max_dd:.1f}%\n"
         f"\n**Positions:**\n"
-        f"  Open: {len(OPEN_POSITIONS)} | Closed today: {AUTO_LIVE_CONFIG['trades_today']}\n"
+        f"  Open: {len(PAPER_PORTFOLIO.get('positions', []))} | Closed today: {AUTO_LIVE_CONFIG['trades_today']}\n"
         f"  Consecutive losses: {consecutive_losses}\n"
     )
     
@@ -6361,6 +6225,29 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS paper_trades (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, market TEXT, platform TEXT, side TEXT, shares REAL, entry_price REAL, cost REAL, ev REAL, edge_score REAL, status TEXT DEFAULT 'open')""")
         c.execute("""CREATE TABLE IF NOT EXISTS daily_state (date TEXT PRIMARY KEY, trades_count INTEGER, daily_pnl REAL, paper_cash REAL, circuit_breaker_trips INTEGER DEFAULT 0)""")
         c.execute("""CREATE TABLE IF NOT EXISTS resolutions (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, market TEXT, platform TEXT, entry_price REAL, outcome REAL, brier_score REAL, realized_edge REAL, pnl REAL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            market_id TEXT,
+            platform TEXT,
+            strategy TEXT,
+            direction TEXT,
+            size_usd REAL,
+            shares REAL,
+            entry_price REAL,
+            current_price REAL,
+            stop_price REAL,
+            target_price REAL,
+            long_leg TEXT,
+            short_leg TEXT,
+            entry_zscore REAL,
+            status TEXT DEFAULT 'open',
+            regime TEXT,
+            metadata TEXT,
+            created_at TEXT,
+            closed_at TEXT,
+            exit_reason TEXT,
+            realized_pnl REAL DEFAULT 0
+        )""")
         conn.commit()
         conn.close()
         log.info("SQLite initialized at %s", DB_PATH)
@@ -6399,8 +6286,11 @@ def db_load_daily_state():
         if row:
             COST_CONFIG["daily_trades"] = row[0]
             COST_CONFIG["daily_pnl"] = row[1]
-            PAPER_PORTFOLIO["cash"] = row[2]
-            log.info("Restored state: %d trades, pnl %.2f, cash %.2f", row[0], row[1], row[2])
+            # Only restore cash if current value is unset/zero (don't overwrite live balance)
+            if PAPER_PORTFOLIO.get("cash", 0) <= 0 and row[2] and row[2] > 0:
+                PAPER_PORTFOLIO["cash"] = row[2]
+                log.info("Restored cash from daily_state: $%.2f", row[2])
+            log.info("Restored state: %d trades, pnl %.2f (cash kept at $%.2f)", row[0], row[1], PAPER_PORTFOLIO["cash"])
             return True
     except Exception:
         pass
@@ -6651,9 +6541,11 @@ def auto_resolve_expired():
     return closed
 
 async def run_exit_manager(channel=None):
-    """Check all open paper positions for TTL/TP exits. Runs every cycle."""
+    """Unified exit manager — single exit path for ALL positions in PAPER_PORTFOLIO."""
     now = datetime.now(timezone.utc)
     positions_to_close = []
+
+    # --- Phase 1: Fetch live prices for price-based exits ---
     for i, pos in enumerate(PAPER_PORTFOLIO.get("positions", [])):
         ts_str = pos.get("timestamp", "")
         if not ts_str:
@@ -6665,66 +6557,125 @@ async def run_exit_manager(channel=None):
         age_hours = (now - entry_time).total_seconds() / 3600
         strategy = pos.get("strategy", "prediction")
         market = pos.get("market", "")
-        # TTL exits
-        if strategy == "pairs":
-            # Z-score mean reversion exit
-            _pa = pos.get("long_leg", "")
-            _pb = pos.get("short_leg", "")
-            _entry_z = pos.get("entry_zscore", 0)
-            if _pa and _pb:
-                try:
-                    _corr, _current_z, _mr = calculate_pair_zscore(_pa, _pb, 252)
-                    if _current_z is not None:
-                        log.info("PAIRS POS: %s/%s entry_z=%.2f current_z=%.2f", _pa, _pb, _entry_z, _current_z)
-                        # EXIT: Z-score crossed zero (mean reverted)
-                        if abs(_current_z) < 0.5 or (_entry_z > 0 and _current_z < 0) or (_entry_z < 0 and _current_z > 0):
-                            positions_to_close.append((i, pos, f"Z-REVERT: z={_current_z:.2f}"))
-                            continue
-                        # STOP: Z-score blew past 3.0 (regime break)
-                        if abs(_current_z) > 3.0:
-                            positions_to_close.append((i, pos, f"Z-BREAK: z={_current_z:.2f}"))
-                            continue
-                except Exception:
-                    pass
-            # TTL FALLBACK: 7 days
-            if age_hours > EXIT_CONFIG.get("pairs_ttl_days", 7) * 24:
-                positions_to_close.append((i, pos, "TTL: pairs 7d"))
-        elif strategy == "pead" and age_hours > EXIT_CONFIG["pead_ttl_hours"]:
-            positions_to_close.append((i, pos, "TTL: PEAD 72h limit"))
-        elif strategy in ("crypto", "momentum") and age_hours > EXIT_CONFIG["crypto_ttl_hours"]:
-            positions_to_close.append((i, pos, "TTL: crypto 72h limit"))
-        elif strategy == "funding_arb":
-            # Exit funding arb when rate drops below threshold
-            _arb_age = age_hours
-            if _arb_age > 24:  # Re-evaluate after 24h
-                positions_to_close.append((i, pos, f"FUNDING-ARB TTL: {_arb_age:.0f}h"))
-                continue
-            log.info("ARB POS: %s age=%.0fh rate=%.4f%%", market[:20], _arb_age, pos.get("entry_price", 0) * 100)
-        elif strategy == "funding_arb":
-            # Exit funding arb when rate drops below threshold
-            _arb_age = age_hours
-            if _arb_age > 24:  # Re-evaluate after 24h
-                positions_to_close.append((i, pos, f"FUNDING-ARB TTL: {_arb_age:.0f}h"))
-                continue
-            log.info("ARB POS: %s age=%.0fh rate=%.4f%%", market[:20], _arb_age, pos.get("entry_price", 0) * 100)
-        elif strategy == "prediction":
-            # Hold to resolution but log status
-            log.info("PRED POS: %s age=%.0fh ev=%.1f%%", market[:30], age_hours, pos.get("ev",0)*100)
-            continue  # Hold to resolution
-            positions_to_close.append((i, pos, "TTL: prediction 72h limit"))
-        # TP exit for PEAD
-        if strategy == "pead":
-            entry_price = pos.get("entry_price", 0)
-            current_price = pos.get("value", 0) / max(pos.get("shares", 1), 1)
-            if entry_price > 0 and current_price > 0:
-                pnl_pct = (current_price - entry_price) / entry_price
-                if pnl_pct >= EXIT_CONFIG["pead_tp_pct"]:
-                    positions_to_close.append((i, pos, f"TP: PEAD +{pnl_pct*100:.1f}%"))
-    # Close positions (reverse order to preserve indices)
+
+        # --- Fetch current price for strategies with live feeds ---
+        current_price = None
+        try:
+            import requests as _pr
+            if strategy == "pairs":
+                _ll = pos.get("long_leg", "")
+                _sl = pos.get("short_leg", "")
+                if _ll and _sl:
+                    _hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+                    _rl = _pr.get(f"https://data.alpaca.markets/v2/stocks/{_ll}/quotes/latest", headers=_hdr, timeout=5)
+                    _rs = _pr.get(f"https://data.alpaca.markets/v2/stocks/{_sl}/quotes/latest", headers=_hdr, timeout=5)
+                    if _rl.status_code == 200 and _rs.status_code == 200:
+                        _lp = float(_rl.json().get("quote", {}).get("ap", 0) or 0)
+                        _sp = float(_rs.json().get("quote", {}).get("ap", 0) or 0)
+                        _el = pos.get("entry_long_price", 0)
+                        _es = pos.get("entry_short_price", 0)
+                        _sz = pos.get("cost", 0) / 2
+                        if _lp > 0 and _sp > 0 and _el > 0 and _es > 0:
+                            _lpnl = (_lp - _el) * (_sz / _el)
+                            _spnl = (_es - _sp) * (_sz / _es)
+                            current_price = pos.get("cost", 0) + _lpnl + _spnl
+                            log.info("PAIRS PRICE: %s/%s long=$%.2f short=$%.2f net=$%.2f", _ll, _sl, _lpnl, _spnl, _lpnl + _spnl)
+            elif strategy in ("crypto", "momentum"):
+                _tk = market.replace("CRYPTO:", "")
+                _rc = _pr.get(f"https://api.coinbase.com/v2/prices/{_tk}-USD/spot", timeout=5)
+                if _rc.status_code == 200:
+                    _spot = float(_rc.json().get("data", {}).get("amount", 0))
+                    _ep = pos.get("entry_price", 0)
+                    _sh = pos.get("shares", 0)
+                    if _spot > 0 and _ep > 0 and _sh > 0:
+                        current_price = _spot * _sh
+                        log.info("CRYPTO PRICE: %s spot=$%.4f value=$%.2f", _tk, _spot, current_price)
+        except Exception as _pe:
+            log.warning("Live price fetch failed for %s: %s", market[:30], _pe)
+
+        # --- Phase 2: Decide exits ---
+        exit_reason = None
+
+        # Price-based exits (stop-loss / target / trailing stop)
+        if pos.get("stop_price") and pos.get("entry_price") and current_price is not None:
+            cost = pos.get("cost", 0)
+            if cost > 0:
+                price_ratio = current_price / cost  # value vs cost
+                entry = pos["entry_price"]
+                # Stop-loss
+                if price_ratio <= pos["stop_price"] / entry:
+                    exit_reason = f"STOP-LOSS hit (ratio={price_ratio:.3f})"
+                # Target
+                elif pos.get("target_price") and price_ratio >= pos["target_price"] / entry:
+                    exit_reason = f"TARGET hit (ratio={price_ratio:.3f})"
+                # Trailing stop update (ratchet up)
+                if not exit_reason and pos.get("trailing_stop"):
+                    new_trail = current_price * 0.85
+                    old_trail_value = pos.get("_trailing_value", 0)
+                    if new_trail > old_trail_value:
+                        pos["_trailing_value"] = new_trail
+                    elif current_price <= old_trail_value:
+                        exit_reason = f"TRAILING STOP hit (value=${current_price:.2f} <= trail=${old_trail_value:.2f})"
+
+        # Strategy-specific TTL/signal exits
+        if not exit_reason:
+            if strategy == "pairs":
+                _pa = pos.get("long_leg", "")
+                _pb = pos.get("short_leg", "")
+                _entry_z = pos.get("entry_zscore", 0)
+                if _pa and _pb:
+                    try:
+                        _corr, _current_z, _mr = calculate_pair_zscore(_pa, _pb, 252)
+                        if _current_z is not None:
+                            log.info("PAIRS POS: %s/%s entry_z=%.2f current_z=%.2f", _pa, _pb, _entry_z, _current_z)
+                            if abs(_current_z) < 0.5 or (_entry_z > 0 and _current_z < 0) or (_entry_z < 0 and _current_z > 0):
+                                exit_reason = f"Z-REVERT: z={_current_z:.2f}"
+                            elif abs(_current_z) > 3.0:
+                                exit_reason = f"Z-BREAK: z={_current_z:.2f}"
+                    except Exception:
+                        pass
+                if not exit_reason and age_hours > EXIT_CONFIG.get("pairs_ttl_days", 7) * 24:
+                    exit_reason = "TTL: pairs 7d"
+            elif strategy == "pead":
+                if age_hours > EXIT_CONFIG["pead_ttl_hours"]:
+                    exit_reason = "TTL: PEAD 72h limit"
+                else:
+                    ep = pos.get("entry_price", 0)
+                    cp = pos.get("value", 0) / max(pos.get("shares", 1), 1)
+                    if ep > 0 and cp > 0:
+                        pnl_pct = (cp - ep) / ep
+                        if pnl_pct >= EXIT_CONFIG["pead_tp_pct"]:
+                            exit_reason = f"TP: PEAD +{pnl_pct*100:.1f}%"
+            elif strategy in ("crypto", "momentum"):
+                if age_hours > EXIT_CONFIG["crypto_ttl_hours"]:
+                    exit_reason = "TTL: crypto 72h limit"
+            elif strategy == "funding_arb":
+                if age_hours > 24:
+                    exit_reason = f"FUNDING-ARB TTL: {age_hours:.0f}h"
+                else:
+                    log.info("ARB POS: %s age=%.0fh rate=%.4f%%", market[:20], age_hours, pos.get("entry_price", 0) * 100)
+            elif strategy == "prediction":
+                log.info("PRED POS: %s age=%.0fh ev=%.1f%%", market[:30], age_hours, pos.get("ev", 0) * 100)
+                # Hold to resolution — no TTL exit
+
+        if exit_reason:
+            positions_to_close.append((i, pos, exit_reason, current_price))
+
+    # --- Phase 3: Execute closes (reverse order to preserve indices) ---
     closed = 0
-    for idx, pos, reason in sorted(positions_to_close, key=lambda x: x[0], reverse=True):
+    for idx, pos, reason, live_value in sorted(positions_to_close, key=lambda x: x[0], reverse=True):
         if idx < len(PAPER_PORTFOLIO["positions"]):
             removed = PAPER_PORTFOLIO["positions"].pop(idx)
+            cost = removed.get("cost", 0)
+
+            # Determine exit value: live price if available, else cost (flat exit)
+            exit_value = live_value if live_value is not None else cost
+            realized_pnl = exit_value - cost
+
+            # Return capital + PnL to cash
+            PAPER_PORTFOLIO["cash"] += exit_value
+
+            # Update both SQLite tables
             try:
                 _econn = sqlite3.connect(DB_PATH)
                 _ec = _econn.cursor()
@@ -6733,50 +6684,25 @@ async def run_exit_manager(channel=None):
                 _econn.close()
             except Exception:
                 pass
-            _live_exit_value = removed.get("cost", 0)
-            _strat = removed.get("strategy", "")
-            try:
-                import requests as _pr
-                if _strat == "pairs":
-                    _ll = removed.get("long_leg", "")
-                    _sl = removed.get("short_leg", "")
-                    _sz = removed.get("cost", 0) / 2
-                    if _ll and _sl and _sz > 0:
-                        _hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
-                        _rl = _pr.get(f"https://data.alpaca.markets/v2/stocks/{_ll}/quotes/latest", headers=_hdr, timeout=5)
-                        _rs = _pr.get(f"https://data.alpaca.markets/v2/stocks/{_sl}/quotes/latest", headers=_hdr, timeout=5)
-                        if _rl.status_code == 200 and _rs.status_code == 200:
-                            _lp = float(_rl.json().get("quote", {}).get("ap", 0) or 0)
-                            _sp = float(_rs.json().get("quote", {}).get("ap", 0) or 0)
-                            _el = removed.get("entry_long_price", 0)
-                            _es = removed.get("entry_short_price", 0)
-                            if _lp > 0 and _sp > 0 and _el > 0 and _es > 0:
-                                _lpnl = (_lp - _el) * (_sz / _el)
-                                _spnl = (_es - _sp) * (_sz / _es)
-                                _live_exit_value = removed.get("cost", 0) + _lpnl + _spnl
-                                log.info("LIVE PNL: %s/%s long=$%.2f short=$%.2f net=$%.2f", _ll, _sl, _lpnl, _spnl, _lpnl+_spnl)
-                elif _strat in ("crypto", "momentum"):
-                    _tk = removed.get("market", "").replace("CRYPTO:", "")
-                    _rc = _pr.get(f"https://api.coinbase.com/v2/prices/{_tk}-USD/spot", timeout=5)
-                    if _rc.status_code == 200:
-                        _spot = float(_rc.json().get("data", {}).get("amount", 0))
-                        _ep = removed.get("entry_price", 0)
-                        _sh = removed.get("shares", 0)
-                        if _spot > 0 and _ep > 0 and _sh > 0:
-                            _live_exit_value = _spot * _sh
-                            log.info("LIVE PNL: %s entry=$%.4f exit=$%.4f pnl=$%.2f", _tk, _ep, _spot, _live_exit_value - removed.get("cost",0))
-            except Exception as _pe:
-                log.warning("Live price fetch failed: %s", _pe)
-            PAPER_PORTFOLIO["cash"] += _live_exit_value
+            db_close_position(removed.get("market", ""), exit_value, reason, realized_pnl)
+
             closed += 1
-            _exit_pnl = _live_exit_value - removed.get("cost", 0)
-            db_close_position(removed.get("market", ""), _live_exit_value, reason, _exit_pnl)
-            log.info("EXIT MANAGER: Closed %s | Reason: %s | Returned $%.2f | PnL $%.2f", removed.get("market", "")[:40], reason, removed.get("value", 0), _exit_pnl)
+            log.info("EXIT MANAGER: Closed %s | %s | Cost $%.2f → Exit $%.2f | PnL $%+.2f",
+                     removed.get("market", "")[:40], reason, cost, exit_value, realized_pnl)
             if channel:
-                await channel.send(f"Exit Manager closed: {removed.get('market', '')[:40]} | {reason}")
+                try:
+                    await channel.send(
+                        f"**Exit** {removed.get('market', '')[:40]}\n"
+                        f"Reason: {reason}\n"
+                        f"PnL: ${realized_pnl:+,.2f} (${cost:.2f} → ${exit_value:.2f})"
+                    )
+                except Exception:
+                    pass
+
     if closed > 0:
         db_save_daily_state()
-        log.info("EXIT MANAGER: Closed %d positions, returned capital to paper cash", closed)
+        save_all_state()
+        log.info("EXIT MANAGER: Closed %d positions", closed)
     return closed
 
 # --- EQUITIES ALLOCATION LIMITS ---
