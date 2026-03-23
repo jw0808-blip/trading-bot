@@ -2925,3 +2925,8 @@ BTC: 0.014797 ($1,098.54)
 - [Crypto] RAIN $0.01 (+8.4% 24h)
 - EV: +2.5% | 987 shares @ $0.210 = $208.51
 ---
+
+## Auto-Paper Trade — 16:06 UTC
+- [Polymarket] Will the Iranian regime fall by April 30?
+- EV: +8.5% | 1176 shares @ $0.085 = $100.56
+---
