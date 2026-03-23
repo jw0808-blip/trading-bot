@@ -6903,6 +6903,21 @@ def scan_pairs_opportunities():
                     _long_tk, _short_tk = ticker_b, ticker_a
                 else:
                     _long_tk, _short_tk = ticker_a, ticker_b
+                # Fetch live entry prices for P&L tracking
+                _entry_long_price = 0
+                _entry_short_price = 0
+                try:
+                    import requests as _ep_req
+                    _ep_hdr = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
+                    _ep_rl = _ep_req.get(f"https://data.alpaca.markets/v2/stocks/{_long_tk}/quotes/latest", headers=_ep_hdr, timeout=5)
+                    _ep_rs = _ep_req.get(f"https://data.alpaca.markets/v2/stocks/{_short_tk}/quotes/latest", headers=_ep_hdr, timeout=5)
+                    if _ep_rl.status_code == 200:
+                        _entry_long_price = float(_ep_rl.json().get("quote", {}).get("ap", 0) or 0)
+                    if _ep_rs.status_code == 200:
+                        _entry_short_price = float(_ep_rs.json().get("quote", {}).get("ap", 0) or 0)
+                    log.info("PAIRS ENTRY PRICES: Long %s=$%.2f Short %s=$%.2f", _long_tk, _entry_long_price, _short_tk, _entry_short_price)
+                except Exception as _ep_err:
+                    log.warning("Entry price fetch failed: %s", _ep_err)
                 _pair_pos = {
                     "market": f"PAIRS:{ticker_a}/{ticker_b}",
                     "side": direction, "shares": 1,
@@ -6912,6 +6927,8 @@ def scan_pairs_opportunities():
                     "platform": "Alpaca", "ev": abs(zscore) / 10,
                     "strategy": "pairs", "long_leg": _long_tk, "short_leg": _short_tk,
                     "entry_zscore": zscore, "correlation": corr,
+                    "entry_long_price": _entry_long_price,
+                    "entry_short_price": _entry_short_price,
                 }
                 PAPER_PORTFOLIO["positions"].append(_pair_pos)
                 PAPER_PORTFOLIO["cash"] -= _pair_size * 2
