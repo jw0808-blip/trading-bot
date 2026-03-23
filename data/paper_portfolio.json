@@ -1,5 +1,5 @@
 {
-  "cash": 21808.114082804128,
+  "cash": 21597.437562804127,
   "positions": [
     {
       "market": "Netanyahu out by March 31?",
@@ -47,7 +47,7 @@
       "timestamp": "2026-03-19 13:36 UTC",
       "platform": "Alpaca",
       "ev": 0.1255055063849849,
-      "strategy": "prediction"
+      "strategy": "pairs"
     },
     {
       "market": "PAIRS:ADBE/CRM",
@@ -59,7 +59,7 @@
       "timestamp": "2026-03-19 13:36 UTC",
       "platform": "Alpaca",
       "ev": 0.2249700670713762,
-      "strategy": "prediction"
+      "strategy": "pairs"
     },
     {
       "market": "PAIRS:MS/GS",
@@ -71,32 +71,104 @@
       "timestamp": "2026-03-19 19:06 UTC",
       "platform": "Alpaca",
       "ev": 0.10262300187423397,
-      "strategy": "prediction"
+      "strategy": "pairs"
     },
     {
       "market": "Kharg Island no longer under Iranian control by March 31?",
       "side": "BUY",
-      "shares": 2591,
+      "shares": 2591.0,
       "entry_price": 0.085,
       "cost": 221.55641000000003,
-      "value": 220.235,
+      "value": 221.55641000000003,
       "timestamp": "2026-03-20 15:50 UTC",
       "platform": "Polymarket",
       "ev": 0.085,
+      "strategy": "prediction"
+    },
+    {
+      "market": "Will the Fed increase interest rates by 25+ bps after the Ap",
+      "side": "BUY",
+      "shares": 5660,
+      "entry_price": 0.037,
+      "cost": 210.67651999999998,
+      "value": 209.42,
+      "timestamp": "2026-03-22 11:24 UTC",
+      "platform": "Polymarket",
+      "ev": 0.037,
       "strategy": "prediction"
     }
   ],
   "trades": [
     {
-      "market": "Kharg Island no longer under Iranian control by March 31?",
+      "market": "RAIN $0.01 (-8.4% 24h)",
       "side": "BUY",
-      "shares": 2591,
-      "entry_price": 0.085,
-      "cost": 221.55641000000003,
-      "value": 220.235,
-      "timestamp": "2026-03-20 15:50 UTC",
+      "shares": 1090,
+      "entry_price": 0.2,
+      "cost": 219.308,
+      "value": 218.0,
+      "timestamp": "2026-03-22 06:44 UTC",
+      "platform": "Crypto",
+      "ev": 0.025206,
+      "strategy": "prediction"
+    },
+    {
+      "market": "RAIN $0.01 (-8.2% 24h)",
+      "side": "BUY",
+      "shares": 1028,
+      "entry_price": 0.21,
+      "cost": 217.17528,
+      "value": 215.88,
+      "timestamp": "2026-03-22 07:24 UTC",
+      "platform": "Crypto",
+      "ev": 0.024716909999999998,
+      "strategy": "prediction"
+    },
+    {
+      "market": "RAIN $0.01 (-8.9% 24h)",
+      "side": "BUY",
+      "shares": 1017,
+      "entry_price": 0.21,
+      "cost": 214.85142,
+      "value": 213.57,
+      "timestamp": "2026-03-22 08:04 UTC",
+      "platform": "Crypto",
+      "ev": 0.026661300000000002,
+      "strategy": "prediction"
+    },
+    {
+      "market": "RAIN $0.01 (-13.2% 24h)",
+      "side": "BUY",
+      "shares": 1057,
+      "entry_price": 0.2,
+      "cost": 212.6684,
+      "value": 211.4,
+      "timestamp": "2026-03-22 08:44 UTC",
+      "platform": "Crypto",
+      "ev": 0.03958389,
+      "strategy": "prediction"
+    },
+    {
+      "market": "Will the Fed increase interest rates by 25+ bps after the Ap",
+      "side": "BUY",
+      "shares": 5660,
+      "entry_price": 0.037,
+      "cost": 210.67651999999998,
+      "value": 209.42,
+      "timestamp": "2026-03-22 11:24 UTC",
       "platform": "Polymarket",
-      "ev": 0.085,
+      "ev": 0.037,
+      "strategy": "prediction"
+    },
+    {
+      "market": "RAIN $0.01 (+8.4% 24h)",
+      "side": "BUY",
+      "shares": 987,
+      "entry_price": 0.21,
+      "cost": 208.51361999999997,
+      "value": 207.26999999999998,
+      "timestamp": "2026-03-23 08:14 UTC",
+      "platform": "Crypto",
+      "ev": 0.02515887,
       "strategy": "prediction"
     }
   ],

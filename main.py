@@ -3161,6 +3161,8 @@ def is_sports_or_junk(title):
     """Pattern-based detection of sports and junk markets. No team names needed."""
     if not title:
         return False
+    if "$0.0" in title or "RAIN $0.0" in title:
+        return True
     t = title.lower()
     # Sports patterns
     if " vs." in t or " vs " in t:
