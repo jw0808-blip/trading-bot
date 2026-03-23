@@ -1297,27 +1297,30 @@ def suggest_position_size(ev, portfolio_value=88000, max_pct=None, edge_score=0)
 async def on_ready():
     init_redis()
     init_db()
+    load_all_state()  # Restore paper_portfolio.json, analytics, signals, etc.
     db_load_daily_state()
-    # Reload open positions from SQLite so exit manager works after restart
-    try:
-        _rconn = sqlite3.connect(DB_PATH)
-        _rc = _rconn.cursor()
-        _rc.execute("SELECT market, side, shares, entry_price, cost, timestamp, platform, ev FROM paper_trades WHERE status = 'open'")
-        _rows = _rc.fetchall()
-        _rconn.close()
-        if _rows and not PAPER_PORTFOLIO.get("positions"):
-            for _r in _rows:
-                PAPER_PORTFOLIO["positions"].append({
-                    "market": _r[0], "side": _r[1] or "BUY", "shares": _r[2] or 0,
-                    "entry_price": _r[3] or 0, "cost": _r[4] or 0, "value": _r[4] or 0,
-                    "timestamp": _r[5] or "", "platform": _r[6] or "",
-                    "ev": _r[7] or 0,
-                    "strategy": "crypto" if any(k in (_r[0] or "").lower() for k in ["btc","eth","sol","doge","zec","xlm","hype","sui","wbt"]) else "prediction",
-                })
-            log.info("Reloaded %d open positions from SQLite", len(_rows))
-    except Exception as _e:
-        log.warning("Position reload error: %s", _e)
-    log.info("TraderJoes bot online as %s", bot.user)
+    # Backfill positions from SQLite only if JSON had none (fresh deploy)
+    if not PAPER_PORTFOLIO.get("positions"):
+        try:
+            _rconn = sqlite3.connect(DB_PATH)
+            _rc = _rconn.cursor()
+            _rc.execute("SELECT market, side, shares, entry_price, cost, timestamp, platform, ev FROM paper_trades WHERE status = 'open'")
+            _rows = _rc.fetchall()
+            _rconn.close()
+            if _rows:
+                for _r in _rows:
+                    PAPER_PORTFOLIO["positions"].append({
+                        "market": _r[0], "side": _r[1] or "BUY", "shares": _r[2] or 0,
+                        "entry_price": _r[3] or 0, "cost": _r[4] or 0, "value": _r[4] or 0,
+                        "timestamp": _r[5] or "", "platform": _r[6] or "",
+                        "ev": _r[7] or 0,
+                        "strategy": "crypto" if any(k in (_r[0] or "").lower() for k in ["btc","eth","sol","doge","zec","xlm","hype","sui","wbt"]) else "prediction",
+                    })
+                log.info("Backfilled %d positions from SQLite (JSON was empty)", len(_rows))
+        except Exception as _e:
+            log.warning("Position backfill error: %s", _e)
+    log.info("TraderJoes bot online as %s | Cash: $%.2f | Positions: %d",
+             bot.user, PAPER_PORTFOLIO.get("cash", 0), len(PAPER_PORTFOLIO.get("positions", [])))
     if not daily_report_task.is_running():
         daily_report_task.start()
     if not alert_scan_task.is_running():
