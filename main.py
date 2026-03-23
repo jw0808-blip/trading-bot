@@ -6731,10 +6731,44 @@ async def run_exit_manager(channel=None):
                 _econn.close()
             except Exception:
                 pass
-            PAPER_PORTFOLIO["cash"] += removed.get("value", removed.get("cost", 0))
+            _live_exit_value = removed.get("cost", 0)
+            _strat = removed.get("strategy", "")
+            try:
+                import requests as _pr
+                if _strat == "pairs":
+                    _ll = removed.get("long_leg", "")
+                    _sl = removed.get("short_leg", "")
+                    _sz = removed.get("cost", 0) / 2
+                    if _ll and _sl and _sz > 0:
+                        _hdr = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
+                        _rl = _pr.get(f"https://data.alpaca.markets/v2/stocks/{_ll}/quotes/latest", headers=_hdr, timeout=5)
+                        _rs = _pr.get(f"https://data.alpaca.markets/v2/stocks/{_sl}/quotes/latest", headers=_hdr, timeout=5)
+                        if _rl.status_code == 200 and _rs.status_code == 200:
+                            _lp = float(_rl.json().get("quote", {}).get("ap", 0) or 0)
+                            _sp = float(_rs.json().get("quote", {}).get("ap", 0) or 0)
+                            _el = removed.get("entry_long_price", 0)
+                            _es = removed.get("entry_short_price", 0)
+                            if _lp > 0 and _sp > 0 and _el > 0 and _es > 0:
+                                _lpnl = (_lp - _el) * (_sz / _el)
+                                _spnl = (_es - _sp) * (_sz / _es)
+                                _live_exit_value = removed.get("cost", 0) + _lpnl + _spnl
+                                log.info("LIVE PNL: %s/%s long=$%.2f short=$%.2f net=$%.2f", _ll, _sl, _lpnl, _spnl, _lpnl+_spnl)
+                elif _strat in ("crypto", "momentum"):
+                    _tk = removed.get("market", "").replace("CRYPTO:", "")
+                    _rc = _pr.get(f"https://api.coinbase.com/v2/prices/{_tk}-USD/spot", timeout=5)
+                    if _rc.status_code == 200:
+                        _spot = float(_rc.json().get("data", {}).get("amount", 0))
+                        _ep = removed.get("entry_price", 0)
+                        _sh = removed.get("shares", 0)
+                        if _spot > 0 and _ep > 0 and _sh > 0:
+                            _live_exit_value = _spot * _sh
+                            log.info("LIVE PNL: %s entry=$%.4f exit=$%.4f pnl=$%.2f", _tk, _ep, _spot, _live_exit_value - removed.get("cost",0))
+            except Exception as _pe:
+                log.warning("Live price fetch failed: %s", _pe)
+            PAPER_PORTFOLIO["cash"] += _live_exit_value
             closed += 1
-            _exit_pnl = removed.get("value", 0) - removed.get("cost", 0)
-            db_close_position(removed.get("market", ""), removed.get("value", 0), reason, _exit_pnl)
+            _exit_pnl = _live_exit_value - removed.get("cost", 0)
+            db_close_position(removed.get("market", ""), _live_exit_value, reason, _exit_pnl)
             log.info("EXIT MANAGER: Closed %s | Reason: %s | Returned $%.2f | PnL $%.2f", removed.get("market", "")[:40], reason, removed.get("value", 0), _exit_pnl)
             if channel:
                 await channel.send(f"Exit Manager closed: {removed.get('market', '')[:40]} | {reason}")
