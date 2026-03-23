@@ -5470,7 +5470,7 @@ def get_alpaca_balance():
     try:
         hdrs = {
             "APCA-API-KEY-ID": ALPACA_API_KEY,
-            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY_KEY,
         }
         r = requests.get(f"{ALPACA_BASE_URL}/v2/account", headers=hdrs, timeout=10)
         if r.status_code == 200:
@@ -5522,7 +5522,7 @@ async def execute_alpaca_order(action, symbol, amount):
     try:
         hdrs = {
             "APCA-API-KEY-ID": ALPACA_API_KEY,
-            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY_KEY,
             "Content-Type": "application/json",
         }
         
@@ -6740,7 +6740,7 @@ async def run_exit_manager(channel=None):
                     _sl = removed.get("short_leg", "")
                     _sz = removed.get("cost", 0) / 2
                     if _ll and _sl and _sz > 0:
-                        _hdr = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
+                        _hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
                         _rl = _pr.get(f"https://data.alpaca.markets/v2/stocks/{_ll}/quotes/latest", headers=_hdr, timeout=5)
                         _rs = _pr.get(f"https://data.alpaca.markets/v2/stocks/{_sl}/quotes/latest", headers=_hdr, timeout=5)
                         if _rl.status_code == 200 and _rs.status_code == 200:
@@ -6886,9 +6886,9 @@ def scan_pairs_opportunities():
                     _row = _cr.fetchone()
                     _cc.close()
                     if _row and _row[0]:
-                        from datetime import datetime, timezone
-                        _ct = datetime.fromisoformat(_row[0]).replace(tzinfo=timezone.utc)
-                        _mins = (datetime.now(timezone.utc) - _ct).total_seconds() / 60
+                        import datetime as _dt_mod
+                        _ct = _dt_mod.datetime.fromisoformat(_row[0]).replace(tzinfo=_dt_mod.timezone.utc)
+                        _mins = (_dt_mod.datetime.now(_dt_mod.timezone.utc) - _ct).total_seconds() / 60
                         if _mins < 30:
                             log.info("PAIRS COOLDOWN: %s closed %.0f min ago", _pair_key, _mins)
                             continue
@@ -6908,7 +6908,7 @@ def scan_pairs_opportunities():
                 _entry_short_price = 0
                 try:
                     import requests as _ep_req
-                    _ep_hdr = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
+                    _ep_hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
                     _ep_rl = _ep_req.get(f"https://data.alpaca.markets/v2/stocks/{_long_tk}/quotes/latest", headers=_ep_hdr, timeout=5)
                     _ep_rs = _ep_req.get(f"https://data.alpaca.markets/v2/stocks/{_short_tk}/quotes/latest", headers=_ep_hdr, timeout=5)
                     if _ep_rl.status_code == 200:
@@ -7090,7 +7090,7 @@ def fetch_earnings_surprises():
     from datetime import timedelta, datetime, timezone
     surprises = []
     try:
-        headers = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
+        headers = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
         params = {
             "start": (datetime.now(timezone.utc)-timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "limit": 50, "sort": "desc"
