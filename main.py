@@ -1326,24 +1326,54 @@ def get_market_forecast():
         "top_headlines": headlines[:5],
     }
 
+CRYPTO_MEME_BLACKLIST = {"SHIB","DOGE","PEPE","FLOKI","BONK","WIF","RAIN","HYPE","BOME","MEME","TRUMP","MELANIA"}
+CRYPTO_MIN_VOLUME_24H = 10_000_000  # $10M minimum 24h volume
+CRYPTO_MIN_PRICE = 1.00  # Skip assets under $1.00
+
 def find_crypto_momentum():
-    return []  # DISABLED: momentum scanner burning capital on penny cryptos
-    return []  # DISABLED: momentum scanner burning capital on penny cryptos
     opportunities = []
     try:
         r = requests.get("https://api.coingecko.com/api/v3/coins/markets",
-            params={"vs_currency":"usd","order":"market_cap_desc","per_page":30,"sparkline":"false"},timeout=15)
-        if r.status_code != 200: return opportunities
+            params={"vs_currency": "usd", "order": "market_cap_desc",
+                    "per_page": 50, "sparkline": "false"}, timeout=15)
+        if r.status_code != 200:
+            return opportunities
         for coin in r.json():
-            sym = coin.get("symbol","").upper()
-            px = coin.get("current_price",0)
+            sym = coin.get("symbol", "").upper()
+            px = coin.get("current_price", 0) or 0
             chg = coin.get("price_change_percentage_24h") or 0
-            vol = coin.get("total_volume",0)
-            if abs(chg) > 8 and vol > 10000000:
-                opportunities.append({"platform":"Crypto","market":f"{sym} ${px:,.2f} ({chg:+.1f}% 24h)",
-                    "ticker":sym,"type":"Momentum" if chg>0 else "Reversal","ev":abs(chg)/100*0.3,
-                    "detail":f"Vol: ${vol/1e6:.0f}M"})
-    except Exception as e: log.warning("Crypto scan: %s",e)
+            vol = coin.get("total_volume", 0) or 0
+
+            # Hard filters
+            if sym in CRYPTO_MEME_BLACKLIST:
+                continue
+            if px < CRYPTO_MIN_PRICE:
+                continue
+            if vol < CRYPTO_MIN_VOLUME_24H:
+                continue
+
+            # Verify live price from Coinbase before adding
+            try:
+                _cr = requests.get(f"https://api.coinbase.com/v2/prices/{sym}-USD/spot", timeout=5)
+                if _cr.status_code == 200:
+                    _live_px = float(_cr.json().get("data", {}).get("amount", 0))
+                    if _live_px < CRYPTO_MIN_PRICE:
+                        continue
+                    px = _live_px  # Use live price
+            except Exception:
+                pass  # Fall back to CoinGecko price
+
+            if abs(chg) > 8:
+                opportunities.append({
+                    "platform": "Crypto",
+                    "market": f"{sym} ${px:,.2f} ({chg:+.1f}% 24h)",
+                    "ticker": sym,
+                    "type": "Momentum" if chg > 0 else "Reversal",
+                    "ev": abs(chg) / 100 * 0.3,
+                    "detail": f"Price: ${px:,.2f} | Vol: ${vol/1e6:.0f}M | 24h: {chg:+.1f}%",
+                })
+    except Exception as e:
+        log.warning("Crypto scan: %s", e)
     return opportunities
 
 def get_fear_greed():
@@ -3102,11 +3132,13 @@ async def alert_scan_task():
                     if _sm % 30 < 10:
                         try:
                             _pch = bot.get_channel(int(DISCORD_CHANNEL_ID))
-                            _pead_fn = globals().get("run_pead_scanner")
+                            import sys as _sys
+                            _main_mod = _sys.modules.get("__main__")
+                            _pead_fn = getattr(_main_mod, "run_pead_scanner", None) if _main_mod else None
                             if _pead_fn:
                                 await _pead_fn(_pch)
                             else:
-                                log.warning("PEAD: run_pead_scanner not in globals")
+                                log.warning("PEAD: run_pead_scanner not found in __main__ module")
                         except Exception as _pe:
                             log.warning("PEAD error: %s", _pe)
 
@@ -3150,27 +3182,79 @@ async def alert_scan_task():
                             log.info("FUNDING-ARB %s: rate=%.4f%% threshold=%.4f%% %s",
                                      _fname, _rate_pct * 100, (0.0005 if _fname in ("SOL","XRP") else _arb_threshold) * 100,
                                      ">>> SIGNAL" if _above else "below threshold")
-                            if _above and TRADING_MODE == "paper" and AUTO_PAPER_ENABLED:
+                            if _above and AUTO_PAPER_ENABLED:
                                 _arb_size = PAPER_PORTFOLIO.get("cash", 25000) * 0.02
                                 if _arb_size > 50 and len(PAPER_PORTFOLIO.get("positions", [])) < 25:
+                                    # Execute both legs: Coinbase spot buy + Phemex perp short
+                                    _spot_ok, _spot_msg = False, ""
+                                    _perp_ok, _perp_msg, _perp_oid = False, "", None
+                                    _spot_oid = None
+                                    try:
+                                        _spot_ok, _spot_msg = await execute_coinbase_order("BUY", _fname, _arb_size)
+                                        if _spot_ok:
+                                            # Extract order ID from message
+                                            import re as _arb_re
+                                            _oid_match = _arb_re.search(r"ID: ([^\)]+)", _spot_msg)
+                                            _spot_oid = _oid_match.group(1) if _oid_match else "unknown"
+                                            log.info("ARB SPOT LEG OK: %s %s", _fname, _spot_msg[:80])
+                                        else:
+                                            log.warning("ARB SPOT LEG FAILED: %s %s", _fname, _spot_msg[:100])
+                                            continue  # Don't open perp if spot failed
+                                    except Exception as _se:
+                                        log.warning("ARB SPOT LEG ERROR: %s %s", _fname, _se)
+                                        continue
+
+                                    try:
+                                        _perp_ok, _perp_msg, _perp_oid = await execute_phemex_perp_short(_fname, _arb_size)
+                                        if _perp_ok:
+                                            log.info("ARB PERP LEG OK: %s %s", _fname, _perp_msg[:80])
+                                        else:
+                                            log.warning("ARB PERP LEG FAILED: %s %s — spot already filled", _fname, _perp_msg[:100])
+                                            # Spot filled but perp failed — sell spot to unwind
+                                            try:
+                                                await execute_coinbase_order("SELL", _fname, _arb_size)
+                                                log.info("ARB UNWIND: sold spot %s (perp leg failed)", _fname)
+                                            except Exception:
+                                                log.warning("ARB UNWIND FAILED: %s — manual intervention needed", _fname)
+                                            continue
+                                    except Exception as _pe:
+                                        log.warning("ARB PERP LEG ERROR: %s %s — unwinding spot", _fname, _pe)
+                                        try:
+                                            await execute_coinbase_order("SELL", _fname, _arb_size)
+                                        except Exception:
+                                            pass
+                                        continue
+
+                                    # Both legs successful — record position
                                     _arb_pos = {
                                         "market": f"FUNDING-ARB:{_fname}",
                                         "side": "ARB", "shares": 1,
                                         "entry_price": _rate_pct,
-                                        "cost": _arb_size, "value": _arb_size,
+                                        "cost": _arb_size * 2, "value": _arb_size * 2,
                                         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
                                         "platform": "Phemex+Coinbase",
                                         "ev": _rate_pct, "strategy": "funding_arb",
+                                        "spot_order_id": _spot_oid,
+                                        "perp_order_id": _perp_oid,
                                     }
                                     PAPER_PORTFOLIO["positions"].append(_arb_pos)
-                                    PAPER_PORTFOLIO["cash"] -= _arb_size
+                                    PAPER_PORTFOLIO["cash"] -= _arb_size * 2
                                     db_log_paper_trade(_arb_pos)
-                                    log.info("FUNDING-ARB TRADE: %s rate=%.4f%% size=$%.0f",
+                                    db_open_position(
+                                        market_id=f"FUNDING-ARB:{_fname}",
+                                        platform="Phemex+Coinbase", strategy="funding_arb",
+                                        direction="arb", size_usd=_arb_size * 2, shares=1,
+                                        entry_price=_rate_pct,
+                                        metadata={"funding_rate": _rate_pct, "spot_order": _spot_oid,
+                                                  "perp_order": _perp_oid, "leg_size": _arb_size},
+                                    )
+                                    log.info("FUNDING-ARB TRADE: %s rate=%.4f%% size=$%.0f (spot+perp)",
                                              _fname, _rate_pct * 100, _arb_size)
                                     if channel:
                                         await channel.send(
-                                            f"**FUNDING ARB** {_fname} | Rate: {_rate_pct*100:.4f}% | "
-                                            f"Size: ${_arb_size:.0f} | Spot+Short")
+                                            f"**FUNDING ARB** {_fname} | Rate: {_rate_pct*100:.4f}%\n"
+                                            f"Spot BUY: ${_arb_size:.0f} | Perp SHORT: ${_arb_size:.0f}\n"
+                                            f"Spot ID: {_spot_oid} | Perp ID: {_perp_oid}")
                         else:
                             log.warning("Phemex API %s: status %d", _fname, _fr.status_code)
                     except Exception as _fe:
@@ -3881,6 +3965,63 @@ async def execute_phemex_order(action, symbol, amount):
             return False, f"Phemex API error: {r.status_code} {r.text[:200]}"
     except Exception as exc:
         return False, f"Phemex execution error: {exc}"
+
+
+async def execute_phemex_perp_short(symbol, amount_usd):
+    """Open a short perpetual position on Phemex. Returns (success, message, order_id)."""
+    if not PHEMEX_API_KEY or not PHEMEX_API_SECRET:
+        return False, "Phemex API keys not configured", None
+    if DRY_RUN_MODE:
+        _dry_id = f"DRY-{int(time.time())}"
+        log.info("DRY RUN: Phemex PERP SHORT %s $%.2f", symbol, amount_usd)
+        return True, f"DRY RUN: perp short {symbol} ${amount_usd:.2f}", _dry_id
+    try:
+        import hmac as _hmac, hashlib as _hl, json as _js
+
+        expiry = str(int(time.time()) + 60)
+        path = "/orders"
+        # Phemex perp symbol format: BTCUSD, ETHUSD (inverse) or BTCUSDT (linear)
+        perp_symbol = f"{symbol}USDT"
+
+        order_body = {
+            "symbol": perp_symbol,
+            "clOrdID": f"tj-arb-{int(time.time())}",
+            "side": "Sell",
+            "orderQty": int(amount_usd),  # Contract quantity in USD for linear
+            "ordType": "Market",
+            "timeInForce": "ImmediateOrCancel",
+            "posSide": "Short",
+        }
+
+        body_str = _js.dumps(order_body, separators=(",", ":"))
+        sign_str = path + expiry + body_str
+        sig = _hmac.new(
+            PHEMEX_API_SECRET.encode("utf-8"),
+            sign_str.encode("utf-8"),
+            _hl.sha256
+        ).hexdigest()
+
+        headers = {
+            "x-phemex-access-token": PHEMEX_API_KEY,
+            "x-phemex-request-expiry": expiry,
+            "x-phemex-request-signature": sig,
+            "Content-Type": "application/json",
+        }
+
+        r = requests.post(f"https://api.phemex.com{path}", data=body_str, headers=headers, timeout=15)
+
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("code") == 0:
+                order_id = data.get("data", {}).get("orderID", "unknown")
+                return True, f"Phemex perp short: {perp_symbol} ${amount_usd:.2f} (ID: {order_id})", order_id
+            else:
+                return False, f"Phemex perp error: code={data.get('code')} msg={data.get('msg', '')}", None
+        else:
+            return False, f"Phemex perp HTTP {r.status_code}: {r.text[:200]}", None
+    except Exception as exc:
+        return False, f"Phemex perp error: {exc}", None
+
 
 async def backtest_real(ctx, *, args: str = ""):
     """Backtest with REAL historical data from CoinGecko.
