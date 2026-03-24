@@ -3497,12 +3497,19 @@ async def auto_paper_execute(channel, opp):
         "platform": opp.get("platform", ""),
         "ev": opp.get("ev", 0),
         "no_token_id": opp.get("no_token_id", ""),
-        "strategy": "crypto" if any(k in opp.get("market","").lower() for k in ["btc","eth","sol","doge","zec","xlm","crypto","wbt"]) else "prediction",
+        "strategy": "crypto" if opp.get("platform", "").lower() == "crypto" else "prediction",
     }
     PAPER_PORTFOLIO["positions"].append(position)
     PAPER_PORTFOLIO["trades"].append(position)
     publish_signal("trade_signals", {"market": position["market"], "platform": position.get("platform",""), "ev": opp.get("ev",0), "size": total_cost})
     db_log_paper_trade(position)
+    db_open_position(
+        market_id=_pos_market, platform=opp.get("platform", ""),
+        strategy=position["strategy"], direction=_side_label,
+        size_usd=total_cost, shares=shares, entry_price=price,
+        metadata={"ev": opp.get("ev", 0), "edge_score": _edge,
+                  "no_token_id": opp.get("no_token_id", "")},
+    )
     db_save_daily_state()
 
     # Record signal as executed
