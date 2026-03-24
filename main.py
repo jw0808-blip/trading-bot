@@ -6806,25 +6806,25 @@ def scan_pairs_opportunities():
                 "mean_ratio": mean_ratio,
             })
             _pair_key = f"PAIRS:{ticker_a}/{ticker_b}"
+            # Cooldown: block re-entry for 4 hours after last close
+            try:
+                import sqlite3 as _sq2
+                _cc = _sq2.connect(DB_PATH)
+                _cr = _cc.cursor()
+                _cr.execute("SELECT closed_at FROM positions WHERE market_id=? AND status='closed' ORDER BY closed_at DESC LIMIT 1", (_pair_key,))
+                _row = _cr.fetchone()
+                _cc.close()
+                if _row and _row[0]:
+                    import datetime as _dt_mod
+                    _ct = _dt_mod.datetime.fromisoformat(_row[0]).replace(tzinfo=_dt_mod.timezone.utc)
+                    _mins = (_dt_mod.datetime.now(_dt_mod.timezone.utc) - _ct).total_seconds() / 60
+                    if _mins < 240:  # 4 hour cooldown
+                        log.info("PAIRS COOLDOWN: %s closed %.0f min ago (need 240)", _pair_key, _mins)
+                        continue
+            except Exception:
+                pass
             if any(p.get("market","") == _pair_key for p in PAPER_PORTFOLIO.get("positions",[])):
                 log.info("PAIRS DEDUP: %s already open", _pair_key)
-                # Cooldown: block re-entry for 30 min after close
-                try:
-                    import sqlite3 as _sq2
-                    _cc = _sq2.connect(DB_PATH)
-                    _cr = _cc.cursor()
-                    _cr.execute("SELECT closed_at FROM positions WHERE market_id=? AND status='closed' ORDER BY closed_at DESC LIMIT 1", (_pair_key,))
-                    _row = _cr.fetchone()
-                    _cc.close()
-                    if _row and _row[0]:
-                        import datetime as _dt_mod
-                        _ct = _dt_mod.datetime.fromisoformat(_row[0]).replace(tzinfo=_dt_mod.timezone.utc)
-                        _mins = (_dt_mod.datetime.now(_dt_mod.timezone.utc) - _ct).total_seconds() / 60
-                        if _mins < 30:
-                            log.info("PAIRS COOLDOWN: %s closed %.0f min ago", _pair_key, _mins)
-                            continue
-                except Exception:
-                    pass
                 continue
             log.info("PAIRS SIGNAL: %s/%s corr=%.3f zscore=%.2f dir=%s", ticker_a, ticker_b, corr, zscore, direction)
             # Auto-execute pairs trade in paper mode
