@@ -1025,10 +1025,24 @@ def calc_ev(yes_price, implied_prob):
     return (implied_prob * (1 - yes_price)) - ((1 - implied_prob) * yes_price)
 
 
+KALSHI_MIN_VOLUME = 50000  # $50K minimum volume for Kalshi markets
+
 def find_kalshi_opportunities():
     opportunities = []
     if not KALSHI_API_KEY_ID or not KALSHI_PRIVATE_KEY:
         return opportunities
+
+    _kalshi_cats = ["fda","sec ","cpi","fed ","fomc","supreme court",
+                    "earnings","tariff","iran","ceasefire","ukraine",
+                    "russia","china","indictment","impeach","rate cut",
+                    "rate hike","inflation","gdp","jobs report",
+                    "nonfarm","sanctions","netanyahu","trudeau",
+                    "macron","zelensky","zelenskyy","putin","modi",
+                    "erdogan","mbs","kim jong","opec","taiwan","gaza",
+                    "debt ceiling","executive order","pce",
+                    "retail sales","recession","yield curve",
+                    "merger","antitrust"]
+
     try:
         events = get_kalshi_events(limit=10)
         for event in events[:5]:
@@ -1043,16 +1057,25 @@ def find_kalshi_opportunities():
                 if yes_price <= 0 or no_price <= 0:
                     continue
 
+                # Volume filter — Kalshi reports volume in cents
+                volume = float(mkt.get("volume", 0) or 0)
+                if volume < KALSHI_MIN_VOLUME:
+                    continue
+
+                mkt_title = mkt.get("title", title)[:60]
+                mkt_ticker = mkt.get("ticker", "")
+                mkt_lower = mkt_title.lower()
+
                 total = yes_price + no_price
                 if total < 0.98:
                     spread_ev = 1.0 - total
                     opportunities.append({
                         "platform": "Kalshi",
-                        "market": mkt.get("title", title)[:60],
-                        "ticker": mkt.get("ticker", ""),
+                        "market": mkt_title,
+                        "ticker": mkt_ticker,
                         "type": "Arb (Yes+No < $1)",
                         "ev": spread_ev,
-                        "detail": f"Yes ${yes_price:.2f} + No ${no_price:.2f} = ${total:.2f}",
+                        "detail": f"Yes ${yes_price:.2f} + No ${no_price:.2f} = ${total:.2f} | Vol: ${volume:,.0f}",
                     })
 
                 if yes_bid > 0 and yes_price > 0:
@@ -1060,12 +1083,40 @@ def find_kalshi_opportunities():
                     if spread >= 0.05:
                         opportunities.append({
                             "platform": "Kalshi",
-                            "market": mkt.get("title", title)[:60],
-                            "ticker": mkt.get("ticker", ""),
+                            "market": mkt_title,
+                            "ticker": mkt_ticker,
                             "type": "Wide Spread",
                             "ev": spread,
-                            "detail": f"Bid ${yes_bid:.2f} / Ask ${yes_price:.2f} (spread ${spread:.2f})",
+                            "detail": f"Bid ${yes_bid:.2f} / Ask ${yes_price:.2f} (spread ${spread:.2f}) | Vol: ${volume:,.0f}",
                         })
+
+                # Catalyst YES: low price YES on whitelisted events
+                is_catalyst = any(cat in mkt_lower for cat in _kalshi_cats)
+                if is_catalyst and 0.02 < yes_price < 0.20:
+                    opportunities.append({
+                        "platform": "Kalshi",
+                        "market": mkt_title,
+                        "ticker": mkt_ticker,
+                        "type": "Catalyst YES",
+                        "ev": yes_price,
+                        "yes_price": yes_price,
+                        "detail": f"YES @ ${yes_price:.3f} / NO @ ${no_price:.3f} | Vol: ${volume:,.0f}",
+                    })
+
+                # Catalyst NO: high YES price → buy NO contract
+                if is_catalyst and yes_price > 0.65 and no_price > 0.01:
+                    opportunities.append({
+                        "platform": "Kalshi",
+                        "market": mkt_title,
+                        "ticker": mkt_ticker,
+                        "type": "Catalyst NO",
+                        "ev": no_price,
+                        "yes_price": yes_price,
+                        "no_price": no_price,
+                        "side": "NO",
+                        "detail": f"NO @ ${no_price:.3f} (YES=${yes_price:.3f}) | Vol: ${volume:,.0f}",
+                    })
+
             time.sleep(0.3)
     except Exception as exc:
         log.warning("Kalshi scan error: %s", exc)
@@ -3051,7 +3102,11 @@ async def alert_scan_task():
                     if _sm % 30 < 10:
                         try:
                             _pch = bot.get_channel(int(DISCORD_CHANNEL_ID))
-                            await run_pead_scanner(_pch)
+                            _pead_fn = globals().get("run_pead_scanner")
+                            if _pead_fn:
+                                await _pead_fn(_pch)
+                            else:
+                                log.warning("PEAD: run_pead_scanner not in globals")
                         except Exception as _pe:
                             log.warning("PEAD error: %s", _pe)
 
@@ -3726,14 +3781,22 @@ async def execute_kalshi_order(action, ticker, amount):
         )
         sig_b64 = base64.b64encode(signature).decode()
         
-        # Build order
-        side = "yes" if action.upper() == "BUY" else "no"
+        # Build order — BUY_NO buys NO contracts, BUY buys YES
+        if action.upper() == "BUY_NO":
+            side = "no"
+            order_action = "buy"
+        elif action.upper() == "BUY":
+            side = "yes"
+            order_action = "buy"
+        else:
+            side = "no"
+            order_action = "sell"
         count = max(int(amount), 1)  # Minimum 1 contract
-        
+
         order_data = {
             "ticker": ticker,
             "type": "market",
-            "action": "buy" if action.upper() == "BUY" else "sell",
+            "action": order_action,
             "side": side,
             "count": count,
             "yes_price_dollars": "0.99",
@@ -4913,7 +4976,8 @@ async def auto_execute_opportunity(opp, channel):
     if TRADING_MODE == "live":
         # Route to correct exchange
         if platform == "Kalshi" or asset.startswith("KX"):
-            success, exec_msg = await execute_kalshi_order("BUY", asset, size)
+            _kalshi_action = "BUY_NO" if opp.get("side") == "NO" else "BUY"
+            success, exec_msg = await execute_kalshi_order(_kalshi_action, asset, size)
         elif platform == "Polymarket":
             if POLYMARKET_PK:
                 # Use NO token for NO contracts, YES token otherwise
@@ -7222,9 +7286,9 @@ def _log_pead(ticker, price, size, surprise, vol_mult, tp, sl):
 def _submit_pead_order(ticker, shares):
     try:
         import requests, json
-        headers = {"APCA-API-KEY-ID":ALPACA_KEY,"APCA-API-SECRET-KEY":ALPACA_SECRET,
+        headers = {"APCA-API-KEY-ID":ALPACA_API_KEY,"APCA-API-SECRET-KEY":ALPACA_SECRET_KEY,
                    "Content-Type":"application/json"}
-        resp = requests.post("https://paper-api.alpaca.markets/v2/orders",
+        resp = requests.post(f"{ALPACA_BASE_URL}/v2/orders",
             headers=headers, timeout=10,
             json={"symbol":ticker,"qty":str(round(shares,4)),
                   "side":"buy","type":"market","time_in_force":"day"})
