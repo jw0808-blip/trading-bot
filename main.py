@@ -3402,18 +3402,31 @@ async def auto_paper_execute(channel, opp):
             return False
     # === SQLITE DEDUP (1 per market, survives restarts) ===
     _raw_mkt = opp.get("market", "")[:60]
-    _mkt_l = _raw_mkt.lower()
-    _tickers = ["btc","eth","sol","doge","zec","xlm","hype","sui","wbt","xrp","hbar","shib","algo","ada","avax","matic","link"]
     _mkey = _raw_mkt
-    for _tk in _tickers:
-        if _tk in _mkt_l:
-            _mkey = "CRYPTO:" + _tk.upper()
-            break
+    # Crypto: dedup by ticker symbol, not the full market string (which includes price)
+    if opp.get("platform", "").lower() == "crypto" and opp.get("ticker"):
+        _mkey = "CRYPTO:" + opp["ticker"].upper()
+    elif opp.get("ticker"):
+        # Fallback: check if ticker looks like a known crypto symbol
+        _tk_upper = opp["ticker"].upper()
+        if any(k == _tk_upper for k in ["BTC","ETH","SOL","DOGE","ZEC","XLM","XRP","HBAR","SHIB","ALGO","ADA","AVAX","MATIC","LINK","TAO","SUI","HYPE","WBT"]):
+            _mkey = "CRYPTO:" + _tk_upper
     try:
         _dconn = sqlite3.connect(DB_PATH)
         _dc = _dconn.cursor()
+        # Check both paper_trades and positions tables, exact and LIKE match for crypto
         _dc.execute("SELECT COUNT(*) FROM paper_trades WHERE market = ? AND status = 'open'", (_mkey,))
         _dcount = _dc.fetchone()[0]
+        if _dcount == 0 and _mkey.startswith("CRYPTO:"):
+            _tk_pattern = f"%{_mkey.replace('CRYPTO:', '')}%"
+            _dc.execute("SELECT COUNT(*) FROM paper_trades WHERE market LIKE ? AND status = 'open'", (_tk_pattern,))
+            _dcount = _dc.fetchone()[0]
+        if _dcount == 0:
+            _dc.execute("SELECT COUNT(*) FROM positions WHERE market_id = ? AND status = 'open'", (_mkey,))
+            _dcount = _dc.fetchone()[0]
+        if _dcount == 0 and _mkey.startswith("CRYPTO:"):
+            _dc.execute("SELECT COUNT(*) FROM positions WHERE market_id LIKE ? AND status = 'open'", (_tk_pattern,))
+            _dcount = _dc.fetchone()[0]
         _dconn.close()
         if _dcount > 0:
             log.info("DEDUP-SQL: %s already traded %d times", _mkey, _dcount)
@@ -3421,9 +3434,15 @@ async def auto_paper_execute(channel, opp):
     except Exception:
         pass
     # === MEMORY DEDUP ===
+    _mkey_ticker = _mkey.replace("CRYPTO:", "") if _mkey.startswith("CRYPTO:") else None
     for _p in PAPER_PORTFOLIO.get("positions", []):
-        if _p.get("market", "") == _mkey:
+        _pm = _p.get("market", "")
+        if _pm == _mkey:
             log.info("DEDUP-MEM: %s already open", _mkey)
+            return False
+        # For crypto, also match by ticker in the market string
+        if _mkey_ticker and _mkey_ticker in _pm.upper():
+            log.info("DEDUP-MEM: %s matches open position %s", _mkey, _pm[:40])
             return False
     # === CRYPTO CAP (max 3) ===
     _is_crypto = any(k in _mkt_lower for k in ["btc","eth","sol","doge","zec","xlm","crypto","wbt","xrp","hbar","shib"])
