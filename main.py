@@ -1156,6 +1156,45 @@ def find_polymarket_opportunities():
                     "ev": yes_price,
                     "detail": detail,
                 })
+
+            # NO contracts: buy NO when YES is high on catalyst events
+            if yes_price > 0.65 and no_price > 0.01:
+                _no_cats = ["fda","sec ","cpi","fed ","fomc","supreme court",
+                            "earnings","tariff","iran","ceasefire","ukraine",
+                            "russia","china","indictment","impeach","rate cut",
+                            "rate hike","inflation","gdp","jobs report",
+                            "nonfarm","sanctions","netanyahu","trudeau",
+                            "macron","zelensky","zelenskyy","putin","modi",
+                            "erdogan","mbs","kim jong","opec","taiwan","gaza",
+                            "debt ceiling","executive order","pce",
+                            "retail sales","recession","yield curve",
+                            "merger","antitrust"]
+                if any(cat in question.lower() for cat in _no_cats):
+                    # Extract NO token_id from clobTokenIds[1]
+                    _no_token_id = ""
+                    _clob_raw = mkt.get("clobTokenIds", "")
+                    if _clob_raw:
+                        try:
+                            _clob_ids = json.loads(_clob_raw) if isinstance(_clob_raw, str) else _clob_raw
+                            if len(_clob_ids) >= 2:
+                                _no_token_id = _clob_ids[1]
+                        except (json.JSONDecodeError, IndexError):
+                            pass
+                    detail = f"NO @ ${no_price:.3f} (YES=${yes_price:.3f})"
+                    if extra:
+                        detail += f" | {extra}"
+                    opportunities.append({
+                        "platform": "Polymarket",
+                        "market": question,
+                        "ticker": condition_id[:20],
+                        "type": "High-YES NO Buy",
+                        "ev": no_price,
+                        "yes_price": yes_price,
+                        "no_price": no_price,
+                        "no_token_id": _no_token_id,
+                        "side": "NO",
+                        "detail": detail,
+                    })
     except Exception as exc:
         log.warning("Polymarket scan error: %s", exc)
     return opportunities
@@ -3271,17 +3310,20 @@ async def auto_paper_execute(channel, opp):
     log.info("Tiered size: edge=%d size=$%.2f", _edge, size)
     price = 0.50  # default for prediction markets
 
-    # Extract price from detail if available
-    detail = opp.get("detail", "")
-    import re
-    price_match = re.search(r"\$([0-9.]+)", detail)
-    if price_match:
-        try:
-            price = float(price_match.group(1))
-            if price > 1:
-                price = price / 100  # normalize if > $1
-        except ValueError:
-            price = 0.50
+    # Use explicit NO price for NO contracts, otherwise extract from detail
+    if opp.get("side") == "NO" and opp.get("no_price"):
+        price = opp["no_price"]
+    else:
+        detail = opp.get("detail", "")
+        import re
+        price_match = re.search(r"\$([0-9.]+)", detail)
+        if price_match:
+            try:
+                price = float(price_match.group(1))
+                if price > 1:
+                    price = price / 100  # normalize if > $1
+            except ValueError:
+                price = 0.50
 
     # TWAP for large orders, direct for small
     if size > TWAP_CONFIG["threshold"]:
@@ -3301,9 +3343,13 @@ async def auto_paper_execute(channel, opp):
         return False
 
     PAPER_PORTFOLIO["cash"] -= total_cost
+    _side_label = "BUY_NO" if opp.get("side") == "NO" else "BUY"
+    _pos_market = _mkey if "_mkey" in dir() and _mkey.startswith("CRYPTO:") else opp["market"][:60]
+    if opp.get("side") == "NO":
+        _pos_market = f"NO:{_pos_market}"
     position = {
-        "market": _mkey if "_mkey" in dir() and _mkey.startswith("CRYPTO:") else opp["market"][:60],
-        "side": "BUY",
+        "market": _pos_market,
+        "side": _side_label,
         "shares": shares,
         "entry_price": price,
         "cost": total_cost,
@@ -3311,6 +3357,7 @@ async def auto_paper_execute(channel, opp):
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "platform": opp.get("platform", ""),
         "ev": opp.get("ev", 0),
+        "no_token_id": opp.get("no_token_id", ""),
         "strategy": "crypto" if any(k in opp.get("market","").lower() for k in ["btc","eth","sol","doge","zec","xlm","crypto","wbt"]) else "prediction",
     }
     PAPER_PORTFOLIO["positions"].append(position)
@@ -4816,7 +4863,12 @@ async def auto_execute_opportunity(opp, channel):
     yes_price = opp.get("yes_price", 0)
     
     # Calculate stops and targets
-    entry_price = yes_price if yes_price > 0 else 0.5
+    if opp.get("side") == "NO" and opp.get("no_price"):
+        entry_price = opp["no_price"]
+    elif yes_price > 0:
+        entry_price = yes_price
+    else:
+        entry_price = 0.5
     stop_price = max(entry_price * 0.7, 0.01)  # 30% stop
     target_price = min(entry_price * 1.6, 0.99)  # 60% target (2:1 R:R)
     
@@ -4864,8 +4916,14 @@ async def auto_execute_opportunity(opp, channel):
             success, exec_msg = await execute_kalshi_order("BUY", asset, size)
         elif platform == "Polymarket":
             if POLYMARKET_PK:
-                token_id = opp.get("token_id", opp.get("slug", ""))
-                success, exec_msg = await execute_polymarket_order("BUY", token_id, size)
+                # Use NO token for NO contracts, YES token otherwise
+                if opp.get("side") == "NO" and opp.get("no_token_id"):
+                    token_id = opp["no_token_id"]
+                    _poly_price = opp.get("no_price", None)
+                else:
+                    token_id = opp.get("token_id", opp.get("slug", ""))
+                    _poly_price = opp.get("yes_price", None)
+                success, exec_msg = await execute_polymarket_order("BUY", token_id, size, price=_poly_price)
             else:
                 success = False
                 exec_msg = "Polymarket not configured. Add POLYMARKET_PK to .env."
@@ -6834,21 +6892,83 @@ def scan_pairs_opportunities():
                     _long_tk, _short_tk = ticker_b, ticker_a
                 else:
                     _long_tk, _short_tk = ticker_a, ticker_b
-                # Fetch live entry prices for P&L tracking
+                # Submit both legs to Alpaca paper API
                 _entry_long_price = 0
                 _entry_short_price = 0
+                _long_order_id = None
+                _short_order_id = None
+                _orders_ok = False
                 try:
                     import requests as _ep_req
-                    _ep_hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
-                    _ep_rl = _ep_req.get(f"https://data.alpaca.markets/v2/stocks/{_long_tk}/quotes/latest", headers=_ep_hdr, timeout=5)
-                    _ep_rs = _ep_req.get(f"https://data.alpaca.markets/v2/stocks/{_short_tk}/quotes/latest", headers=_ep_hdr, timeout=5)
-                    if _ep_rl.status_code == 200:
-                        _entry_long_price = float(_ep_rl.json().get("quote", {}).get("ap", 0) or 0)
-                    if _ep_rs.status_code == 200:
-                        _entry_short_price = float(_ep_rs.json().get("quote", {}).get("ap", 0) or 0)
-                    log.info("PAIRS ENTRY PRICES: Long %s=$%.2f Short %s=$%.2f", _long_tk, _entry_long_price, _short_tk, _entry_short_price)
+                    _ep_hdr = {
+                        "APCA-API-KEY-ID": ALPACA_API_KEY,
+                        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+                        "Content-Type": "application/json",
+                    }
+                    _alpaca_orders_url = f"{ALPACA_BASE_URL}/v2/orders"
+
+                    # Long leg — buy market order
+                    _long_body = {
+                        "symbol": _long_tk,
+                        "notional": str(round(_pair_size, 2)),
+                        "side": "buy",
+                        "type": "market",
+                        "time_in_force": "day",
+                    }
+                    _rl = _ep_req.post(_alpaca_orders_url, json=_long_body, headers=_ep_hdr, timeout=10)
+                    if _rl.status_code in (200, 201):
+                        _long_order_id = _rl.json().get("id", "unknown")
+                        _entry_long_price = float(_rl.json().get("filled_avg_price", 0) or 0)
+                        log.info("ALPACA LONG ORDER: %s id=%s", _long_tk, _long_order_id)
+                    else:
+                        log.warning("ALPACA LONG FAILED: %s HTTP %d: %s", _long_tk, _rl.status_code, _rl.text[:200])
+                        continue  # Skip this pair entirely
+
+                    # Short leg — sell short market order
+                    _short_body = {
+                        "symbol": _short_tk,
+                        "notional": str(round(_pair_size, 2)),
+                        "side": "sell",
+                        "type": "market",
+                        "time_in_force": "day",
+                    }
+                    _rs = _ep_req.post(_alpaca_orders_url, json=_short_body, headers=_ep_hdr, timeout=10)
+                    if _rs.status_code in (200, 201):
+                        _short_order_id = _rs.json().get("id", "unknown")
+                        _entry_short_price = float(_rs.json().get("filled_avg_price", 0) or 0)
+                        log.info("ALPACA SHORT ORDER: %s id=%s", _short_tk, _short_order_id)
+                    else:
+                        log.warning("ALPACA SHORT FAILED: %s HTTP %d: %s — cancelling long", _short_tk, _rs.status_code, _rs.text[:200])
+                        # Cancel the long leg since short failed
+                        try:
+                            _ep_req.delete(f"{_alpaca_orders_url}/{_long_order_id}", headers=_ep_hdr, timeout=5)
+                            log.info("ALPACA CANCEL LONG: %s (short leg failed)", _long_order_id)
+                        except Exception:
+                            pass
+                        continue  # Skip this pair entirely
+
+                    _orders_ok = True
+
+                    # Fetch fill prices if not returned inline (market orders may not fill instantly)
+                    if _entry_long_price <= 0 or _entry_short_price <= 0:
+                        _data_hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+                        _ql = _ep_req.get(f"https://data.alpaca.markets/v2/stocks/{_long_tk}/quotes/latest", headers=_data_hdr, timeout=5)
+                        _qs = _ep_req.get(f"https://data.alpaca.markets/v2/stocks/{_short_tk}/quotes/latest", headers=_data_hdr, timeout=5)
+                        if _ql.status_code == 200 and _entry_long_price <= 0:
+                            _entry_long_price = float(_ql.json().get("quote", {}).get("ap", 0) or 0)
+                        if _qs.status_code == 200 and _entry_short_price <= 0:
+                            _entry_short_price = float(_qs.json().get("quote", {}).get("bp", 0) or 0)
+
+                    log.info("PAIRS ENTRY PRICES: Long %s=$%.2f (order=%s) Short %s=$%.2f (order=%s)",
+                             _long_tk, _entry_long_price, _long_order_id,
+                             _short_tk, _entry_short_price, _short_order_id)
                 except Exception as _ep_err:
-                    log.warning("Entry price fetch failed: %s", _ep_err)
+                    log.warning("Alpaca pairs order failed: %s", _ep_err)
+                    continue  # Don't open position if orders failed
+
+                if not _orders_ok:
+                    continue
+
                 _pair_pos = {
                     "market": f"PAIRS:{ticker_a}/{ticker_b}",
                     "side": direction, "shares": 1,
@@ -6860,6 +6980,8 @@ def scan_pairs_opportunities():
                     "entry_zscore": zscore, "correlation": corr,
                     "entry_long_price": _entry_long_price,
                     "entry_short_price": _entry_short_price,
+                    "long_order_id": _long_order_id,
+                    "short_order_id": _short_order_id,
                 }
                 PAPER_PORTFOLIO["positions"].append(_pair_pos)
                 PAPER_PORTFOLIO["cash"] -= _pair_size * 2
@@ -6870,7 +6992,8 @@ def scan_pairs_opportunities():
                     size_usd=_pair_size * 2, shares=1, entry_price=zscore,
                     long_leg=_long_tk, short_leg=_short_tk, entry_zscore=zscore,
                     regime=get_regime("equities").get("regime","normal"),
-                    metadata={"correlation": corr, "long": _long_tk, "short": _short_tk}
+                    metadata={"correlation": corr, "long": _long_tk, "short": _short_tk,
+                              "long_order_id": _long_order_id, "short_order_id": _short_order_id}
                 )
                 db_save_daily_state()
                 log.info("PAIRS TRADE: Long %s / Short %s | Z=%.2f | Size=$%.0f per leg",
