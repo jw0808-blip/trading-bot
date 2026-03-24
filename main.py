@@ -3261,6 +3261,16 @@ async def alert_scan_task():
                         log.warning("Phemex %s fetch error: %s", _fname, _fe)
             except Exception as arb_err:
                 log.warning("Funding arb scan error: %s", arb_err)
+            # === CRASH HEDGE SCANNER (runs during market hours) ===
+            if is_market_open():
+                try:
+                    _hedge_ch = bot.get_channel(int(DISCORD_CHANNEL_ID)) if DISCORD_CHANNEL_ID else None
+                    _check_hedge_fn = __import__("sys").modules.get("__main__")
+                    _check_hedge_fn = getattr(_check_hedge_fn, "check_crash_hedges", None) if _check_hedge_fn else None
+                    if _check_hedge_fn:
+                        await _check_hedge_fn(_hedge_ch)
+                except Exception as hedge_err:
+                    log.warning("Crash hedge scan error: %s", hedge_err)
             # Run exit manager every cycle
             try:
                 exits = await run_exit_manager()
@@ -6749,6 +6759,274 @@ def is_market_open():
     market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
     return market_open <= now <= market_close
 
+# ============================================================================
+# CRASH HEDGE MODULE (SPY puts + directional short)
+# ============================================================================
+CRASH_HEDGE_CONFIG = {
+    "enabled": True,
+    "put_vix_threshold": 25,        # Buy puts when VIX > 25
+    "put_size_pct": 0.005,          # 0.5% of portfolio per put hedge
+    "put_dte": 7,                   # 7 days to expiration
+    "put_strike_offset": 0.02,      # 2% below current price
+    "short_vix_threshold": 35,      # Short SPY when VIX > 35
+    "short_size_pct": 0.01,         # 1% of portfolio
+    "max_hedges": 2,                # Max concurrent hedge positions
+    "cooldown_hours": 12,           # Min hours between hedge entries
+}
+
+
+def _get_spy_price():
+    """Fetch current SPY price from Alpaca."""
+    try:
+        hdrs = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+        r = requests.get("https://data.alpaca.markets/v2/stocks/SPY/quotes/latest",
+                         headers=hdrs, timeout=5)
+        if r.status_code == 200:
+            quote = r.json().get("quote", {})
+            mid = (float(quote.get("ap", 0) or 0) + float(quote.get("bp", 0) or 0)) / 2
+            if mid > 0:
+                return mid
+    except Exception as e:
+        log.warning("SPY price fetch failed: %s", e)
+    return None
+
+
+def _build_options_symbol(underlying, expiry_date, strike, option_type="P"):
+    """Build OCC options symbol. e.g. SPY   260328P00550000"""
+    date_str = expiry_date.strftime("%y%m%d")
+    strike_int = int(strike * 1000)
+    return f"{underlying:<6s}{date_str}{option_type}{strike_int:08d}"
+
+
+async def execute_spy_put_hedge(spy_price, portfolio_value):
+    """Buy SPY put option via Alpaca options API."""
+    cfg = CRASH_HEDGE_CONFIG
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        return False, "Alpaca not configured"
+
+    strike = round(spy_price * (1 - cfg["put_strike_offset"]), 0)
+    expiry = datetime.now(timezone.utc) + __import__("datetime").timedelta(days=cfg["put_dte"])
+    # Round to next Friday for weekly options
+    days_to_friday = (4 - expiry.weekday()) % 7
+    if days_to_friday == 0 and expiry.hour > 16:
+        days_to_friday = 7
+    expiry = expiry + __import__("datetime").timedelta(days=days_to_friday)
+
+    symbol = _build_options_symbol("SPY", expiry, strike, "P")
+    size_usd = portfolio_value * cfg["put_size_pct"]
+    # Estimate ~$3-8 per contract for OTM weeklies, buy as many as budget allows
+    est_premium = max(spy_price * 0.005, 1.0)  # Rough estimate
+    qty = max(1, int(size_usd / (est_premium * 100)))  # Options are 100 shares per contract
+
+    hdrs = {
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+        "Content-Type": "application/json",
+    }
+
+    order_body = {
+        "symbol": symbol,
+        "qty": str(qty),
+        "side": "buy",
+        "type": "market",
+        "time_in_force": "day",
+    }
+
+    if DRY_RUN_MODE:
+        log.info("DRY RUN: SPY PUT %s qty=%d strike=$%.0f exp=%s size=$%.0f",
+                 symbol, qty, strike, expiry.strftime("%Y-%m-%d"), size_usd)
+        return True, f"DRY RUN: BUY {qty}x {symbol} (strike ${strike:.0f}, exp {expiry.strftime('%m/%d')})"
+
+    try:
+        r = requests.post(f"{ALPACA_BASE_URL}/v2/orders", json=order_body,
+                          headers=hdrs, timeout=15)
+        if r.status_code in (200, 201):
+            order_id = r.json().get("id", "unknown")
+            log.info("SPY PUT ORDER: %s qty=%d id=%s", symbol, qty, order_id)
+            return True, f"BUY {qty}x {symbol} (ID: {order_id})"
+        else:
+            return False, f"Alpaca options error: {r.status_code} {r.text[:200]}"
+    except Exception as exc:
+        return False, f"SPY put order error: {exc}"
+
+
+async def execute_spy_short_hedge(spy_price, portfolio_value):
+    """Short SPY via Alpaca (directional crash hedge)."""
+    cfg = CRASH_HEDGE_CONFIG
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        return False, "Alpaca not configured"
+
+    size_usd = portfolio_value * cfg["short_size_pct"]
+    hdrs = {
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+        "Content-Type": "application/json",
+    }
+
+    order_body = {
+        "symbol": "SPY",
+        "notional": str(round(size_usd, 2)),
+        "side": "sell",
+        "type": "market",
+        "time_in_force": "day",
+    }
+
+    if DRY_RUN_MODE:
+        log.info("DRY RUN: SPY SHORT $%.0f @ $%.2f", size_usd, spy_price)
+        return True, f"DRY RUN: SHORT SPY ${size_usd:.0f}"
+
+    try:
+        r = requests.post(f"{ALPACA_BASE_URL}/v2/orders", json=order_body,
+                          headers=hdrs, timeout=15)
+        if r.status_code in (200, 201):
+            order_id = r.json().get("id", "unknown")
+            log.info("SPY SHORT ORDER: $%.0f id=%s", size_usd, order_id)
+            return True, f"SHORT SPY ${size_usd:.0f} (ID: {order_id})"
+        else:
+            return False, f"Alpaca short error: {r.status_code} {r.text[:200]}"
+    except Exception as exc:
+        return False, f"SPY short order error: {exc}"
+
+
+async def check_crash_hedges(channel):
+    """Check regime and deploy crash hedges if needed. Runs during market hours."""
+    cfg = CRASH_HEDGE_CONFIG
+    if not cfg["enabled"]:
+        return
+
+    regime = get_regime("equities")
+    vix = regime.get("vix")
+    regime_name = regime.get("regime", "normal")
+
+    if not vix or vix < cfg["put_vix_threshold"]:
+        return  # No hedge needed
+
+    # Count existing hedge positions
+    hedge_count = sum(1 for p in PAPER_PORTFOLIO.get("positions", [])
+                      if p.get("strategy") in ("crash_hedge_put", "crash_hedge_short"))
+
+    if hedge_count >= cfg["max_hedges"]:
+        log.info("CRASH-HEDGE: %d hedges already open (max %d)", hedge_count, cfg["max_hedges"])
+        return
+
+    # Cooldown check
+    try:
+        import sqlite3 as _chsq
+        _chconn = _chsq.connect(DB_PATH)
+        _chc = _chconn.cursor()
+        _chc.execute("SELECT closed_at FROM positions WHERE strategy IN ('crash_hedge_put','crash_hedge_short') ORDER BY created_at DESC LIMIT 1")
+        _chrow = _chc.fetchone()
+        _chc.execute("SELECT created_at FROM positions WHERE strategy IN ('crash_hedge_put','crash_hedge_short') AND status='open' ORDER BY created_at DESC LIMIT 1")
+        _chrow2 = _chc.fetchone()
+        _chconn.close()
+        _last_ts = (_chrow2 and _chrow2[0]) or (_chrow and _chrow[0])
+        if _last_ts:
+            import datetime as _dt_ch
+            _last = _dt_ch.datetime.fromisoformat(_last_ts).replace(tzinfo=timezone.utc)
+            _hours_since = (datetime.now(timezone.utc) - _last).total_seconds() / 3600
+            if _hours_since < cfg["cooldown_hours"]:
+                log.info("CRASH-HEDGE: cooldown %.0fh < %dh", _hours_since, cfg["cooldown_hours"])
+                return
+    except Exception:
+        pass
+
+    spy_price = _get_spy_price()
+    if not spy_price:
+        log.warning("CRASH-HEDGE: cannot fetch SPY price")
+        return
+
+    portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
+        p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+
+    # --- SPY PUT: VIX > 25, regime elevated or extreme ---
+    if vix > cfg["put_vix_threshold"] and regime_name in ("elevated", "extreme"):
+        success, msg = await execute_spy_put_hedge(spy_price, portfolio_value)
+        if success:
+            strike = round(spy_price * (1 - cfg["put_strike_offset"]), 0)
+            size_usd = portfolio_value * cfg["put_size_pct"]
+            _put_pos = {
+                "market": f"HEDGE:SPY PUT ${strike:.0f}",
+                "side": "BUY", "shares": 1,
+                "entry_price": spy_price, "cost": size_usd, "value": size_usd,
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                "platform": "Alpaca", "ev": 0,
+                "strategy": "crash_hedge_put",
+                "stop_price": 0, "target_price": 0,
+            }
+            PAPER_PORTFOLIO["positions"].append(_put_pos)
+            PAPER_PORTFOLIO["cash"] -= size_usd
+            db_log_paper_trade(_put_pos)
+            db_open_position(
+                market_id=f"HEDGE:SPY PUT ${strike:.0f}",
+                platform="Alpaca", strategy="crash_hedge_put",
+                direction="BUY", size_usd=size_usd, shares=1,
+                entry_price=spy_price,
+                metadata={"vix": vix, "regime": regime_name, "strike": strike,
+                          "spy_price": spy_price, "order_msg": msg},
+            )
+            log.info("CRASH-HEDGE PUT: VIX=%.1f SPY=$%.2f strike=$%.0f size=$%.0f",
+                     vix, spy_price, strike, size_usd)
+            if channel:
+                try:
+                    await channel.send(
+                        f"**CRASH HEDGE — SPY PUT**\n"
+                        f"VIX: {vix:.1f} | Regime: {regime_name.upper()}\n"
+                        f"SPY: ${spy_price:.2f} | Strike: ${strike:.0f}\n"
+                        f"Size: ${size_usd:.0f} | {msg}")
+                except Exception:
+                    pass
+        else:
+            log.warning("CRASH-HEDGE PUT FAILED: %s", msg[:100])
+
+    # --- SPY SHORT: VIX > 35, regime extreme only ---
+    if vix > cfg["short_vix_threshold"] and regime_name == "extreme":
+        # Check we don't already have a short open
+        has_short = any(p.get("strategy") == "crash_hedge_short"
+                        for p in PAPER_PORTFOLIO.get("positions", []))
+        if has_short:
+            log.info("CRASH-HEDGE: SPY short already open")
+            return
+
+        success, msg = await execute_spy_short_hedge(spy_price, portfolio_value)
+        if success:
+            size_usd = portfolio_value * cfg["short_size_pct"]
+            _short_pos = {
+                "market": "HEDGE:SPY SHORT",
+                "side": "SELL", "shares": 1,
+                "entry_price": spy_price, "cost": size_usd, "value": size_usd,
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                "platform": "Alpaca", "ev": 0,
+                "strategy": "crash_hedge_short",
+                "stop_price": round(spy_price * 1.03, 2),  # 3% stop-loss on shorts
+                "target_price": round(spy_price * 0.90, 2),  # 10% target
+            }
+            PAPER_PORTFOLIO["positions"].append(_short_pos)
+            PAPER_PORTFOLIO["cash"] -= size_usd
+            db_log_paper_trade(_short_pos)
+            db_open_position(
+                market_id="HEDGE:SPY SHORT",
+                platform="Alpaca", strategy="crash_hedge_short",
+                direction="SELL", size_usd=size_usd, shares=1,
+                entry_price=spy_price,
+                metadata={"vix": vix, "regime": regime_name,
+                          "spy_price": spy_price, "order_msg": msg},
+            )
+            log.info("CRASH-HEDGE SHORT: VIX=%.1f SPY=$%.2f size=$%.0f",
+                     vix, spy_price, size_usd)
+            if channel:
+                try:
+                    await channel.send(
+                        f"**CRASH HEDGE — SPY SHORT**\n"
+                        f"VIX: {vix:.1f} | Regime: EXTREME\n"
+                        f"SPY: ${spy_price:.2f} | Size: ${size_usd:.0f}\n"
+                        f"Stop: ${spy_price * 1.03:.2f} | Target: ${spy_price * 0.90:.2f}\n"
+                        f"{msg}")
+                except Exception:
+                    pass
+        else:
+            log.warning("CRASH-HEDGE SHORT FAILED: %s", msg[:100])
+
+
 # --- DYNAMIC EXIT MANAGER ---
 EXIT_CONFIG = {
     "crypto_ttl_hours": 4,
@@ -6882,6 +7160,11 @@ async def run_exit_manager(channel=None):
                     if _spot > 0 and _ep > 0 and _sh > 0:
                         current_price = _spot * _sh
                         log.info("CRYPTO PRICE: %s spot=$%.4f value=$%.2f", _tk, _spot, current_price)
+            elif strategy == "crash_hedge_short":
+                # Fetch SPY price for stop/target checks
+                _spy = _get_spy_price()
+                if _spy and _spy > 0:
+                    current_price = _spy
         except Exception as _pe:
             log.warning("Live price fetch failed for %s: %s", market[:30], _pe)
 
@@ -6946,6 +7229,26 @@ async def run_exit_manager(channel=None):
                     exit_reason = f"FUNDING-ARB TTL: {age_hours:.0f}h"
                 else:
                     log.info("ARB POS: %s age=%.0fh rate=%.4f%%", market[:20], age_hours, pos.get("entry_price", 0) * 100)
+            elif strategy == "crash_hedge_put":
+                # Puts expire worthless or in-the-money — exit at DTE or 7-day TTL
+                if age_hours > CRASH_HEDGE_CONFIG.get("put_dte", 7) * 24:
+                    exit_reason = f"HEDGE PUT EXPIRED: {age_hours:.0f}h"
+                else:
+                    log.info("HEDGE PUT: %s age=%.0fh", market[:30], age_hours)
+            elif strategy == "crash_hedge_short":
+                # Check stop-loss and target on SPY short
+                if current_price is not None and pos.get("stop_price") and pos.get("entry_price"):
+                    _ep = pos["entry_price"]
+                    if _ep > 0 and current_price > 0:
+                        # Short: lose money when price goes up
+                        if current_price >= pos["stop_price"]:
+                            exit_reason = f"HEDGE SHORT STOP: SPY ${current_price:.2f} >= ${pos['stop_price']:.2f}"
+                        elif current_price <= pos.get("target_price", 0):
+                            exit_reason = f"HEDGE SHORT TARGET: SPY ${current_price:.2f}"
+                if not exit_reason and age_hours > 168:  # 7-day max hold
+                    exit_reason = f"HEDGE SHORT TTL: {age_hours:.0f}h"
+                if not exit_reason:
+                    log.info("HEDGE SHORT: %s age=%.0fh entry=$%.2f", market[:30], age_hours, pos.get("entry_price", 0))
             elif strategy == "prediction":
                 log.info("PRED POS: %s age=%.0fh ev=%.1f%%", market[:30], age_hours, pos.get("ev", 0) * 100)
                 # Hold to resolution — no TTL exit
