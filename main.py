@@ -3427,10 +3427,35 @@ async def cycle_cmd(ctx, *, ticker: str = ""):
                                      f"avg {_hs['avg_reversion_days']:.0f}d, {_hs['sample_size']} samples")
                 else:
                     notes.append("Z-score below entry threshold or low correlation")
+            # Monte Carlo on pair spread
+            try:
+                _mc = montecarlo_simulate(tk_a, tk_b, entry_zscore=zscore, horizon_days=7)
+                if _mc.get("available"):
+                    _mc_prob = _mc["prob_profit"]
+                    notes.append(f"Monte Carlo: {_mc_prob*100:.0f}% prob profit, "
+                                 f"EV={_mc['expected_value']:.4f}, Sharpe={_mc['sharpe']:.2f}, "
+                                 f"Kelly={_mc['kelly_fraction']*100:.1f}%")
+                    if _mc_prob >= 0.60:
+                        signals.append(("LONG" if zscore < 0 else "SHORT", int(_mc_prob * 30), f"mc_prob={_mc_prob:.0%}"))
+                    elif _mc_prob < 0.45:
+                        signals.append(("NEUTRAL", 20, f"mc_skip={_mc_prob:.0%}"))
+            except Exception:
+                pass
         except Exception:
             notes.append("Pairs calc error")
     else:
-        # Single ticker — check price trend via Alpaca
+        # Single ticker — Monte Carlo + price check
+        try:
+            _mc = montecarlo_simulate(tk_a, horizon_days=7)
+            if _mc.get("available"):
+                notes.append(f"Monte Carlo: {_mc['prob_profit']*100:.0f}% prob profit, "
+                             f"EV={_mc['expected_value']:.4f}, Sharpe={_mc['sharpe']:.2f}, "
+                             f"Kelly={_mc['kelly_fraction']*100:.1f}%")
+                if _mc["prob_profit"] >= 0.55:
+                    signals.append(("LONG", int(_mc["prob_profit"] * 25), f"mc_prob={_mc['prob_profit']:.0%}"))
+        except Exception:
+            pass
+        # Check price via Alpaca
         try:
             _hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
             _r = _cy_req.get(f"https://data.alpaca.markets/v2/stocks/{tk_a}/quotes/latest", headers=_hdr, timeout=5)
@@ -3501,6 +3526,70 @@ async def cycle_cmd(ctx, *, ticker: str = ""):
     result += f"{'─' * 45}\n"
     for note in notes:
         result += f"{note}\n"
+    result += f"```"
+
+    await msg.edit(content=result)
+
+
+@bot.command(name="montecarlo")
+async def montecarlo_cmd(ctx, ticker_a: str = "", ticker_b: str = ""):
+    """Run Monte Carlo simulation. Usage: !montecarlo NVDA AMD  or  !montecarlo SPY"""
+    if not ticker_a:
+        await ctx.send("Usage: `!montecarlo NVDA AMD` (pair) or `!montecarlo SPY` (single)")
+        return
+    ticker_a = ticker_a.upper()
+    ticker_b = ticker_b.upper() if ticker_b else None
+    label = f"{ticker_a}/{ticker_b}" if ticker_b else ticker_a
+
+    msg = await ctx.send(f"Running 10,000-path Monte Carlo for **{label}**...")
+
+    # If pair, get current Z-score for context
+    entry_z = None
+    corr_val = None
+    if ticker_b:
+        try:
+            corr_val, entry_z, _ = calculate_pair_zscore(ticker_a, ticker_b, 252)
+        except Exception:
+            pass
+
+    mc = montecarlo_simulate(ticker_a, ticker_b, entry_zscore=entry_z, n_paths=10000, horizon_days=7)
+
+    if not mc.get("available"):
+        await msg.edit(content=f"Monte Carlo for **{label}**: insufficient data (need 100+ trading days)")
+        return
+
+    portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
+        p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+    kelly_size = portfolio_value * mc["kelly_fraction"]
+
+    # Verdict
+    prob = mc["prob_profit"]
+    if prob >= 0.65:
+        verdict = "STRONG EDGE — full size"
+    elif prob >= 0.55:
+        verdict = "Modest edge — standard size"
+    elif prob >= 0.45:
+        verdict = "Marginal — reduce size 50%"
+    else:
+        verdict = "SKIP — negative edge"
+
+    result = f"**Monte Carlo Simulation: {label}**\n```\n"
+    result += f"Paths: {mc['n_paths']:,} | Horizon: 7 days | σ={mc['sigma']:.4f}\n"
+    if ticker_b and entry_z is not None:
+        result += f"Entry Z-score: {entry_z:.2f}"
+        if corr_val is not None:
+            result += f" | Correlation: {corr_val:.3f}"
+        result += "\n"
+    result += f"{'─' * 48}\n"
+    result += f"{'Prob of profit:':<24s} {prob*100:>6.1f}%\n"
+    result += f"{'Expected value:':<24s} {mc['expected_value']:>+6.4f}\n"
+    result += f"{'Sharpe ratio:':<24s} {mc['sharpe']:>6.2f}\n"
+    result += f"{'Max drawdown (95th):':<24s} {mc['max_drawdown_95']:>6.4f}\n"
+    result += f"{'Kelly fraction:':<24s} {mc['kelly_fraction']*100:>6.1f}%\n"
+    result += f"{'Kelly size:':<24s} ${kelly_size:>6,.0f}\n"
+    result += f"{'90% CI:':<24s} [{mc['ci_low']:+.4f}, {mc['ci_high']:+.4f}]\n"
+    result += f"{'─' * 48}\n"
+    result += f"Verdict: {verdict}\n"
     result += f"```"
 
     await msg.edit(content=result)
@@ -8693,6 +8782,165 @@ def historian_size_multiplier(stats):
         return 1.0
 
 
+# ---------------------------------------------------------------------------
+# MONTE CARLO SIMULATION AGENT — Probability engine for trade decisions
+# ---------------------------------------------------------------------------
+_MC_CACHE = {}  # {cache_key: {"result": {...}, "fetched_at": datetime}}
+
+
+def montecarlo_simulate(ticker_a, ticker_b=None, entry_zscore=None, n_paths=10000, horizon_days=7):
+    """Run Monte Carlo simulation on a pair spread or single ticker.
+    Returns dict with prob_profit, expected_value, max_drawdown_95, kelly_size, etc.
+    Cached for 30 minutes."""
+    cache_key = f"{ticker_a}/{ticker_b or 'solo'}:{entry_zscore or 0:.1f}"
+    now = datetime.now(timezone.utc)
+
+    cached = _MC_CACHE.get(cache_key)
+    if cached and (now - cached["fetched_at"]).total_seconds() < 1800:
+        return cached["result"]
+
+    result = {"prob_profit": 0.50, "expected_value": 0.0, "max_drawdown_95": 0.0,
+              "kelly_fraction": 0.01, "sharpe": 0.0, "ci_low": 0.0, "ci_high": 0.0,
+              "n_paths": n_paths, "available": False}
+
+    try:
+        import yfinance as yf
+        import numpy as np
+
+        data_a = yf.download(ticker_a, period="252d", progress=False)
+        if len(data_a) < 100:
+            _MC_CACHE[cache_key] = {"result": result, "fetched_at": now}
+            return result
+        prices_a = data_a["Close"].values.flatten()
+
+        if ticker_b:
+            # Pairs mode: simulate the spread ratio
+            data_b = yf.download(ticker_b, period="252d", progress=False)
+            if len(data_b) < 100:
+                _MC_CACHE[cache_key] = {"result": result, "fetched_at": now}
+                return result
+            prices_b = data_b["Close"].values.flatten()
+            min_len = min(len(prices_a), len(prices_b))
+            prices_a, prices_b = prices_a[-min_len:], prices_b[-min_len:]
+            ratio = prices_a / prices_b
+            log_returns = np.diff(np.log(ratio))
+        else:
+            # Single ticker mode
+            log_returns = np.diff(np.log(prices_a))
+
+        mu = float(np.mean(log_returns))
+        sigma = float(np.std(log_returns))
+        if sigma == 0:
+            _MC_CACHE[cache_key] = {"result": result, "fetched_at": now}
+            return result
+
+        # For pairs: mean-reversion drift toward Z=0
+        if ticker_b and entry_zscore is not None and abs(entry_zscore) > 0.5:
+            # Add mean-reversion pull: drift toward mean
+            mean_ratio = float(np.mean(ratio))
+            std_ratio = float(np.std(ratio))
+            current_ratio = float(ratio[-1])
+            if std_ratio > 0:
+                # Half-life based drift: pull ~5% per day toward mean
+                reversion_pull = -0.05 * (current_ratio - mean_ratio) / current_ratio
+                mu = mu + reversion_pull
+
+        # Simulate n_paths
+        np.random.seed(42)  # Reproducible for same inputs
+        rand = np.random.normal(mu, sigma, (n_paths, horizon_days))
+        cum_returns = np.cumsum(rand, axis=1)
+        final_returns = cum_returns[:, -1]
+
+        # For pairs: profit = spread reverts toward 0 from entry Z
+        # Entry zscore > 0 → short spread (profit if returns < 0)
+        # Entry zscore < 0 → long spread (profit if returns > 0)
+        if ticker_b and entry_zscore is not None:
+            if entry_zscore > 0:
+                path_pnls = -final_returns  # Short spread
+            else:
+                path_pnls = final_returns   # Long spread
+        else:
+            path_pnls = final_returns
+
+        # Calculate statistics
+        prob_profit = float(np.mean(path_pnls > 0))
+        expected_value = float(np.mean(path_pnls))
+        std_pnl = float(np.std(path_pnls))
+
+        # Max drawdown at 95th percentile
+        if ticker_b:
+            # Track worst-case path drawdowns
+            if entry_zscore and entry_zscore > 0:
+                path_values = -cum_returns
+            else:
+                path_values = cum_returns
+            running_max = np.maximum.accumulate(path_values, axis=1)
+            drawdowns = running_max - path_values
+            max_dd_per_path = np.max(drawdowns, axis=1)
+        else:
+            running_max = np.maximum.accumulate(cum_returns, axis=1)
+            drawdowns = running_max - cum_returns
+            max_dd_per_path = np.max(drawdowns, axis=1)
+        max_drawdown_95 = float(np.percentile(max_dd_per_path, 95))
+
+        # Kelly criterion: f* = (p * b - q) / b where b = win/loss ratio
+        wins = path_pnls[path_pnls > 0]
+        losses = path_pnls[path_pnls <= 0]
+        if len(wins) > 0 and len(losses) > 0:
+            avg_win = float(np.mean(wins))
+            avg_loss = float(np.mean(np.abs(losses)))
+            if avg_loss > 0:
+                b = avg_win / avg_loss
+                p = prob_profit
+                q = 1 - p
+                kelly = (p * b - q) / b
+                kelly = max(0, min(kelly, 0.25))  # Cap at 25%
+            else:
+                kelly = 0.02
+        else:
+            kelly = 0.01
+
+        # Confidence interval (5th to 95th percentile of final returns)
+        ci_low = float(np.percentile(path_pnls, 5))
+        ci_high = float(np.percentile(path_pnls, 95))
+
+        # Sharpe ratio
+        sharpe = float(expected_value / std_pnl) if std_pnl > 0 else 0
+
+        result = {
+            "prob_profit": prob_profit,
+            "expected_value": expected_value,
+            "max_drawdown_95": max_drawdown_95,
+            "kelly_fraction": kelly,
+            "sharpe": sharpe,
+            "ci_low": ci_low,
+            "ci_high": ci_high,
+            "n_paths": n_paths,
+            "sigma": sigma,
+            "available": True,
+        }
+
+    except Exception as e:
+        log.warning("MONTE CARLO error %s/%s: %s", ticker_a, ticker_b, e)
+
+    _MC_CACHE[cache_key] = {"result": result, "fetched_at": now}
+    return result
+
+
+def montecarlo_size_adjustment(mc_result):
+    """Return (multiplier, skip_trade) based on Monte Carlo probability.
+    prob < 45% → skip, prob < 55% → 0.5x, else 1.0x."""
+    if not mc_result.get("available"):
+        return 1.0, False
+    prob = mc_result["prob_profit"]
+    if prob < 0.45:
+        return 0.0, True   # Skip trade
+    elif prob < 0.55:
+        return 0.5, False  # Reduce size
+    else:
+        return 1.0, False  # Full size
+
+
 def calculate_pair_zscore(ticker_a, ticker_b, lookback=252):
     """Calculate Z-score of price ratio spread for a pair."""
     try:
@@ -8786,12 +9034,24 @@ def scan_pairs_opportunities():
                          ticker_a, ticker_b, _hist_stats["reversion_rate"] * 100,
                          _hist_stats["avg_reversion_days"], _hist_stats["max_adverse_z"],
                          _hist_stats["sample_size"], _hist_mult)
+            # Monte Carlo Agent: simulate spread paths
+            _mc = montecarlo_simulate(ticker_a, ticker_b, entry_zscore=zscore, horizon_days=7)
+            _mc_mult, _mc_skip = montecarlo_size_adjustment(_mc)
+            if _mc.get("available"):
+                log.info("MONTE CARLO: %s/%s prob=%.0f%% EV=%.4f maxDD95=%.4f kelly=%.1f%% → %s",
+                         ticker_a, ticker_b, _mc["prob_profit"] * 100, _mc["expected_value"],
+                         _mc["max_drawdown_95"], _mc["kelly_fraction"] * 100,
+                         "SKIP" if _mc_skip else f"{_mc_mult:.1f}x")
+            if _mc_skip:
+                log.info("MONTE CARLO SKIP: %s/%s prob=%.0f%% below 45%% threshold",
+                         ticker_a, ticker_b, _mc["prob_profit"] * 100)
+                continue
             # Auto-execute pairs trade in paper mode
             if TRADING_MODE == "paper" and AUTO_PAPER_ENABLED:
                 _base_size = PAPER_PORTFOLIO.get("cash", 25000) * 0.015  # 1.5% per leg base
                 _kelly_mult = min((abs(zscore) / 2.0) * corr, 2.0)  # Half-Kelly scaling
                 _psych_mult = psychologist_size_multiplier()
-                _pair_size = _base_size * _kelly_mult * _hist_mult * _psych_mult
+                _pair_size = _base_size * _kelly_mult * _hist_mult * _psych_mult * _mc_mult
                 if direction == "short_a_long_b":
                     _long_tk, _short_tk = ticker_b, ticker_a
                 else:
