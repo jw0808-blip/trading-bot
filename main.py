@@ -3710,6 +3710,23 @@ async def tv_signals_cmd(ctx):
     await ctx.send(msg)
 
 
+@bot.command(name="engineer-log")
+async def engineer_log_cmd(ctx):
+    """Show last 10 auto-improvement adjustments from the Engineer Agent."""
+    if not _ENGINEER_LOG:
+        await ctx.send("**Engineer Log**: No adjustments yet. Needs 10+ closed trades per strategy.")
+        return
+
+    msg = "**Engineer Self-Improvement Log**\n```\n"
+    for adj in reversed(_ENGINEER_LOG[-10:]):
+        _ts = adj["timestamp"].strftime("%m/%d %H:%M") if hasattr(adj["timestamp"], "strftime") else "?"
+        msg += (f"[{_ts}] {adj['strategy']:12s} {adj['metric']:16s} "
+                f"{adj['old']:.3f} → {adj['new']:.3f}\n")
+        msg += f"  Reason: {adj['reason'][:65]}\n"
+    msg += "```"
+    await ctx.send(msg)
+
+
 @bot.command(name="risk-status")
 async def risk_status_cmd(ctx):
     """Show risk management state: correlations, drawdowns, pauses."""
@@ -4106,6 +4123,11 @@ async def alert_scan_task():
                     log.info("Oracle engine fired %d signals this cycle", _oracle_fired)
             except Exception as _oerr:
                 log.warning("Oracle engine error: %s", _oerr)
+            # === ENGINEER AGENT (self-improvement, every cycle) ===
+            try:
+                engineer_self_improve()
+            except Exception as _engr:
+                log.warning("Engineer agent error: %s", _engr)
             # === RISK MANAGEMENT AGENT (every cycle) ===
             try:
                 risk_run_all_checks()
@@ -9378,6 +9400,121 @@ def risk_run_all_checks():
     risk_check_correlations()
     risk_check_daily_drawdown()
     _RISK_STATE["last_check"] = datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# ENGINEER AGENT — Self-improvement loop, auto-tuning thresholds
+# ---------------------------------------------------------------------------
+_ENGINEER_LOG = []  # Rolling list of adjustments: [{timestamp, strategy, metric, old, new, reason}]
+_ENGINEER_LAST_CHECK = None
+_ENGINEER_TRADE_COUNTER = {}  # {strategy: count_since_last_analysis}
+
+
+def engineer_self_improve():
+    """After every 10 closed trades per strategy, analyze and auto-tune.
+    Compares actual win rate to Monte Carlo predictions. Adjusts thresholds."""
+    global _ENGINEER_LAST_CHECK
+    now = datetime.now(timezone.utc)
+
+    try:
+        import sqlite3 as _esq
+        conn = _esq.connect(DB_PATH)
+
+        # Count closed trades per strategy since last check
+        _since = _ENGINEER_LAST_CHECK.strftime("%Y-%m-%d %H:%M:%S") if _ENGINEER_LAST_CHECK else "2020-01-01"
+        rows = conn.execute("""
+            SELECT strategy, COUNT(*) as cnt
+            FROM positions WHERE status='closed' AND closed_at >= ?
+            GROUP BY strategy
+        """, (_since,)).fetchall()
+
+        for strategy, cnt in rows:
+            if not strategy:
+                continue
+            prev = _ENGINEER_TRADE_COUNTER.get(strategy, 0)
+            _ENGINEER_TRADE_COUNTER[strategy] = prev + cnt
+            if _ENGINEER_TRADE_COUNTER[strategy] < 10:
+                continue
+
+            # 10+ trades accumulated — run analysis
+            _ENGINEER_TRADE_COUNTER[strategy] = 0
+
+            # Get last 30 trades for this strategy
+            trades = conn.execute("""
+                SELECT realized_pnl, size_usd,
+                       (julianday(closed_at) - julianday(created_at)) * 24 as hold_hours
+                FROM positions WHERE status='closed' AND strategy=?
+                AND realized_pnl IS NOT NULL
+                ORDER BY closed_at DESC LIMIT 30
+            """, (strategy,)).fetchall()
+
+            if len(trades) < 10:
+                continue
+
+            wins = sum(1 for t in trades if t[0] > 0)
+            total = len(trades)
+            actual_wr = wins / total
+            avg_pnl = sum(t[0] for t in trades) / total
+            avg_hold = sum(t[2] or 0 for t in trades) / total
+
+            # Compare to MC prediction (60% is our baseline expectation)
+            mc_expected = 0.60
+            gap = mc_expected - actual_wr
+
+            adjustment = None
+            if gap > 0.10:  # Actual win rate 10%+ below MC prediction
+                if strategy == "pairs":
+                    # Tighten Z-score entry by 0.1
+                    old_z = EQUITIES_CONFIG.get("pairs", {}).get("zscore_entry", 1.0)
+                    new_z = round(old_z + 0.1, 1)
+                    if new_z <= 2.5:  # Don't tighten beyond 2.5
+                        EQUITIES_CONFIG["pairs"]["zscore_entry"] = new_z
+                        adjustment = {
+                            "timestamp": now, "strategy": strategy,
+                            "metric": "zscore_entry", "old": old_z, "new": new_z,
+                            "reason": f"Win rate {actual_wr*100:.0f}% vs expected {mc_expected*100:.0f}% "
+                                      f"(gap {gap*100:.0f}%). Avg PnL ${avg_pnl:+.2f}, hold {avg_hold:.0f}h",
+                        }
+                elif strategy == "oracle_trade":
+                    # Reduce oracle sizing
+                    old_pct = ORACLE_CONFIG.get("base_size_pct", 0.0075)
+                    new_pct = round(max(old_pct - 0.001, 0.003), 4)
+                    if new_pct != old_pct:
+                        ORACLE_CONFIG["base_size_pct"] = new_pct
+                        adjustment = {
+                            "timestamp": now, "strategy": strategy,
+                            "metric": "base_size_pct", "old": old_pct, "new": new_pct,
+                            "reason": f"Win rate {actual_wr*100:.0f}% vs expected {mc_expected*100:.0f}%",
+                        }
+                elif strategy == "crypto":
+                    # Tighten crypto by raising min EV threshold
+                    old_ev = ALERT_CONFIG.get("min_ev_threshold", 0.02)
+                    new_ev = round(old_ev + 0.005, 3)
+                    if new_ev <= 0.05:
+                        ALERT_CONFIG["min_ev_threshold"] = new_ev
+                        adjustment = {
+                            "timestamp": now, "strategy": strategy,
+                            "metric": "min_ev_threshold", "old": old_ev, "new": new_ev,
+                            "reason": f"Win rate {actual_wr*100:.0f}% vs expected {mc_expected*100:.0f}%",
+                        }
+
+            if adjustment:
+                _ENGINEER_LOG.append(adjustment)
+                if len(_ENGINEER_LOG) > 50:
+                    _ENGINEER_LOG.pop(0)
+                log.info("ENGINEER: %s %s %.3f→%.3f (%s)",
+                         adjustment["strategy"], adjustment["metric"],
+                         adjustment["old"], adjustment["new"], adjustment["reason"][:60])
+
+            # Always log stats even without adjustment
+            log.info("ENGINEER STATS: %s wr=%.0f%% avg_pnl=$%+.2f hold=%.0fh (%d trades)",
+                     strategy, actual_wr * 100, avg_pnl, avg_hold, total)
+
+        conn.close()
+        _ENGINEER_LAST_CHECK = now
+
+    except Exception as e:
+        log.warning("ENGINEER error: %s", e)
 
 
 # PSYCHOLOGIST AGENT — Sentiment regime from Fear & Greed
