@@ -2970,3 +2970,8 @@ BTC: 0.014797 ($1,098.54)
 - [Crypto] TAO $364.88 (+19.4% 24h)
 - EV: +5.8% | 1 shares @ $364.880 = $367.07
 ---
+
+## Auto-Paper Trade — 21:12 UTC
+- [Polymarket] Will Trump visit China by April 30?
+- EV: +2.1% | 11904 shares @ $0.021 = $251.48
+---
