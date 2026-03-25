@@ -3710,6 +3710,61 @@ async def tv_signals_cmd(ctx):
     await ctx.send(msg)
 
 
+@bot.command(name="ai-consensus")
+async def ai_consensus_cmd(ctx, *, ticker: str = ""):
+    """Get AI second opinion on a ticker. Usage: !ai-consensus NVDA"""
+    if not ticker:
+        # Show recent AI consultations
+        if not _AI_CONSENSUS_LOG:
+            await ctx.send("**AI Consensus**: No consultations yet. Use `!ai-consensus NVDA`")
+            return
+        msg = "**AI Consensus Log**\n```\n"
+        for entry in reversed(_AI_CONSENSUS_LOG[-8:]):
+            _ts = entry["timestamp"].strftime("%m/%d %H:%M") if hasattr(entry["timestamp"], "strftime") else "?"
+            msg += (f"[{_ts}] {entry['ticker']:6s} {entry['direction']:6s} "
+                    f"score={entry['score']:>3d} → {entry['verdict']:7s}\n")
+            msg += f"  {entry['reasoning'][:65]}\n"
+        msg += "```"
+        await ctx.send(msg)
+        return
+
+    ticker = ticker.strip().upper()
+    msg = await ctx.send(f"Consulting AI on **{ticker}**...")
+
+    # Build context from available data
+    notes = [f"Ticker: {ticker}"]
+    fng_val, fng_label = get_fear_greed()
+    notes.append(f"F&G: {fng_val}/100 ({fng_label})")
+    regime = get_regime("equities")
+    notes.append(f"VIX: {regime.get('vix', '?')} Regime: {regime.get('regime', '?')}")
+    psych = _PSYCH_STATE
+    if psych["contrarian_mode"]:
+        notes.append("Psychologist: CONTRARIAN MODE (extreme fear)")
+    geo = _intel_get_geo_state()
+    if geo["active"]:
+        notes.append(f"Geo escalation: {geo['theme']} ({geo['count']} headlines)")
+
+    # Get MC if available
+    try:
+        mc = montecarlo_simulate(ticker, horizon_days=7)
+        if mc.get("available"):
+            notes.append(f"Monte Carlo: {mc['prob_profit']*100:.0f}% prob, EV={mc['expected_value']:+.4f}")
+    except Exception:
+        pass
+
+    verdict, reasoning = ai_get_second_opinion(ticker, "LONG", 65, notes)
+
+    result = f"**AI Second Opinion: {ticker}**\n```\n"
+    result += f"Verdict: {verdict}\n"
+    result += f"Reasoning: {reasoning}\n"
+    result += f"{'─' * 40}\n"
+    result += f"Context provided:\n"
+    for n in notes:
+        result += f"  {n}\n"
+    result += "```"
+    await msg.edit(content=result)
+
+
 @bot.command(name="engineer-log")
 async def engineer_log_cmd(ctx):
     """Show last 10 auto-improvement adjustments from the Engineer Agent."""
@@ -8205,6 +8260,25 @@ async def scan_oracle_signals(channel=None):
         if leg_size < 10:
             continue
 
+        # AI Consensus: get second opinion on high-conviction oracle trades
+        _ai_verdict = "APPROVE"
+        _conviction_score = int(yes_price * 100)
+        if _conviction_score >= 70 and OPENAI_API_KEY:
+            _ai_notes = [f"Oracle signal: {signal_name}", f"YES price: ${yes_price:.2f}",
+                         f"1h delta: {delta_1h:+.3f}", f"Trade: Long {sig['long']} / Short {sig['short']}"]
+            _rel_hl = _intel_get_relevant_headlines(signal_name, limit=2)
+            for _h in _rel_hl:
+                _ai_notes.append(f"Headline: {_h[:60]}")
+            _ai_verdict, _ai_reason = ai_get_second_opinion(
+                f"{sig['long']}/{sig['short']}", f"Long {sig['long']}/Short {sig['short']}",
+                _conviction_score, _ai_notes)
+            if _ai_verdict == "REJECT":
+                log.info("AI REJECT: %s — %s", signal_name, _ai_reason[:60])
+                continue
+            if _ai_verdict == "REDUCE":
+                leg_size *= 0.5
+                log.info("AI REDUCE: %s size halved — %s", signal_name, _ai_reason[:60])
+
         long_tk = sig["long"]
         short_tk = sig["short"]
 
@@ -9400,6 +9474,73 @@ def risk_run_all_checks():
     risk_check_correlations()
     risk_check_daily_drawdown()
     _RISK_STATE["last_check"] = datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# MULTI-MODEL CONSENSUS — AI second opinion on high-conviction trades
+# ---------------------------------------------------------------------------
+_AI_CONSENSUS_LOG = []  # [{timestamp, ticker, score, verdict, reasoning, executed}]
+
+
+def ai_get_second_opinion(ticker, direction, confidence, context_notes):
+    """Query Claude/GPT for a second opinion on a trade. Returns (verdict, reasoning).
+    Verdict: APPROVE, REJECT, or REDUCE."""
+    if not OPENAI_API_KEY:
+        return "APPROVE", "No AI key configured — auto-approve"
+
+    prompt = (
+        f"You are a risk manager reviewing a trade recommendation.\n"
+        f"Ticker: {ticker}\n"
+        f"Direction: {direction}\n"
+        f"Confidence score: {confidence}/100\n"
+        f"Context:\n{chr(10).join(context_notes[:8])}\n\n"
+        f"Based on this information, should we execute this trade?\n"
+        f"Reply with exactly one of: APPROVE, REJECT, or REDUCE\n"
+        f"Then on the next line, explain your reasoning in 1-2 sentences."
+    )
+
+    try:
+        r = requests.post("https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 150, "temperature": 0.3,
+            }, timeout=15)
+
+        if r.status_code == 200:
+            reply = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            # Parse verdict from first line
+            first_line = reply.split("\n")[0].upper().strip()
+            if "REJECT" in first_line:
+                verdict = "REJECT"
+            elif "REDUCE" in first_line:
+                verdict = "REDUCE"
+            else:
+                verdict = "APPROVE"
+            reasoning = reply[len(first_line):].strip().lstrip("\n").strip()[:200]
+            if not reasoning:
+                reasoning = reply[:200]
+
+            _AI_CONSENSUS_LOG.append({
+                "timestamp": datetime.now(timezone.utc),
+                "ticker": ticker, "direction": direction,
+                "score": confidence, "verdict": verdict,
+                "reasoning": reasoning, "executed": verdict != "REJECT",
+            })
+            if len(_AI_CONSENSUS_LOG) > 50:
+                _AI_CONSENSUS_LOG.pop(0)
+
+            log.info("AI CONSENSUS: %s %s score=%d → %s: %s",
+                     ticker, direction, confidence, verdict, reasoning[:60])
+            return verdict, reasoning
+        else:
+            log.warning("AI CONSENSUS API error: %d", r.status_code)
+            return "APPROVE", f"API error {r.status_code} — auto-approve"
+
+    except Exception as e:
+        log.warning("AI CONSENSUS error: %s", e)
+        return "APPROVE", f"Error: {e} — auto-approve"
 
 
 # ---------------------------------------------------------------------------
