@@ -3273,10 +3273,16 @@ async def oracle_status_cmd(ctx):
         pos_lines.append(
             f"  {market:20s} ${cost:>6.0f} ${upnl:>+8.2f} prob={_prob:.2f} age={age_h:.0f}h {price_info}")
 
+    # Intel context
+    geo_state = _intel_get_geo_state()
+    _total_hl = sum(len(v) for v in _INTEL_HEADLINE_MEMORY.values())
+
     msg = "**Oracle Engine Status**\n```\n"
     msg += f"Positions: {len(pos_lines)} / {ORACLE_CONFIG['max_oracle_positions']} max\n"
     msg += f"Oracle P&L: ${total_oracle_pnl:+,.2f}\n"
     msg += f"Signals tracked: {len(prices)} markets\n"
+    _geo_str = f"ELEVATED ({geo_state['theme']}, {geo_state['count']} hits)" if geo_state["active"] else "normal"
+    msg += f"Geo risk: {_geo_str} | Headlines: {_total_hl}\n"
     msg += f"{'─' * 50}\n"
 
     if signal_lines:
@@ -3294,6 +3300,18 @@ async def oracle_status_cmd(ctx):
 
     msg += "```"
     await ctx.send(msg)
+
+    # Second message: recent headlines per theme
+    _hl_msg = ""
+    for theme in sorted(_INTEL_HEADLINE_MEMORY.keys()):
+        entries = _INTEL_HEADLINE_MEMORY[theme]
+        if not entries:
+            continue
+        recent = sorted(entries, key=lambda x: x[0], reverse=True)[:2]
+        _hl_msg += f"**{theme}**: "
+        _hl_msg += " | ".join(h[:60] for _, h in recent) + "\n"
+    if _hl_msg:
+        await ctx.send(f"**Intel Headlines:**\n{_hl_msg[:1900]}")
 
 @bot.command(name="paper-reset")
 async def paper_reset_cmd(ctx, amount: float = 10000):
@@ -7202,6 +7220,139 @@ ORACLE_SIGNALS = [
 # Price history: {market_title_lower: [(timestamp, yes_price), ...]}
 _ORACLE_PRICE_HISTORY = {}
 
+# ---------------------------------------------------------------------------
+# INTELLIGENCE LAYER — Meteorologist + Geopolitical Monitor
+# ---------------------------------------------------------------------------
+
+# Rolling headline memory: {theme: [(timestamp, title_str), ...]}
+_INTEL_HEADLINE_MEMORY = {}
+# Geopolitical alert state: {"active": bool, "theme": str, "count": int, "since": datetime}
+_INTEL_GEO_STATE = {"active": False, "theme": "", "count": 0, "since": None, "notified": False}
+
+# Theme → search queries for Google News RSS
+_INTEL_THEMES = {
+    "fed":        ["federal reserve interest rate", "fed funds rate decision"],
+    "iran":       ["iran military", "iran ceasefire", "iran nuclear deal"],
+    "tariff":     ["tariffs trade war", "import tariffs increase"],
+    "recession":  ["US recession economy", "recession indicators GDP"],
+    "china":      ["china taiwan", "china sanctions", "china trade"],
+    "ukraine":    ["ukraine russia war", "ukraine ceasefire"],
+}
+
+# Escalation keywords — weighted heavier in geo monitor
+_GEO_ESCALATION_KEYWORDS = [
+    "attack", "missile", "invasion", "sanctions", "ceasefire",
+    "nuclear", "troops", "strike", "bomb", "war", "military",
+    "deploy", "retaliat", "escalat", "mobiliz", "blockade",
+]
+
+
+def _intel_fetch_headlines():
+    """Meteorologist Agent: fetch top headlines for each Oracle theme via Google News RSS.
+    Stores in rolling 2-hour memory. Returns total headlines fetched."""
+    import xml.etree.ElementTree as ET
+    now = datetime.now(timezone.utc)
+    cutoff = now - __import__("datetime").timedelta(hours=2)
+    total = 0
+
+    for theme, queries in _INTEL_THEMES.items():
+        if theme not in _INTEL_HEADLINE_MEMORY:
+            _INTEL_HEADLINE_MEMORY[theme] = []
+
+        # Prune old entries
+        _INTEL_HEADLINE_MEMORY[theme] = [
+            (t, h) for t, h in _INTEL_HEADLINE_MEMORY[theme] if t > cutoff]
+
+        # Fetch headlines for first query (rotate could be added later)
+        query = queries[0]
+        try:
+            url = f"https://news.google.com/rss/search?q={query.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
+            r = requests.get(url, timeout=8, headers={"User-Agent": "TraderJoes/1.0"})
+            if r.status_code == 200:
+                root = ET.fromstring(r.content)
+                existing_titles = {h.lower() for _, h in _INTEL_HEADLINE_MEMORY[theme]}
+                for item in root.findall(".//item")[:10]:
+                    title_el = item.find("title")
+                    if title_el is not None and title_el.text:
+                        title_text = title_el.text.strip()
+                        if title_text.lower() not in existing_titles:
+                            _INTEL_HEADLINE_MEMORY[theme].append((now, title_text))
+                            existing_titles.add(title_text.lower())
+                            total += 1
+        except Exception as e:
+            log.warning("INTEL fetch %s: %s", theme, e)
+
+    return total
+
+
+def _intel_get_relevant_headlines(signal_name, limit=3):
+    """Return top N recent headlines relevant to an Oracle signal."""
+    # Map signal names to themes
+    theme_map = {
+        "fed_hike": "fed", "fed_cut": "fed",
+        "iran_ceasefire": "iran", "iran_attack": "iran",
+        "tariff": "tariff", "recession": "recession",
+    }
+    theme = theme_map.get(signal_name, "")
+    if not theme:
+        return []
+
+    headlines = _INTEL_HEADLINE_MEMORY.get(theme, [])
+    # Sort by recency, return most recent
+    headlines.sort(key=lambda x: x[0], reverse=True)
+    return [h for _, h in headlines[:limit]]
+
+
+def _intel_geo_monitor(channel_notify=None):
+    """Geopolitical Monitor: detect escalation spikes across themes.
+    Returns True if geo risk is elevated (3+ escalation headlines in 1h on same theme)."""
+    now = datetime.now(timezone.utc)
+    one_hour_ago = now - __import__("datetime").timedelta(hours=1)
+    state = _INTEL_GEO_STATE
+
+    worst_theme = ""
+    worst_count = 0
+
+    for theme, entries in _INTEL_HEADLINE_MEMORY.items():
+        # Count escalation keywords in last hour's headlines
+        recent = [(t, h) for t, h in entries if t > one_hour_ago]
+        esc_count = 0
+        for _, headline in recent:
+            hl = headline.lower()
+            if sum(1 for kw in _GEO_ESCALATION_KEYWORDS if kw in hl) >= 1:
+                esc_count += 1
+        if esc_count > worst_count:
+            worst_count = esc_count
+            worst_theme = theme
+
+    was_active = state["active"]
+
+    if worst_count >= 3:
+        state["active"] = True
+        state["theme"] = worst_theme
+        state["count"] = worst_count
+        if not state["since"]:
+            state["since"] = now
+        if not was_active:
+            state["notified"] = False
+            log.warning("GEO ESCALATION: %s — %d escalation headlines in 1h, sizing tightened to 0.5%%",
+                        worst_theme, worst_count)
+    else:
+        if was_active:
+            log.info("GEO DE-ESCALATION: %s risk subsided (%d headlines)", state["theme"], worst_count)
+        state["active"] = False
+        state["theme"] = worst_theme if worst_count > 0 else ""
+        state["count"] = worst_count
+        state["since"] = None
+        state["notified"] = False
+
+    return state["active"]
+
+
+def _intel_get_geo_state():
+    """Return current geopolitical alert state for display."""
+    return _INTEL_GEO_STATE.copy()
+
 
 def _oracle_match_signal(market_title):
     """Match a market title against ORACLE_SIGNALS. Returns matching signal or None."""
@@ -7273,6 +7424,35 @@ async def scan_oracle_signals(channel=None):
         cutoff = now - __import__("datetime").timedelta(hours=2)
         _ORACLE_PRICE_HISTORY[key] = [(t, p) for t, p in _ORACLE_PRICE_HISTORY[key] if t > cutoff]
 
+    # --- Intelligence Layer: fetch headlines + geo monitor ---
+    try:
+        _intel_count = _intel_fetch_headlines()
+        if _intel_count > 0:
+            log.info("INTEL: fetched %d new headlines across %d themes", _intel_count, len(_INTEL_HEADLINE_MEMORY))
+    except Exception as _ie:
+        log.warning("INTEL headline fetch error: %s", _ie)
+
+    geo_elevated = False
+    try:
+        geo_elevated = _intel_geo_monitor()
+        geo_state = _intel_get_geo_state()
+        if geo_elevated and not geo_state.get("notified") and channel:
+            _INTEL_GEO_STATE["notified"] = True
+            # Get sample headlines
+            _geo_theme = geo_state.get("theme", "")
+            _geo_headlines = _INTEL_HEADLINE_MEMORY.get(_geo_theme, [])
+            _geo_recent = sorted(_geo_headlines, key=lambda x: x[0], reverse=True)[:3]
+            _geo_hl_str = "\n".join(f"  • {h[:70]}" for _, h in _geo_recent)
+            try:
+                await channel.send(
+                    f"**GEO ESCALATION ALERT** — {_geo_theme.upper()}\n"
+                    f"{geo_state['count']} escalation headlines in 1h — sizing tightened to 0.5%\n"
+                    f"{_geo_hl_str}")
+            except Exception:
+                pass
+    except Exception as _ge:
+        log.warning("INTEL geo monitor error: %s", _ge)
+
     # Count existing oracle positions
     oracle_count = sum(1 for p in PAPER_PORTFOLIO.get("positions", [])
                        if p.get("strategy") == "oracle_trade")
@@ -7321,10 +7501,11 @@ async def scan_oracle_signals(channel=None):
         if old_prices:
             delta_1h = yes_price - old_prices[-1][1]
 
-        # Half-Kelly sizing at 0.75% base
+        # Half-Kelly sizing at 0.75% base (tightened to 0.5% during geo escalation)
         portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
             p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
-        base_size = portfolio_value * ORACLE_CONFIG["base_size_pct"]
+        _size_pct = 0.005 if geo_elevated else ORACLE_CONFIG["base_size_pct"]
+        base_size = portfolio_value * _size_pct
         # Scale by conviction: higher probability & larger delta = more size
         kelly_mult = min(yes_price * (1 + abs(delta_1h) * 5), 2.0)
         leg_size = base_size * kelly_mult
@@ -7447,10 +7628,19 @@ async def scan_oracle_signals(channel=None):
                      signal_name, yes_price, long_tk, short_tk, total_cost)
             if channel:
                 try:
-                    await channel.send(
+                    _trade_msg = (
                         f"**ORACLE TRADE** — {signal_name}\n"
                         f"Signal: {title[:50]} YES=${yes_price:.2f} (Δ1h={delta_1h:+.3f})\n"
                         f"Long {long_tk} / Short {short_tk} | ${total_cost:.0f}")
+                    # Attach relevant headlines from Intelligence Layer
+                    _rel_hl = _intel_get_relevant_headlines(signal_name, limit=3)
+                    if _rel_hl:
+                        _trade_msg += "\n**Why:**"
+                        for _hl in _rel_hl:
+                            _trade_msg += f"\n  • {_hl[:80]}"
+                    if geo_elevated:
+                        _trade_msg += f"\n⚠ Geo risk elevated — sizing at 0.5%"
+                    await channel.send(_trade_msg)
                 except Exception:
                     pass
         except Exception as _oe:
