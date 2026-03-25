@@ -3307,6 +3307,22 @@ async def paper_pnl_cmd(ctx):
                         price_src = f"${live_price:,.2f}"
             elif strategy == "crash_hedge_put":
                 _opt_sym = pos.get("option_symbol", "")
+                # Reconstruct OCC symbol from market string if missing
+                if not _opt_sym and "PUT $" in market:
+                    try:
+                        import re as _occ_re
+                        _strike_match = _occ_re.search(r'PUT \$(\d+)', market)
+                        if _strike_match:
+                            _strike = float(_strike_match.group(1))
+                            _ts_str = pos.get("timestamp", "")
+                            if _ts_str:
+                                _entry_dt = datetime.strptime(_ts_str, "%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc)
+                                _exp = _entry_dt + __import__("datetime").timedelta(days=7)
+                                while _exp.weekday() >= 5:
+                                    _exp += __import__("datetime").timedelta(days=1)
+                                _opt_sym = _build_options_symbol("SPY", _exp, _strike, "P")
+                    except Exception:
+                        pass
                 if _opt_sym:
                     _oq = _pnl_req.get(f"https://data.alpaca.markets/v1beta1/options/quotes/latest?symbols={_opt_sym}",
                                        headers=_alp_hdr, timeout=5)
@@ -10055,6 +10071,21 @@ async def run_exit_manager(channel=None):
             elif strategy == "crash_hedge_put":
                 # Fetch option price from Alpaca options API
                 _opt_sym = pos.get("option_symbol", "")
+                if not _opt_sym and "PUT $" in market:
+                    try:
+                        import re as _occ_re2
+                        _sm = _occ_re2.search(r'PUT \$(\d+)', market)
+                        if _sm:
+                            _st = float(_sm.group(1))
+                            _ts2 = pos.get("timestamp", "")
+                            if _ts2:
+                                _edt = datetime.strptime(_ts2, "%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc)
+                                _exp2 = _edt + __import__("datetime").timedelta(days=7)
+                                while _exp2.weekday() >= 5:
+                                    _exp2 += __import__("datetime").timedelta(days=1)
+                                _opt_sym = _build_options_symbol("SPY", _exp2, _st, "P")
+                    except Exception:
+                        pass
                 if _opt_sym:
                     _oq = _pr.get(f"https://data.alpaca.markets/v1beta1/options/quotes/latest?symbols={_opt_sym}",
                                   headers={"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}, timeout=5)
