@@ -3710,6 +3710,49 @@ async def tv_signals_cmd(ctx):
     await ctx.send(msg)
 
 
+@bot.command(name="risk-status")
+async def risk_status_cmd(ctx):
+    """Show risk management state: correlations, drawdowns, pauses."""
+    risk_run_all_checks()
+
+    msg = "**Risk Management Status**\n```\n"
+
+    # Correlation flags
+    flags = _RISK_STATE.get("corr_flags", [])
+    msg += f"Correlated positions (>80%): {len(flags)}\n"
+    for t1, t2, c in flags[:5]:
+        msg += f"  {t1}/{t2}: {c:.2f} — BLOCKED\n"
+    if not flags:
+        msg += "  None — all clear\n"
+
+    msg += f"{'─' * 42}\n"
+
+    # Daily drawdown
+    dd = _RISK_STATE.get("daily_drawdown", {})
+    msg += f"Daily P&L by strategy:\n"
+    for strat, pnl in sorted(dd.items()):
+        _warn = " ⚠" if pnl < -_RISK_STATE["drawdown_limit"] else ""
+        msg += f"  {strat:18s} ${pnl:>+8.2f}{_warn}\n"
+    if not dd:
+        msg += "  No closed trades today\n"
+
+    msg += f"{'─' * 42}\n"
+
+    # Pauses
+    pauses = _RISK_STATE.get("strategy_pauses", {})
+    msg += f"Active pauses: {len(pauses)}\n"
+    for strat, until in pauses.items():
+        _remaining = (until - datetime.now(timezone.utc)).total_seconds() / 3600
+        msg += f"  {strat:18s} {_remaining:.1f}h remaining\n"
+    if not pauses:
+        msg += "  None — all strategies active\n"
+
+    msg += f"{'─' * 42}\n"
+    msg += f"Drawdown limit: ${_RISK_STATE['drawdown_limit']}/strategy/day\n"
+    msg += "```"
+    await ctx.send(msg)
+
+
 @bot.command(name="security-status")
 async def security_status(ctx):
     """Show security status including hostname, circuit breaker, key rotation."""
@@ -4063,6 +4106,24 @@ async def alert_scan_task():
                     log.info("Oracle engine fired %d signals this cycle", _oracle_fired)
             except Exception as _oerr:
                 log.warning("Oracle engine error: %s", _oerr)
+            # === RISK MANAGEMENT AGENT (every cycle) ===
+            try:
+                risk_run_all_checks()
+                _pauses = _RISK_STATE.get("strategy_pauses", {})
+                if _pauses:
+                    _risk_ch = bot.get_channel(int(DISCORD_CHANNEL_ID)) if DISCORD_CHANNEL_ID else None
+                    for _ps, _pt in list(_pauses.items()):
+                        if _risk_ch and _RISK_STATE.get(f"_notified_{_ps}") is None:
+                            _RISK_STATE[f"_notified_{_ps}"] = True
+                            try:
+                                await _risk_ch.send(
+                                    f"**RISK PAUSE** — {_ps}\n"
+                                    f"Daily drawdown: ${_RISK_STATE['daily_drawdown'].get(_ps, 0):+.2f}\n"
+                                    f"Paused until: {_pt.strftime('%H:%M UTC')}")
+                            except Exception:
+                                pass
+            except Exception as _rkerr:
+                log.warning("Risk agent error: %s", _rkerr)
             # === OPTIONS THETA HARVEST (market hours, after crash hedge) ===
             if is_market_open():
                 try:
@@ -8105,6 +8166,11 @@ async def scan_oracle_signals(channel=None):
         if old_prices:
             delta_1h = yes_price - old_prices[-1][1]
 
+        # Risk gate
+        if risk_is_strategy_paused("oracle_trade"):
+            log.info("RISK BLOCK: oracle_trade strategy paused")
+            continue
+
         # Half-Kelly sizing at 0.75% base (tightened to 0.5% during geo escalation)
         portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
             p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
@@ -9188,6 +9254,132 @@ def get_equities_exposure(positions, total_portfolio):
 
 # --- PAIRS TRADING ENGINE ---
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# RISK MANAGEMENT AGENT — Correlation, drawdown, strategy pauses
+# ---------------------------------------------------------------------------
+_RISK_STATE = {
+    "corr_flags": [],        # [(ticker_a, ticker_b, corr)] — high correlation pairs
+    "strategy_pauses": {},   # {strategy: pause_until_datetime}
+    "daily_drawdown": {},    # {strategy: today's realized pnl}
+    "drawdown_limit": 200,   # $200 per strategy per day
+    "last_check": None,
+}
+
+
+def risk_check_correlations():
+    """Check correlation between open positions. Flag >80% correlated pairs."""
+    positions = PAPER_PORTFOLIO.get("positions", [])
+    tickers = []
+    for p in positions:
+        ll = p.get("long_leg", "")
+        sl = p.get("short_leg", "")
+        if ll:
+            tickers.append(ll)
+        if sl:
+            tickers.append(sl)
+        mkt = p.get("market", "")
+        if mkt.startswith("TV:"):
+            tickers.append(mkt.replace("TV:", ""))
+
+    tickers = list(set(t.upper() for t in tickers if t))
+    if len(tickers) < 2:
+        _RISK_STATE["corr_flags"] = []
+        return
+
+    flags = []
+    try:
+        import yfinance as yf
+        import numpy as np
+        data = yf.download(tickers, period="60d", progress=False)
+        if hasattr(data, "Close"):
+            closes = data["Close"].dropna(axis=1)
+            if len(closes.columns) >= 2:
+                corr_matrix = closes.corr()
+                checked = set()
+                for i, t1 in enumerate(corr_matrix.columns):
+                    for j, t2 in enumerate(corr_matrix.columns):
+                        if i >= j:
+                            continue
+                        pair = tuple(sorted([str(t1), str(t2)]))
+                        if pair in checked:
+                            continue
+                        checked.add(pair)
+                        c = float(corr_matrix.iloc[i, j])
+                        if abs(c) > 0.80:
+                            flags.append((str(t1), str(t2), c))
+    except Exception as e:
+        log.warning("RISK corr check error: %s", e)
+
+    _RISK_STATE["corr_flags"] = flags
+    if flags:
+        log.info("RISK: %d correlated pairs flagged: %s",
+                 len(flags), ", ".join(f"{a}/{b}={c:.2f}" for a, b, c in flags[:3]))
+
+
+def risk_check_daily_drawdown():
+    """Check realized P&L per strategy today. Pause strategies exceeding limit."""
+    now = datetime.now(timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+
+    try:
+        import sqlite3 as _rsq
+        conn = _rsq.connect(DB_PATH)
+        rows = conn.execute("""
+            SELECT strategy, SUM(realized_pnl) as dd
+            FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL
+            AND closed_at >= ? GROUP BY strategy
+        """, (today,)).fetchall()
+        conn.close()
+
+        dd_by_strat = {}
+        for strategy, dd in rows:
+            if strategy and dd is not None:
+                dd_by_strat[strategy] = dd
+
+        _RISK_STATE["daily_drawdown"] = dd_by_strat
+
+        limit = _RISK_STATE["drawdown_limit"]
+        for strat, dd in dd_by_strat.items():
+            if dd < -limit and strat not in _RISK_STATE["strategy_pauses"]:
+                pause_until = now + __import__("datetime").timedelta(hours=24)
+                _RISK_STATE["strategy_pauses"][strat] = pause_until
+                log.warning("RISK PAUSE: %s lost $%.2f today (limit $%d) — paused 24h",
+                            strat, dd, limit)
+
+    except Exception as e:
+        log.warning("RISK drawdown check error: %s", e)
+
+    # Clean expired pauses
+    expired = [s for s, t in _RISK_STATE["strategy_pauses"].items() if now > t]
+    for s in expired:
+        del _RISK_STATE["strategy_pauses"][s]
+        log.info("RISK UNPAUSE: %s pause expired", s)
+
+
+def risk_is_strategy_paused(strategy):
+    """Check if a strategy is currently paused due to drawdown."""
+    pause_until = _RISK_STATE["strategy_pauses"].get(strategy)
+    if pause_until and datetime.now(timezone.utc) < pause_until:
+        return True
+    return False
+
+
+def risk_is_correlated_blocked(ticker):
+    """Check if a ticker would create concentration risk with existing positions."""
+    ticker = ticker.upper()
+    for t1, t2, c in _RISK_STATE.get("corr_flags", []):
+        if ticker in (t1, t2):
+            return True, f"{t1}/{t2} corr={c:.2f}"
+    return False, ""
+
+
+def risk_run_all_checks():
+    """Run all risk checks. Call every cycle."""
+    risk_check_correlations()
+    risk_check_daily_drawdown()
+    _RISK_STATE["last_check"] = datetime.now(timezone.utc)
+
+
 # PSYCHOLOGIST AGENT — Sentiment regime from Fear & Greed
 # ---------------------------------------------------------------------------
 _PSYCH_STATE = {
@@ -9784,6 +9976,16 @@ def scan_pairs_opportunities():
                          ticker_a, ticker_b, _hist_stats["reversion_rate"] * 100,
                          _hist_stats["avg_reversion_days"], _hist_stats["max_adverse_z"],
                          _hist_stats["sample_size"], _hist_mult)
+            # Risk Management: check strategy pause and correlation
+            if risk_is_strategy_paused("pairs"):
+                log.info("RISK BLOCK: pairs strategy paused")
+                continue
+            _corr_blocked, _corr_reason = risk_is_correlated_blocked(ticker_a)
+            if not _corr_blocked:
+                _corr_blocked, _corr_reason = risk_is_correlated_blocked(ticker_b)
+            if _corr_blocked:
+                log.info("RISK BLOCK: %s/%s concentration risk (%s)", ticker_a, ticker_b, _corr_reason)
+                continue
             # Monte Carlo Agent: simulate spread paths
             _mc = montecarlo_simulate(ticker_a, ticker_b, entry_zscore=zscore, horizon_days=7)
             _mc_mult, _mc_skip = montecarlo_size_adjustment(_mc)
