@@ -3443,6 +3443,23 @@ async def auto_paper_execute(channel, opp):
             return False
     except Exception:
         pass
+    # === CRYPTO COOLDOWN (4h after close, mirrors pairs cooldown) ===
+    if _mkey.startswith("CRYPTO:"):
+        try:
+            _cdconn = sqlite3.connect(DB_PATH)
+            _cdc = _cdconn.cursor()
+            _cdc.execute("SELECT closed_at FROM positions WHERE market_id=? AND status='closed' ORDER BY closed_at DESC LIMIT 1", (_mkey,))
+            _cdrow = _cdc.fetchone()
+            _cdconn.close()
+            if _cdrow and _cdrow[0]:
+                import datetime as _dt_cd
+                _cdt = _dt_cd.datetime.fromisoformat(_cdrow[0]).replace(tzinfo=_dt_cd.timezone.utc)
+                _cd_mins = (_dt_cd.datetime.now(_dt_cd.timezone.utc) - _cdt).total_seconds() / 60
+                if _cd_mins < 240:  # 4 hour cooldown
+                    log.info("CRYPTO COOLDOWN: %s closed %.0f min ago (need 240)", _mkey, _cd_mins)
+                    return False
+        except Exception:
+            pass
     # === MEMORY DEDUP ===
     _mkey_ticker = _mkey.replace("CRYPTO:", "") if _mkey.startswith("CRYPTO:") else None
     for _p in PAPER_PORTFOLIO.get("positions", []):
@@ -7126,6 +7143,9 @@ async def run_exit_manager(channel=None):
             continue
         age_hours = (now - entry_time).total_seconds() / 3600
         strategy = pos.get("strategy", "prediction")
+        # Fix: detect crypto by platform for legacy positions with wrong strategy label
+        if pos.get("platform", "").lower() == "crypto" and strategy not in ("crypto", "momentum"):
+            strategy = "crypto"
         market = pos.get("market", "")
 
         # --- Fetch current price for strategies with live feeds ---
@@ -7151,7 +7171,7 @@ async def run_exit_manager(channel=None):
                             current_price = pos.get("cost", 0) + _lpnl + _spnl
                             log.info("PAIRS PRICE: %s/%s long=$%.2f short=$%.2f net=$%.2f", _ll, _sl, _lpnl, _spnl, _lpnl + _spnl)
             elif strategy in ("crypto", "momentum"):
-                _tk = market.replace("CRYPTO:", "")
+                _tk = market.replace("CRYPTO:", "").split()[0]
                 _rc = _pr.get(f"https://api.coinbase.com/v2/prices/{_tk}-USD/spot", timeout=5)
                 if _rc.status_code == 200:
                     _spot = float(_rc.json().get("data", {}).get("amount", 0))
@@ -7458,10 +7478,28 @@ def scan_pairs_opportunities():
                         log.warning("ALPACA LONG FAILED: %s HTTP %d: %s", _long_tk, _rl.status_code, _rl.text[:200])
                         continue  # Skip this pair entirely
 
-                    # Short leg — sell short market order
+                    # Short leg — sell short market order (whole shares required)
+                    import math as _math
+                    _short_price = 0
+                    try:
+                        _data_hdr_s = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+                        _sq = _ep_req.get(f"https://data.alpaca.markets/v2/stocks/{_short_tk}/quotes/latest", headers=_data_hdr_s, timeout=5)
+                        if _sq.status_code == 200:
+                            _short_price = float(_sq.json().get("quote", {}).get("ap", 0) or 0)
+                    except Exception:
+                        pass
+                    _short_shares = _math.floor(_pair_size / _short_price) if _short_price > 0 else 0
+                    if _short_shares < 1:
+                        log.warning("ALPACA SHORT SKIP: %s — %d shares at $%.2f (notional=$%.2f)", _short_tk, _short_shares, _short_price, _pair_size)
+                        try:
+                            _ep_req.delete(f"{_alpaca_orders_url}/{_long_order_id}", headers=_ep_hdr, timeout=5)
+                            log.info("ALPACA CANCEL LONG: %s (short shares=0)", _long_order_id)
+                        except Exception:
+                            pass
+                        continue
                     _short_body = {
                         "symbol": _short_tk,
-                        "notional": str(round(_pair_size, 2)),
+                        "qty": str(_short_shares),
                         "side": "sell",
                         "type": "market",
                         "time_in_force": "day",
