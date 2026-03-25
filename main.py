@@ -4238,6 +4238,23 @@ def send_critical_alert(subject, message):
     return sms_ok or email_ok
 
 
+@bot.command(name="vol-skew")
+async def vol_skew_cmd(ctx):
+    """Show put/call IV skew on SPY and QQQ."""
+    msg = await ctx.send("Scanning volatility skew...")
+    result = "**Volatility Skew Scanner**\n```\n"
+    for underlying in ["SPY", "QQQ"]:
+        sk = vol_skew_scan(underlying)
+        if sk.get("available"):
+            result += (f"{underlying}: Put IV={sk['put_iv']:.2f} Call IV={sk['call_iv']:.2f} "
+                       f"Skew={sk['skew_pct']:+.1f}%\n")
+            result += f"  → {sk['recommendation']}\n"
+        else:
+            result += f"{underlying}: Data unavailable\n"
+    result += "```"
+    await msg.edit(content=result)
+
+
 @bot.command(name="alert-test")
 async def alert_test_cmd(ctx):
     """Test SMS and email alert channels."""
@@ -10687,6 +10704,70 @@ def engineer_self_improve():
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# VOLATILITY SKEW SCANNER — Put/Call IV analysis for options strategy
+# ---------------------------------------------------------------------------
+_VOL_SKEW_CACHE = {}  # {underlying: {"put_iv": x, "call_iv": y, "skew": z, "ts": datetime}}
+
+
+def vol_skew_scan(underlying="SPY"):
+    """Fetch options chain and calculate put/call IV skew. Returns skew dict."""
+    now = datetime.now(timezone.utc)
+    cached = _VOL_SKEW_CACHE.get(underlying)
+    if cached and (now - cached["ts"]).total_seconds() < 1800:
+        return cached
+
+    result = {"put_iv": 0, "call_iv": 0, "skew": 0, "skew_pct": 0,
+              "recommendation": "neutral", "available": False, "ts": now}
+    try:
+        hdrs = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+        expiry = datetime.now(timezone.utc) + __import__("datetime").timedelta(days=7)
+        while expiry.weekday() >= 5:
+            expiry += __import__("datetime").timedelta(days=1)
+        _or = requests.get(f"https://data.alpaca.markets/v1beta1/options/snapshots/{underlying}",
+                           headers=hdrs, params={"feed": "indicative", "expiration_date": expiry.strftime("%Y-%m-%d")},
+                           timeout=10)
+        if _or.status_code != 200:
+            _VOL_SKEW_CACHE[underlying] = result
+            return result
+
+        snapshots = _or.json().get("snapshots", {})
+        put_ivs = []
+        call_ivs = []
+        for sym, snap in snapshots.items():
+            iv = float(snap.get("greeks", {}).get("implied_volatility", 0) or 0)
+            if iv <= 0:
+                continue
+            if "P" in sym[-9:-8]:  # Put
+                put_ivs.append(iv)
+            elif "C" in sym[-9:-8]:  # Call
+                call_ivs.append(iv)
+
+        if put_ivs and call_ivs:
+            avg_put = sum(put_ivs) / len(put_ivs)
+            avg_call = sum(call_ivs) / len(call_ivs)
+            skew = avg_put - avg_call
+            skew_pct = (skew / avg_call * 100) if avg_call > 0 else 0
+
+            if skew_pct > 40:
+                rec = "SKIP — panic put buying"
+            elif skew_pct > 20:
+                rec = "SELL CALL SPREADS (not puts)"
+            elif skew_pct > 0:
+                rec = "SELL PUT SPREADS (normal skew)"
+            else:
+                rec = "SELL PUT SPREADS (calls expensive)"
+
+            result = {"put_iv": avg_put, "call_iv": avg_call, "skew": skew,
+                      "skew_pct": skew_pct, "recommendation": rec,
+                      "available": True, "ts": now, "n_puts": len(put_ivs), "n_calls": len(call_ivs)}
+    except Exception as e:
+        log.warning("VOL SKEW %s error: %s", underlying, e)
+
+    _VOL_SKEW_CACHE[underlying] = result
+    return result
+
+
 # MASTER ARBITER — Conflict resolution matrix for ALL trades
 # ---------------------------------------------------------------------------
 
