@@ -9294,6 +9294,13 @@ async def scan_oracle_signals(channel=None):
             except Exception:
                 pass
 
+            # Minimum leg size floor — too many reductions can compound to dust
+            _MIN_ORACLE_LEG = 50
+            if leg_size < _MIN_ORACLE_LEG:
+                log.info("ORACLE SIZE FLOOR: %s $%.0f < $%d min — skipping",
+                         signal_name, leg_size, _MIN_ORACLE_LEG)
+                continue
+
             # AI Consensus: get second opinion on high-conviction oracle trades
             _ai_verdict = "APPROVE"
             _conviction_score = int(yes_price * 100)
