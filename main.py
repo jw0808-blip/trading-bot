@@ -3557,8 +3557,8 @@ async def oracle_status_cmd(ctx):
     # Build signal status table
     signal_lines = []
     for title, yes_price in prices.items():
-        sig = _oracle_match_signal(title)
-        if not sig:
+        _all_sigs = _oracle_match_all_signals(title)
+        if not _all_sigs:
             continue
         # Calculate 1-hour delta
         key = title.lower()
@@ -3566,20 +3566,21 @@ async def oracle_status_cmd(ctx):
         one_hour_ago = now - __import__("datetime").timedelta(hours=1)
         old = [(t, p) for t, p in history if t <= one_hour_ago]
         delta = yes_price - old[-1][1] if old else 0.0
-        _inv = sig.get("inverse", False)
-        if _inv:
-            _geo_gs = _intel_get_geo_state()
-            _geo_ok = _geo_gs.get("active") and _geo_gs.get("theme") == sig.get("geo_required", "")
-            status = "ACTIVE" if yes_price <= sig["threshold"] and _geo_ok else "watch"
-            signal_lines.append(
-                f"  {sig['name']:16s} YES=${yes_price:.2f} Δ1h={delta:+.3f} "
-                f"inv<{sig['threshold']:.2f} {status:6s} → {sig['long']}/{sig['short']}"
-                f"{' +GEO' if _geo_ok else ''}")
-        else:
-            status = "ACTIVE" if yes_price >= sig["threshold"] else "below"
-            signal_lines.append(
-                f"  {sig['name']:16s} YES=${yes_price:.2f} Δ1h={delta:+.3f} "
-                f"thr={sig['threshold']:.2f} {status:6s} → {sig['long']}/{sig['short']}")
+        for sig in _all_sigs:
+            _inv = sig.get("inverse", False)
+            if _inv:
+                _geo_gs = _intel_get_geo_state()
+                _geo_ok = _geo_gs.get("active") and _geo_gs.get("theme") == sig.get("geo_required", "")
+                status = "ACTIVE" if yes_price <= sig["threshold"] and _geo_ok else "watch"
+                signal_lines.append(
+                    f"  {sig['name']:16s} YES=${yes_price:.2f} Δ1h={delta:+.3f} "
+                    f"inv<{sig['threshold']:.2f} {status:6s} → {sig['long']}/{sig['short']}"
+                    f"{' +GEO' if _geo_ok else ''}")
+            else:
+                status = "ACTIVE" if yes_price >= sig["threshold"] else "below"
+                signal_lines.append(
+                    f"  {sig['name']:16s} YES=${yes_price:.2f} Δ1h={delta:+.3f} "
+                    f"thr={sig['threshold']:.2f} {status:6s} → {sig['long']}/{sig['short']}")
 
     # Oracle positions with live P&L
     _alp_hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
@@ -9098,13 +9099,18 @@ def _intel_get_geo_state():
 
 
 def _oracle_match_signal(market_title):
-    """Match a market title against ORACLE_SIGNALS. Returns matching signal or None."""
+    """Match a market title against ORACLE_SIGNALS. Returns first matching signal or None."""
     title_lower = market_title.lower()
     for sig in ORACLE_SIGNALS:
-        # All keywords must be present in the title
         if all(kw in title_lower for kw in sig["keywords"]):
             return sig
     return None
+
+
+def _oracle_match_all_signals(market_title):
+    """Match a market title against ALL ORACLE_SIGNALS. Returns list of matching signals."""
+    title_lower = market_title.lower()
+    return [sig for sig in ORACLE_SIGNALS if all(kw in title_lower for kw in sig["keywords"])]
 
 
 def _oracle_get_all_prices():
@@ -9205,246 +9211,247 @@ async def scan_oracle_signals(channel=None):
 
     fired = 0
     for title, yes_price in prices.items():
-        sig = _oracle_match_signal(title)
-        if not sig:
+        _all_sigs = _oracle_match_all_signals(title)
+        if not _all_sigs:
             continue
-        # Threshold check: normal signals fire above threshold, inverse fire below
-        _is_inverse = sig.get("inverse", False)
-        if _is_inverse:
-            if yes_price > sig["threshold"]:
-                continue  # Inverse: only fire when prob DROPS below threshold
-            # Check geo requirement
-            _geo_req = sig.get("geo_required", "")
-            _geo_min = sig.get("geo_min_headlines", 0)
-            if _geo_req:
-                _gs = _intel_get_geo_state()
-                if not _gs.get("active") or _gs.get("theme", "") != _geo_req or _gs.get("count", 0) < _geo_min:
-                    continue  # Geo not escalated enough
-        else:
-            if yes_price < sig["threshold"]:
-                continue
-
-        signal_name = sig["name"]
-        market_id = f"ORACLE:{signal_name}"
-
-        # Dedup: already open?
-        if any(p.get("market", "") == market_id for p in PAPER_PORTFOLIO.get("positions", [])):
-            continue
-
-        # Cooldown: check SQLite for recently closed
-        try:
-            import sqlite3 as _osq
-            _oc = _osq.connect(DB_PATH)
-            _ocr = _oc.cursor()
-            _ocr.execute("SELECT closed_at FROM positions WHERE market_id=? AND status='closed' ORDER BY closed_at DESC LIMIT 1", (market_id,))
-            _orow = _ocr.fetchone()
-            _oc.close()
-            if _orow and _orow[0]:
-                _oct = datetime.fromisoformat(_orow[0]).replace(tzinfo=timezone.utc)
-                _omins = (now - _oct).total_seconds() / 60
-                if _omins < ORACLE_CONFIG["cooldown_hours"] * 60:
-                    log.info("ORACLE COOLDOWN: %s closed %.0f min ago", signal_name, _omins)
+        for sig in _all_sigs:
+            # Threshold check: normal signals fire above threshold, inverse fire below
+            _is_inverse = sig.get("inverse", False)
+            if _is_inverse:
+                if yes_price > sig["threshold"]:
+                    continue  # Inverse: only fire when prob DROPS below threshold
+                # Check geo requirement
+                _geo_req = sig.get("geo_required", "")
+                _geo_min = sig.get("geo_min_headlines", 0)
+                if _geo_req:
+                    _gs = _intel_get_geo_state()
+                    if not _gs.get("active") or _gs.get("theme", "") != _geo_req or _gs.get("count", 0) < _geo_min:
+                        continue  # Geo not escalated enough
+            else:
+                if yes_price < sig["threshold"]:
                     continue
-        except Exception:
-            pass
 
-        # Calculate 1-hour delta
-        key = title.lower()
-        delta_1h = 0.0
-        history = _ORACLE_PRICE_HISTORY.get(key, [])
-        one_hour_ago = now - __import__("datetime").timedelta(hours=1)
-        old_prices = [(t, p) for t, p in history if t <= one_hour_ago]
-        if old_prices:
-            delta_1h = yes_price - old_prices[-1][1]
+            signal_name = sig["name"]
+            market_id = f"ORACLE:{signal_name}"
 
-        # Risk gate
-        if risk_is_strategy_paused("oracle_trade"):
-            log.info("RISK BLOCK: oracle_trade strategy paused")
-            continue
-
-        # Half-Kelly sizing at 0.75% base (tightened to 0.5% during geo escalation)
-        portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
-            p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
-        _size_pct = 0.005 if geo_elevated else ORACLE_CONFIG["base_size_pct"]
-        base_size = portfolio_value * _size_pct
-        # Scale by conviction: higher probability & larger delta = more size
-        kelly_mult = min(yes_price * (1 + abs(delta_1h) * 5), 2.0)
-        leg_size = base_size * kelly_mult * psychologist_size_multiplier() * meta_alloc_multiplier("oracle_trade")
-
-        if leg_size < 10:
-            continue
-
-        # Monte Carlo validation on oracle trade legs
-        try:
-            _mc_o = montecarlo_simulate(sig["long"], sig["short"], horizon_days=5)
-            if _mc_o.get("available"):
-                _mc_o_mult, _mc_o_skip = montecarlo_size_adjustment(_mc_o)
-                if _mc_o_skip:
-                    log.info("MC SKIP ORACLE: %s prob=%.0f%%", signal_name, _mc_o["prob_profit"] * 100)
-                    continue
-                leg_size *= _mc_o_mult
-                log.info("MC ORACLE: %s prob=%.0f%% → %.1fx", signal_name, _mc_o["prob_profit"] * 100, _mc_o_mult)
-        except Exception:
-            pass
-
-        # AI Consensus: get second opinion on high-conviction oracle trades
-        _ai_verdict = "APPROVE"
-        _conviction_score = int(yes_price * 100)
-        if _conviction_score >= 70 and OPENAI_API_KEY:
-            _ai_notes = [f"Oracle signal: {signal_name}", f"YES price: ${yes_price:.2f}",
-                         f"1h delta: {delta_1h:+.3f}", f"Trade: Long {sig['long']} / Short {sig['short']}"]
-            _rel_hl = _intel_get_relevant_headlines(signal_name, limit=2)
-            for _h in _rel_hl:
-                _ai_notes.append(f"Headline: {_h[:60]}")
-            _ai_verdict, _ai_reason = ai_get_second_opinion(
-                f"{sig['long']}/{sig['short']}", f"Long {sig['long']}/Short {sig['short']}",
-                _conviction_score, _ai_notes)
-            if _ai_verdict == "REJECT":
-                log.info("AI REJECT: %s — %s", signal_name, _ai_reason[:60])
+            # Dedup: already open?
+            if any(p.get("market", "") == market_id for p in PAPER_PORTFOLIO.get("positions", [])):
                 continue
-            if _ai_verdict == "REDUCE":
-                leg_size *= 0.5
-                log.info("AI REDUCE: %s size halved — %s", signal_name, _ai_reason[:60])
 
-        long_tk = sig["long"]
-        short_tk = sig["short"]
-
-        log.info("ORACLE SIGNAL: %s YES=$%.2f (Δ1h=%+.3f) → Long %s / Short %s | $%.0f/leg",
-                 signal_name, yes_price, delta_1h, long_tk, short_tk, leg_size)
-
-        # Execute both legs via Alpaca
-        import math as _omath
-        _alp_hdr = {
-            "APCA-API-KEY-ID": ALPACA_API_KEY,
-            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
-            "Content-Type": "application/json",
-        }
-        _alp_url = f"{ALPACA_BASE_URL}/v2/orders"
-        _data_hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
-
-        try:
-            # Long leg — buy with notional
-            _long_body = {
-                "symbol": long_tk, "notional": str(round(leg_size, 2)),
-                "side": "buy", "type": "market", "time_in_force": "day",
-            }
-            _rl = requests.post(_alp_url, json=_long_body, headers=_alp_hdr, timeout=10)
-            if _rl.status_code not in (200, 201):
-                log.warning("ORACLE LONG FAILED: %s HTTP %d: %s", long_tk, _rl.status_code, _rl.text[:200])
-                continue
-            _long_oid = _rl.json().get("id", "unknown")
-            log.info("ORACLE LONG ORDER: %s id=%s", long_tk, _long_oid)
-
-            # Short leg — whole shares only
-            _short_price = 0
+            # Cooldown: check SQLite for recently closed
             try:
-                _sq = requests.get(f"https://data.alpaca.markets/v2/stocks/{short_tk}/quotes/latest",
-                                   headers=_data_hdr, timeout=5)
-                if _sq.status_code == 200:
-                    _short_price = float(_sq.json().get("quote", {}).get("ap", 0) or 0)
-            except Exception:
-                pass
-            _short_shares = _omath.floor(leg_size / _short_price) if _short_price > 0 else 0
-            if _short_shares < 1:
-                log.warning("ORACLE SHORT SKIP: %s — 0 shares at $%.2f", short_tk, _short_price)
-                try:
-                    requests.delete(f"{_alp_url}/{_long_oid}", headers=_alp_hdr, timeout=5)
-                except Exception:
-                    pass
-                continue
-
-            _short_body = {
-                "symbol": short_tk, "qty": str(_short_shares),
-                "side": "sell", "type": "market", "time_in_force": "day",
-            }
-            _rs = requests.post(_alp_url, json=_short_body, headers=_alp_hdr, timeout=10)
-            if _rs.status_code not in (200, 201):
-                log.warning("ORACLE SHORT FAILED: %s HTTP %d: %s — cancelling long", short_tk, _rs.status_code, _rs.text[:200])
-                try:
-                    requests.delete(f"{_alp_url}/{_long_oid}", headers=_alp_hdr, timeout=5)
-                except Exception:
-                    pass
-                continue
-            _short_oid = _rs.json().get("id", "unknown")
-            log.info("ORACLE SHORT ORDER: %s id=%s", short_tk, _short_oid)
-
-            # Get fill prices
-            _entry_long_price = 0
-            _entry_short_price = 0
-            try:
-                _ql = requests.get(f"https://data.alpaca.markets/v2/stocks/{long_tk}/quotes/latest", headers=_data_hdr, timeout=5)
-                if _ql.status_code == 200:
-                    _entry_long_price = float(_ql.json().get("quote", {}).get("ap", 0) or 0)
-                _entry_short_price = _short_price  # Already fetched
+                import sqlite3 as _osq
+                _oc = _osq.connect(DB_PATH)
+                _ocr = _oc.cursor()
+                _ocr.execute("SELECT closed_at FROM positions WHERE market_id=? AND status='closed' ORDER BY closed_at DESC LIMIT 1", (market_id,))
+                _orow = _ocr.fetchone()
+                _oc.close()
+                if _orow and _orow[0]:
+                    _oct = datetime.fromisoformat(_orow[0]).replace(tzinfo=timezone.utc)
+                    _omins = (now - _oct).total_seconds() / 60
+                    if _omins < ORACLE_CONFIG["cooldown_hours"] * 60:
+                        log.info("ORACLE COOLDOWN: %s closed %.0f min ago", signal_name, _omins)
+                        continue
             except Exception:
                 pass
 
-            total_cost = leg_size * 2
-            if total_cost > PAPER_PORTFOLIO.get("cash", 0):
-                log.warning("ORACLE: insufficient cash $%.0f for $%.0f trade", PAPER_PORTFOLIO.get("cash", 0), total_cost)
+            # Calculate 1-hour delta
+            key = title.lower()
+            delta_1h = 0.0
+            history = _ORACLE_PRICE_HISTORY.get(key, [])
+            one_hour_ago = now - __import__("datetime").timedelta(hours=1)
+            old_prices = [(t, p) for t, p in history if t <= one_hour_ago]
+            if old_prices:
+                delta_1h = yes_price - old_prices[-1][1]
+
+            # Risk gate
+            if risk_is_strategy_paused("oracle_trade"):
+                log.info("RISK BLOCK: oracle_trade strategy paused")
                 continue
 
-            PAPER_PORTFOLIO["cash"] -= total_cost
-            _oracle_pos = {
-                "market": market_id,
-                "side": f"Long {long_tk} / Short {short_tk}",
-                "shares": 1, "entry_price": yes_price, "cost": total_cost,
-                "value": total_cost,
-                "timestamp": now.strftime("%Y-%m-%d %H:%M UTC"),
-                "platform": "Alpaca", "ev": delta_1h,
-                "strategy": "oracle_trade",
-                "long_leg": long_tk, "short_leg": short_tk,
-                "entry_long_price": _entry_long_price,
-                "entry_short_price": _entry_short_price,
-                "signal_threshold": sig["threshold"],
-                "source_market": title[:60],
-                "long_order_id": _long_oid,
-                "short_order_id": _short_oid,
-            }
-            PAPER_PORTFOLIO["positions"].append(_oracle_pos)
-            db_log_paper_trade(_oracle_pos)
-            db_open_position(
-                market_id=market_id, platform="Alpaca", strategy="oracle_trade",
-                direction=f"Long {long_tk} / Short {short_tk}",
-                size_usd=total_cost, shares=1, entry_price=yes_price,
-                long_leg=long_tk, short_leg=short_tk,
-                metadata={"signal": signal_name, "threshold": sig["threshold"],
-                          "yes_price": yes_price, "delta_1h": delta_1h,
-                          "source_market": title[:60],
-                          "long_order_id": _long_oid, "short_order_id": _short_oid,
-                          "entry_long_price": _entry_long_price,
-                          "entry_short_price": _entry_short_price},
-            )
+            # Half-Kelly sizing at 0.75% base (tightened to 0.5% during geo escalation)
+            portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
+                p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+            _size_pct = 0.005 if geo_elevated else ORACLE_CONFIG["base_size_pct"]
+            base_size = portfolio_value * _size_pct
+            # Scale by conviction: higher probability & larger delta = more size
+            kelly_mult = min(yes_price * (1 + abs(delta_1h) * 5), 2.0)
+            leg_size = base_size * kelly_mult * psychologist_size_multiplier() * meta_alloc_multiplier("oracle_trade")
 
-            fired += 1
-            log.info("ORACLE TRADE: %s | YES=$%.2f | Long %s / Short %s | $%.0f",
-                     signal_name, yes_price, long_tk, short_tk, total_cost)
-            # Store in echo memory
-            _geo_st = _intel_get_geo_state()
-            _hl = _intel_get_relevant_headlines(signal_name, limit=1)
-            echo_memory_store("oracle_trade", signal_name, signal_name, yes_price,
-                              "elevated" if _geo_st.get("active") else "normal",
-                              _hl[0] if _hl else "", "", 0,
-                              f"delta={delta_1h:+.3f} long={long_tk} short={short_tk} size=${total_cost:.0f}")
-            if channel:
+            if leg_size < 10:
+                continue
+
+            # Monte Carlo validation on oracle trade legs
+            try:
+                _mc_o = montecarlo_simulate(sig["long"], sig["short"], horizon_days=5)
+                if _mc_o.get("available"):
+                    _mc_o_mult, _mc_o_skip = montecarlo_size_adjustment(_mc_o)
+                    if _mc_o_skip:
+                        log.info("MC SKIP ORACLE: %s prob=%.0f%%", signal_name, _mc_o["prob_profit"] * 100)
+                        continue
+                    leg_size *= _mc_o_mult
+                    log.info("MC ORACLE: %s prob=%.0f%% → %.1fx", signal_name, _mc_o["prob_profit"] * 100, _mc_o_mult)
+            except Exception:
+                pass
+
+            # AI Consensus: get second opinion on high-conviction oracle trades
+            _ai_verdict = "APPROVE"
+            _conviction_score = int(yes_price * 100)
+            if _conviction_score >= 70 and OPENAI_API_KEY:
+                _ai_notes = [f"Oracle signal: {signal_name}", f"YES price: ${yes_price:.2f}",
+                             f"1h delta: {delta_1h:+.3f}", f"Trade: Long {sig['long']} / Short {sig['short']}"]
+                _rel_hl = _intel_get_relevant_headlines(signal_name, limit=2)
+                for _h in _rel_hl:
+                    _ai_notes.append(f"Headline: {_h[:60]}")
+                _ai_verdict, _ai_reason = ai_get_second_opinion(
+                    f"{sig['long']}/{sig['short']}", f"Long {sig['long']}/Short {sig['short']}",
+                    _conviction_score, _ai_notes)
+                if _ai_verdict == "REJECT":
+                    log.info("AI REJECT: %s — %s", signal_name, _ai_reason[:60])
+                    continue
+                if _ai_verdict == "REDUCE":
+                    leg_size *= 0.5
+                    log.info("AI REDUCE: %s size halved — %s", signal_name, _ai_reason[:60])
+
+            long_tk = sig["long"]
+            short_tk = sig["short"]
+
+            log.info("ORACLE SIGNAL: %s YES=$%.2f (Δ1h=%+.3f) → Long %s / Short %s | $%.0f/leg",
+                     signal_name, yes_price, delta_1h, long_tk, short_tk, leg_size)
+
+            # Execute both legs via Alpaca
+            import math as _omath
+            _alp_hdr = {
+                "APCA-API-KEY-ID": ALPACA_API_KEY,
+                "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+                "Content-Type": "application/json",
+            }
+            _alp_url = f"{ALPACA_BASE_URL}/v2/orders"
+            _data_hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+
+            try:
+                # Long leg — buy with notional
+                _long_body = {
+                    "symbol": long_tk, "notional": str(round(leg_size, 2)),
+                    "side": "buy", "type": "market", "time_in_force": "day",
+                }
+                _rl = requests.post(_alp_url, json=_long_body, headers=_alp_hdr, timeout=10)
+                if _rl.status_code not in (200, 201):
+                    log.warning("ORACLE LONG FAILED: %s HTTP %d: %s", long_tk, _rl.status_code, _rl.text[:200])
+                    continue
+                _long_oid = _rl.json().get("id", "unknown")
+                log.info("ORACLE LONG ORDER: %s id=%s", long_tk, _long_oid)
+
+                # Short leg — whole shares only
+                _short_price = 0
                 try:
-                    _trade_msg = (
-                        f"**ORACLE TRADE** — {signal_name}\n"
-                        f"Signal: {title[:50]} YES=${yes_price:.2f} (Δ1h={delta_1h:+.3f})\n"
-                        f"Long {long_tk} / Short {short_tk} | ${total_cost:.0f}")
-                    # Attach relevant headlines from Intelligence Layer
-                    _rel_hl = _intel_get_relevant_headlines(signal_name, limit=3)
-                    if _rel_hl:
-                        _trade_msg += "\n**Why:**"
-                        for _hl in _rel_hl:
-                            _trade_msg += f"\n  • {_hl[:80]}"
-                    if geo_elevated:
-                        _trade_msg += f"\n⚠ Geo risk elevated — sizing at 0.5%"
-                    await channel.send(_trade_msg)
+                    _sq = requests.get(f"https://data.alpaca.markets/v2/stocks/{short_tk}/quotes/latest",
+                                       headers=_data_hdr, timeout=5)
+                    if _sq.status_code == 200:
+                        _short_price = float(_sq.json().get("quote", {}).get("ap", 0) or 0)
                 except Exception:
                     pass
-        except Exception as _oe:
-            log.warning("Oracle execution error for %s: %s", signal_name, _oe)
+                _short_shares = _omath.floor(leg_size / _short_price) if _short_price > 0 else 0
+                if _short_shares < 1:
+                    log.warning("ORACLE SHORT SKIP: %s — 0 shares at $%.2f", short_tk, _short_price)
+                    try:
+                        requests.delete(f"{_alp_url}/{_long_oid}", headers=_alp_hdr, timeout=5)
+                    except Exception:
+                        pass
+                    continue
+
+                _short_body = {
+                    "symbol": short_tk, "qty": str(_short_shares),
+                    "side": "sell", "type": "market", "time_in_force": "day",
+                }
+                _rs = requests.post(_alp_url, json=_short_body, headers=_alp_hdr, timeout=10)
+                if _rs.status_code not in (200, 201):
+                    log.warning("ORACLE SHORT FAILED: %s HTTP %d: %s — cancelling long", short_tk, _rs.status_code, _rs.text[:200])
+                    try:
+                        requests.delete(f"{_alp_url}/{_long_oid}", headers=_alp_hdr, timeout=5)
+                    except Exception:
+                        pass
+                    continue
+                _short_oid = _rs.json().get("id", "unknown")
+                log.info("ORACLE SHORT ORDER: %s id=%s", short_tk, _short_oid)
+
+                # Get fill prices
+                _entry_long_price = 0
+                _entry_short_price = 0
+                try:
+                    _ql = requests.get(f"https://data.alpaca.markets/v2/stocks/{long_tk}/quotes/latest", headers=_data_hdr, timeout=5)
+                    if _ql.status_code == 200:
+                        _entry_long_price = float(_ql.json().get("quote", {}).get("ap", 0) or 0)
+                    _entry_short_price = _short_price  # Already fetched
+                except Exception:
+                    pass
+
+                total_cost = leg_size * 2
+                if total_cost > PAPER_PORTFOLIO.get("cash", 0):
+                    log.warning("ORACLE: insufficient cash $%.0f for $%.0f trade", PAPER_PORTFOLIO.get("cash", 0), total_cost)
+                    continue
+
+                PAPER_PORTFOLIO["cash"] -= total_cost
+                _oracle_pos = {
+                    "market": market_id,
+                    "side": f"Long {long_tk} / Short {short_tk}",
+                    "shares": 1, "entry_price": yes_price, "cost": total_cost,
+                    "value": total_cost,
+                    "timestamp": now.strftime("%Y-%m-%d %H:%M UTC"),
+                    "platform": "Alpaca", "ev": delta_1h,
+                    "strategy": "oracle_trade",
+                    "long_leg": long_tk, "short_leg": short_tk,
+                    "entry_long_price": _entry_long_price,
+                    "entry_short_price": _entry_short_price,
+                    "signal_threshold": sig["threshold"],
+                    "source_market": title[:60],
+                    "long_order_id": _long_oid,
+                    "short_order_id": _short_oid,
+                }
+                PAPER_PORTFOLIO["positions"].append(_oracle_pos)
+                db_log_paper_trade(_oracle_pos)
+                db_open_position(
+                    market_id=market_id, platform="Alpaca", strategy="oracle_trade",
+                    direction=f"Long {long_tk} / Short {short_tk}",
+                    size_usd=total_cost, shares=1, entry_price=yes_price,
+                    long_leg=long_tk, short_leg=short_tk,
+                    metadata={"signal": signal_name, "threshold": sig["threshold"],
+                              "yes_price": yes_price, "delta_1h": delta_1h,
+                              "source_market": title[:60],
+                              "long_order_id": _long_oid, "short_order_id": _short_oid,
+                              "entry_long_price": _entry_long_price,
+                              "entry_short_price": _entry_short_price},
+                )
+
+                fired += 1
+                log.info("ORACLE TRADE: %s | YES=$%.2f | Long %s / Short %s | $%.0f",
+                         signal_name, yes_price, long_tk, short_tk, total_cost)
+                # Store in echo memory
+                _geo_st = _intel_get_geo_state()
+                _hl = _intel_get_relevant_headlines(signal_name, limit=1)
+                echo_memory_store("oracle_trade", signal_name, signal_name, yes_price,
+                                  "elevated" if _geo_st.get("active") else "normal",
+                                  _hl[0] if _hl else "", "", 0,
+                                  f"delta={delta_1h:+.3f} long={long_tk} short={short_tk} size=${total_cost:.0f}")
+                if channel:
+                    try:
+                        _trade_msg = (
+                            f"**ORACLE TRADE** — {signal_name}\n"
+                            f"Signal: {title[:50]} YES=${yes_price:.2f} (Δ1h={delta_1h:+.3f})\n"
+                            f"Long {long_tk} / Short {short_tk} | ${total_cost:.0f}")
+                        # Attach relevant headlines from Intelligence Layer
+                        _rel_hl = _intel_get_relevant_headlines(signal_name, limit=3)
+                        if _rel_hl:
+                            _trade_msg += "\n**Why:**"
+                            for _hl in _rel_hl:
+                                _trade_msg += f"\n  • {_hl[:80]}"
+                        if geo_elevated:
+                            _trade_msg += f"\n⚠ Geo risk elevated — sizing at 0.5%"
+                        await channel.send(_trade_msg)
+                    except Exception:
+                        pass
+            except Exception as _oe:
+                log.warning("Oracle execution error for %s: %s", signal_name, _oe)
 
     return fired
 
