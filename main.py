@@ -3468,7 +3468,22 @@ async def cycle_cmd(ctx, *, ticker: str = ""):
         except Exception:
             pass
 
-    # ── 5. Top 3 headlines from Meteorologist ──
+    # ── 5. Squeeze check (single tickers) ──
+    if not is_pair:
+        try:
+            _sq_cands = squeeze_scan()
+            for _sq in _sq_cands:
+                if _sq["ticker"] == tk_a:
+                    _si = _sq["short_interest"]
+                    _sp = _sq["squeeze_prob"]
+                    notes.append(f"SQUEEZE: SI={_si*100:.1f}% squeeze_prob={_sp*100:.0f}%")
+                    if _sp >= 0.40:
+                        signals.append(("LONG", int(_sp * 40), f"squeeze={_sp:.0%}"))
+                    break
+        except Exception:
+            pass
+
+    # ── 6. Top 3 headlines from Meteorologist ──
     _hl_found = False
     for theme, entries in _INTEL_HEADLINE_MEMORY.items():
         if not entries:
@@ -3591,6 +3606,70 @@ async def montecarlo_cmd(ctx, ticker_a: str = "", ticker_b: str = ""):
     result += f"{'─' * 48}\n"
     result += f"Verdict: {verdict}\n"
     result += f"```"
+
+    await msg.edit(content=result)
+
+
+@bot.command(name="allocation-status")
+async def allocation_status_cmd(ctx):
+    """Show current meta-allocation pillar weights and 7-day P&L attribution."""
+    # Force a refresh
+    meta_alloc_refresh()
+
+    msg = "**Meta-Allocation Status**\n```\n"
+    msg += f"{'Strategy':<18s} {'Weight':>6s} {'7d PnL':>10s} {'Trades':>6s}\n"
+    msg += f"{'─' * 44}\n"
+
+    total_pnl = 0
+    total_trades = 0
+    for strat in sorted(_META_ALLOC.keys()):
+        weight = _META_ALLOC[strat]
+        pnl_data = _META_ALLOC_PNL.get(strat, {})
+        pnl = pnl_data.get("pnl", 0)
+        trades = pnl_data.get("trades", 0)
+        total_pnl += pnl
+        total_trades += trades
+        _tag = " ★" if weight > 1.0 else " ▼" if weight < 1.0 else ""
+        msg += f"  {strat:<16s} {weight:>5.1f}x ${pnl:>+9.2f} {trades:>5d}{_tag}\n"
+
+    msg += f"{'─' * 44}\n"
+    msg += f"  {'TOTAL':<16s}       ${total_pnl:>+9.2f} {total_trades:>5d}\n"
+
+    _last = _META_ALLOC_LAST_RUN
+    if _last:
+        _ago = (datetime.now(timezone.utc) - _last).total_seconds() / 3600
+        msg += f"\nLast rebalance: {_ago:.1f}h ago\n"
+    else:
+        msg += "\nNot yet rebalanced (need 4h of data)\n"
+
+    msg += "```"
+    msg += "\n★ = top performer (1.5x) | ▼ = underperformer (0.5x)"
+    await ctx.send(msg)
+
+
+@bot.command(name="squeeze-scan")
+async def squeeze_scan_cmd(ctx):
+    """Scan for short squeeze candidates: high SI + reversion signals."""
+    msg = await ctx.send("Scanning for short squeeze candidates...")
+
+    candidates = squeeze_scan()
+    if not candidates:
+        await msg.edit(content="**Squeeze Scan**: No candidates found (need shortable stocks with >15% SI)")
+        return
+
+    result = "**Short Squeeze Candidates**\n```\n"
+    result += f"{'Ticker':>6s} {'SI%':>6s} {'Price':>8s} {'Z-score':>8s} {'Pair':>6s} {'Sq Prob':>7s}\n"
+    result += f"{'─' * 48}\n"
+
+    for c in candidates[:8]:
+        _z_str = f"{c['zscore']:+.2f}" if c["zscore"] is not None else "  n/a"
+        _pair = c.get("pair_partner") or "—"
+        result += (f"  {c['ticker']:>4s} {c['short_interest']*100:>5.1f}% "
+                   f"${c['price']:>7.2f} {_z_str:>8s} {_pair:>6s} {c['squeeze_prob']*100:>5.0f}%\n")
+
+    result += f"{'─' * 48}\n"
+    result += f"SI > 15% + Z-score reversion = squeeze signal\n"
+    result += "```"
 
     await msg.edit(content=result)
 
@@ -3898,6 +3977,25 @@ async def alert_scan_task():
                         await _check_hedge_fn(_hedge_ch)
                 except Exception as hedge_err:
                     log.warning("Crash hedge scan error: %s", hedge_err)
+            # === META-ALLOCATION ENGINE (rebalances every 4h internally) ===
+            try:
+                _rebal = meta_alloc_refresh()
+                if _rebal:
+                    _alloc_ch = bot.get_channel(int(DISCORD_CHANNEL_ID)) if DISCORD_CHANNEL_ID else None
+                    if _alloc_ch:
+                        _alloc_msg = "**META-ALLOC Rebalanced**\n```\n"
+                        for _s, _w in sorted(_META_ALLOC.items()):
+                            _p = _META_ALLOC_PNL.get(_s, {})
+                            _pnl = _p.get("pnl", 0)
+                            _trades = _p.get("trades", 0)
+                            _alloc_msg += f"  {_s:16s} {_w:.1f}x  7d PnL: ${_pnl:>+8.2f} ({_trades} trades)\n"
+                        _alloc_msg += "```"
+                        try:
+                            await _alloc_ch.send(_alloc_msg)
+                        except Exception:
+                            pass
+            except Exception as _maerr:
+                log.warning("Meta-alloc error: %s", _maerr)
             # === PSYCHOLOGIST AGENT (every cycle) ===
             try:
                 _psych = psychologist_update()
@@ -7774,7 +7872,7 @@ async def scan_oracle_signals(channel=None):
         base_size = portfolio_value * _size_pct
         # Scale by conviction: higher probability & larger delta = more size
         kelly_mult = min(yes_price * (1 + abs(delta_1h) * 5), 2.0)
-        leg_size = base_size * kelly_mult * psychologist_size_multiplier()
+        leg_size = base_size * kelly_mult * psychologist_size_multiplier() * meta_alloc_multiplier("oracle_trade")
 
         if leg_size < 10:
             continue
@@ -8783,6 +8881,191 @@ def historian_size_multiplier(stats):
 
 
 # ---------------------------------------------------------------------------
+# DYNAMIC META-ALLOCATION ENGINE — Performance-weighted pillar sizing
+# ---------------------------------------------------------------------------
+_META_ALLOC = {
+    "pairs": 1.0, "crypto": 1.0, "prediction": 1.0,
+    "funding_arb": 1.0, "oracle_trade": 1.0, "crash_hedge_put": 1.0,
+}
+_META_ALLOC_LAST_RUN = None
+_META_ALLOC_PNL = {}  # {strategy: 7d_pnl} — refreshed every 4h
+
+
+def meta_alloc_refresh():
+    """Query SQLite for 7-day realized P&L by strategy. Rebalance pillar weights.
+    Top performer gets 1.5x, bottom gets 0.5x, rest stay 1.0x. Runs every 4 hours."""
+    global _META_ALLOC_LAST_RUN
+    now = datetime.now(timezone.utc)
+
+    # Only run every 4 hours
+    if _META_ALLOC_LAST_RUN and (now - _META_ALLOC_LAST_RUN).total_seconds() < 14400:
+        return False
+
+    _META_ALLOC_LAST_RUN = now
+
+    try:
+        import sqlite3 as _masq
+        conn = _masq.connect(DB_PATH)
+        seven_days_ago = (now - __import__("datetime").timedelta(days=7)).strftime("%Y-%m-%d")
+
+        rows = conn.execute("""
+            SELECT strategy, SUM(realized_pnl) as total_pnl, COUNT(*) as trades
+            FROM positions
+            WHERE status='closed' AND realized_pnl IS NOT NULL
+            AND closed_at >= ?
+            GROUP BY strategy
+        """, (seven_days_ago,)).fetchall()
+        conn.close()
+
+        if not rows:
+            return False
+
+        pnl_by_strat = {}
+        for strategy, total_pnl, trades in rows:
+            if strategy and total_pnl is not None:
+                pnl_by_strat[strategy] = {"pnl": total_pnl, "trades": trades}
+
+        _META_ALLOC_PNL.clear()
+        _META_ALLOC_PNL.update(pnl_by_strat)
+
+        if len(pnl_by_strat) < 2:
+            return False  # Need at least 2 strategies to compare
+
+        # Find top and bottom performers
+        sorted_strats = sorted(pnl_by_strat.items(), key=lambda x: x[1]["pnl"], reverse=True)
+        top_strat = sorted_strats[0][0]
+        bottom_strat = sorted_strats[-1][0]
+
+        # Reset all to 1.0, then adjust
+        for k in _META_ALLOC:
+            _META_ALLOC[k] = 1.0
+        if top_strat in _META_ALLOC:
+            _META_ALLOC[top_strat] = 1.5
+        if bottom_strat in _META_ALLOC and sorted_strats[-1][1]["pnl"] < 0:
+            _META_ALLOC[bottom_strat] = 0.5
+
+        log.info("META-ALLOC rebalanced: top=%s(1.5x, $%+.2f) bottom=%s(%.1fx, $%+.2f)",
+                 top_strat, sorted_strats[0][1]["pnl"],
+                 bottom_strat, _META_ALLOC[bottom_strat], sorted_strats[-1][1]["pnl"])
+        return True
+
+    except Exception as e:
+        log.warning("META-ALLOC error: %s", e)
+        return False
+
+
+def meta_alloc_multiplier(strategy):
+    """Return the current meta-allocation multiplier for a strategy."""
+    return _META_ALLOC.get(strategy, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# REVERSE COPY TRADING — Short squeeze detection
+# ---------------------------------------------------------------------------
+_SQUEEZE_CACHE = {"candidates": [], "fetched_at": None}
+
+
+def squeeze_scan():
+    """Scan for short squeeze candidates: high short interest + Z-score reversion signal.
+    Returns list of candidate dicts. Cached for 1 hour."""
+    now = datetime.now(timezone.utc)
+    if _SQUEEZE_CACHE["fetched_at"] and (now - _SQUEEZE_CACHE["fetched_at"]).total_seconds() < 3600:
+        return _SQUEEZE_CACHE["candidates"]
+
+    candidates = []
+
+    # Fetch most active/shorted stocks from Alpaca
+    try:
+        hdrs = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+        # Get all assets and filter for high short interest (Alpaca provides this for paper)
+        r = requests.get(f"{ALPACA_BASE_URL}/v2/assets", headers=hdrs,
+                         params={"status": "active", "asset_class": "us_equity"}, timeout=15)
+        if r.status_code != 200:
+            return candidates
+
+        assets = r.json()
+        # Filter for tradeable, shortable stocks
+        tradeable = [a for a in assets if a.get("tradable") and a.get("shortable")
+                     and a.get("easy_to_borrow") is False]  # Hard to borrow = likely high SI
+
+        # Check our pairs seed list tickers for short interest data via yfinance
+        import yfinance as yf
+        import numpy as np
+
+        # Check a focused set: our seed pairs tickers + popular squeeze targets
+        check_tickers = set()
+        for pos in PAPER_PORTFOLIO.get("positions", []):
+            for leg in (pos.get("long_leg", ""), pos.get("short_leg", "")):
+                if leg:
+                    check_tickers.add(leg.upper())
+        # Add well-known high-SI tickers
+        check_tickers.update(["GME", "AMC", "BBBY", "CVNA", "UPST", "RIVN", "LCID", "PLTR",
+                              "SOFI", "NIO", "SNAP", "COIN", "MARA", "RIOT", "SQ", "HOOD"])
+
+        for ticker in list(check_tickers)[:25]:
+            try:
+                info = yf.Ticker(ticker).info
+                short_pct = info.get("shortPercentOfFloat", 0) or 0
+                if short_pct < 0.15:  # Below 15% — not interesting
+                    continue
+
+                # Check for reversion signal: is this ticker in a pair with Z-score?
+                zscore_val = None
+                pair_partner = None
+                # Look up in seed pairs
+                _seed = globals().get("EQUITIES_CONFIG", {}).get("pairs", {}).get("seed", [])
+                for pa, pb in _seed:
+                    if ticker == pa:
+                        try:
+                            _, z, _ = calculate_pair_zscore(pa, pb, 252)
+                            if z is not None:
+                                zscore_val = z
+                                pair_partner = pb
+                        except Exception:
+                            pass
+                        break
+                    elif ticker == pb:
+                        try:
+                            _, z, _ = calculate_pair_zscore(pa, pb, 252)
+                            if z is not None:
+                                zscore_val = -z  # Flip for the B ticker perspective
+                                pair_partner = pa
+                        except Exception:
+                            pass
+                        break
+
+                # Calculate squeeze probability heuristic
+                # Higher SI + lower Z-score (beaten down) = higher squeeze prob
+                squeeze_prob = min(short_pct * 2, 0.5)  # Base from SI
+                if zscore_val is not None and zscore_val < -1.0:
+                    squeeze_prob += min(abs(zscore_val) * 0.1, 0.3)  # Bonus for reversion signal
+                squeeze_prob = min(squeeze_prob, 0.95)
+
+                price = info.get("currentPrice") or info.get("regularMarketPrice") or 0
+
+                candidates.append({
+                    "ticker": ticker,
+                    "short_interest": short_pct,
+                    "price": price,
+                    "zscore": zscore_val,
+                    "pair_partner": pair_partner,
+                    "squeeze_prob": squeeze_prob,
+                    "market_cap": info.get("marketCap", 0),
+                })
+            except Exception:
+                continue
+
+        candidates.sort(key=lambda x: x["squeeze_prob"], reverse=True)
+
+    except Exception as e:
+        log.warning("SQUEEZE-SCAN error: %s", e)
+
+    _SQUEEZE_CACHE["candidates"] = candidates[:10]
+    _SQUEEZE_CACHE["fetched_at"] = now
+    return candidates[:10]
+
+
+# ---------------------------------------------------------------------------
 # MONTE CARLO SIMULATION AGENT — Probability engine for trade decisions
 # ---------------------------------------------------------------------------
 _MC_CACHE = {}  # {cache_key: {"result": {...}, "fetched_at": datetime}}
@@ -9051,7 +9334,8 @@ def scan_pairs_opportunities():
                 _base_size = PAPER_PORTFOLIO.get("cash", 25000) * 0.015  # 1.5% per leg base
                 _kelly_mult = min((abs(zscore) / 2.0) * corr, 2.0)  # Half-Kelly scaling
                 _psych_mult = psychologist_size_multiplier()
-                _pair_size = _base_size * _kelly_mult * _hist_mult * _psych_mult * _mc_mult
+                _meta_mult = meta_alloc_multiplier("pairs")
+                _pair_size = _base_size * _kelly_mult * _hist_mult * _psych_mult * _mc_mult * _meta_mult
                 if direction == "short_a_long_b":
                     _long_tk, _short_tk = ticker_b, ticker_a
                 else:
