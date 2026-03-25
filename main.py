@@ -4179,6 +4179,39 @@ async def week_cmd(ctx):
         await msg.edit(content=f"Weekly summary error: {e}")
 
 
+@bot.command(name="pairs-scan")
+async def pairs_scan_cmd(ctx):
+    """Show discovered pairs by sector from S&P 500 scan."""
+    try:
+        import sqlite3 as _psq
+        conn = _psq.connect(DB_PATH)
+        rows = conn.execute("SELECT ticker_a, ticker_b, correlation, sector, discovered_at FROM pairs_discovery ORDER BY correlation DESC LIMIT 50").fetchall()
+        conn.close()
+    except Exception:
+        rows = []
+
+    if not rows:
+        await ctx.send("**Pairs Discovery**: No pairs found yet. Runs daily at market open.")
+        return
+
+    by_sector = {}
+    for t1, t2, corr, sector, dt in rows:
+        by_sector.setdefault(sector or "?", []).append((t1, t2, corr))
+
+    msg = f"**Discovered Pairs** ({len(rows)} total)\n```\n"
+    for sector in sorted(by_sector.keys()):
+        pairs = by_sector[sector]
+        msg += f"{sector[:25]}:\n"
+        for t1, t2, corr in pairs[:5]:
+            msg += f"  {t1:5s}/{t2:5s}  {corr:.3f}\n"
+        if len(pairs) > 5:
+            msg += f"  +{len(pairs)-5} more\n"
+    msg += "```"
+    if len(msg) > 1900:
+        msg = msg[:1900] + "\n```"
+    await ctx.send(msg)
+
+
 @bot.command(name="security-status")
 async def security_status(ctx):
     """Show security status including hostname, circuit breaker, key rotation."""
@@ -4333,6 +4366,11 @@ async def alert_scan_task():
         if not CYCLE_PAUSED and not COST_CONFIG.get("kill_switch", False):
             await check_and_send_alerts()
             push_all_analytics()  # push metrics each cycle
+            # === PAIRS DISCOVERY (runs daily, internally throttled) ===
+            try:
+                discover_sp500_pairs()
+            except Exception as _pderr:
+                log.warning("Pairs discovery error: %s", _pderr)
             # === PAIRS TRADING SCANNER (runs during market hours) ===
             if EQUITIES_ENABLED and is_market_open():
                 try:
@@ -8225,6 +8263,34 @@ def init_db():
             exit_reason TEXT,
             realized_pnl REAL DEFAULT 0
         )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS pairs_discovery (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker_a TEXT, ticker_b TEXT, correlation REAL,
+            sector TEXT, discovered_at TEXT,
+            UNIQUE(ticker_a, ticker_b) ON CONFLICT REPLACE
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS backtest_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy TEXT, days INTEGER, run_at TEXT,
+            total_trades INTEGER, win_rate REAL, total_pnl REAL,
+            avg_pnl REAL, sharpe REAL, max_drawdown REAL,
+            best_trade REAL, worst_trade REAL, metadata TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS shadow_positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            market_id TEXT, strategy TEXT, direction TEXT,
+            size_usd REAL, entry_price REAL,
+            status TEXT DEFAULT 'open', realized_pnl REAL DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now')),
+            closed_at TEXT, exit_reason TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS echo_memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT, theme TEXT, signal_name TEXT,
+            probability REAL, geo_level TEXT, headline TEXT,
+            trade_outcome TEXT, realized_pnl REAL,
+            context TEXT, created_at TEXT DEFAULT (datetime('now'))
+        )""")
         conn.commit()
         conn.close()
         log.info("SQLite initialized at %s", DB_PATH)
@@ -9875,6 +9941,112 @@ EQUITIES_CONFIG = {
         "ttl_hours": 72,
     },
 }
+
+_PAIRS_DISCOVERY_LAST_RUN = None
+
+def discover_sp500_pairs():
+    """Scan S&P 500 by GICS sector for high-correlation pairs.
+    Runs daily at 9:00 AM ET. Stores in SQLite, updates EQUITIES_CONFIG seed list."""
+    global _PAIRS_DISCOVERY_LAST_RUN
+    now = datetime.now(timezone.utc)
+    if _PAIRS_DISCOVERY_LAST_RUN and (now - _PAIRS_DISCOVERY_LAST_RUN).total_seconds() < 72000:
+        return 0  # Only run every ~20h
+
+    _PAIRS_DISCOVERY_LAST_RUN = now
+    log.info("PAIRS DISCOVERY: starting S&P 500 sector scan")
+
+    try:
+        import yfinance as yf
+        import numpy as np
+
+        # Fetch S&P 500 tickers by sector from Wikipedia
+        import io, csv
+        _sp_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        _sp_r = requests.get(_sp_url, timeout=15, headers={"User-Agent": "TraderJoes/1.0"})
+        if _sp_r.status_code != 200:
+            log.warning("PAIRS DISCOVERY: Wikipedia fetch failed %d", _sp_r.status_code)
+            return 0
+
+        # Parse HTML table for tickers and sectors
+        import re as _pd_re
+        _rows = _pd_re.findall(r'<td[^>]*><a[^>]*>([A-Z.]+)</a></td>\s*<td[^>]*>[^<]*</td>\s*<td[^>]*>([^<]+)</td>', _sp_r.text)
+        if not _rows:
+            # Fallback: simpler parse
+            _rows = _pd_re.findall(r'>([A-Z]{1,5})</a></td><td[^>]*>[^<]*</td><td[^>]*>([^<]+)</td>', _sp_r.text)
+
+        by_sector = {}
+        for ticker, sector in _rows:
+            ticker = ticker.replace(".", "-")  # BRK.B → BRK-B for yfinance
+            sector = sector.strip()
+            by_sector.setdefault(sector, []).append(ticker)
+
+        if not by_sector:
+            log.warning("PAIRS DISCOVERY: no sectors parsed")
+            return 0
+
+        log.info("PAIRS DISCOVERY: %d sectors, %d tickers", len(by_sector), sum(len(v) for v in by_sector.values()))
+
+        # For each sector, compute pairwise correlations (limit to top 15 tickers by market cap)
+        all_pairs = []
+        for sector, tickers in by_sector.items():
+            if len(tickers) < 2:
+                continue
+            _sample = tickers[:15]  # Limit to avoid huge downloads
+            try:
+                data = yf.download(_sample, period="252d", progress=False, threads=True)
+                if hasattr(data, "Close") and len(data) > 100:
+                    closes = data["Close"].dropna(axis=1, thresh=100)
+                    if len(closes.columns) < 2:
+                        continue
+                    corr_matrix = closes.corr()
+                    checked = set()
+                    for i, t1 in enumerate(corr_matrix.columns):
+                        for j, t2 in enumerate(corr_matrix.columns):
+                            if i >= j:
+                                continue
+                            pair = tuple(sorted([str(t1), str(t2)]))
+                            if pair in checked:
+                                continue
+                            checked.add(pair)
+                            c = float(corr_matrix.iloc[i, j])
+                            if c >= 0.85 and not np.isnan(c):
+                                all_pairs.append((str(t1), str(t2), c, sector))
+            except Exception as _se:
+                log.warning("PAIRS DISCOVERY: sector %s error: %s", sector[:20], _se)
+                continue
+
+        # Sort by correlation, take top 50
+        all_pairs.sort(key=lambda x: x[2], reverse=True)
+        top_pairs = all_pairs[:50]
+
+        if not top_pairs:
+            log.info("PAIRS DISCOVERY: no pairs found above 0.85 threshold")
+            return 0
+
+        # Store in SQLite
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            for t1, t2, corr, sector in top_pairs:
+                c.execute("INSERT OR REPLACE INTO pairs_discovery (ticker_a, ticker_b, correlation, sector, discovered_at) VALUES (?,?,?,?,?)",
+                          (t1, t2, corr, sector, now.strftime("%Y-%m-%d %H:%M")))
+            conn.commit()
+            conn.close()
+        except Exception as _de:
+            log.warning("PAIRS DISCOVERY: DB error: %s", _de)
+
+        # Update EQUITIES_CONFIG seed list
+        new_seed = [(t1, t2) for t1, t2, _, _ in top_pairs]
+        EQUITIES_CONFIG["pairs"]["seed"] = new_seed
+        log.info("PAIRS DISCOVERY: found %d pairs, updated seed list (%d sectors scanned)",
+                 len(top_pairs), len(by_sector))
+        _agent_log_event("pairs-discovery", f"Found {len(top_pairs)} pairs across {len(by_sector)} sectors")
+        return len(top_pairs)
+
+    except Exception as e:
+        log.warning("PAIRS DISCOVERY error: %s", e)
+        return 0
+
 
 def get_equities_exposure(positions, total_portfolio):
     """Calculate current equities exposure."""
