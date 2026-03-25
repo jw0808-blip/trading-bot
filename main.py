@@ -89,6 +89,10 @@ def db_open_position(market_id, platform, strategy, direction,
         row_id = c.lastrowid
         conn.commit(); conn.close()
         log.info("DB-OPEN: %s | %s | $%.2f", market_id, strategy, size_usd)
+        try:
+            shadow_open_position(market_id, strategy, direction, size_usd, entry_price)
+        except Exception:
+            pass
         return row_id
     except Exception as e:
         log.warning("db_open_position error: %s", e)
@@ -107,6 +111,10 @@ def db_close_position(market_id, exit_price, exit_reason, realized_pnl=0):
         conn.commit(); conn.close()
         if rows > 0:
             log.info("DB-CLOSE: %s | %s | pnl=$%.2f", market_id, exit_reason, realized_pnl)
+            try:
+                shadow_close_position(market_id, realized_pnl, exit_reason)
+            except Exception:
+                pass
         return rows > 0
     except Exception as e:
         log.warning("db_close_position error: %s", e)
@@ -4239,6 +4247,40 @@ async def alert_test_cmd(ctx):
     email_ok = send_email("Alert Test", "TraderJoes alert system operational.")
     results.append(f"Email: {'OK' if email_ok else 'FAILED' if SMTP_EMAIL else 'NOT CONFIGURED'}")
     await ctx.send(f"**Alert Test**\n" + "\n".join(results))
+
+
+@bot.command(name="shadow-pnl")
+async def shadow_pnl_cmd(ctx):
+    """Show shadow portfolio (10x) vs real performance."""
+    shadow_pnl, real_pnl = shadow_compare_performance()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        _s = conn.execute("SELECT COUNT(*), SUM(size_usd) FROM shadow_positions WHERE status='open'").fetchone()
+        _sc = conn.execute("SELECT COUNT(*) FROM shadow_positions WHERE status='closed'").fetchone()
+        conn.close()
+        s_open = _s[0] or 0
+        s_deployed = _s[1] or 0
+        s_closed = _sc[0] or 0
+    except Exception:
+        s_open = s_deployed = s_closed = 0
+
+    ratio = shadow_pnl / (real_pnl * 10) if real_pnl != 0 else 1.0
+    msg = f"**Shadow Portfolio (10x)**\n```\n"
+    msg += f"{'Shadow P&L (7d):':<22s} ${shadow_pnl:>+10,.2f}\n"
+    msg += f"{'Real P&L (7d):':<22s} ${real_pnl:>+10,.2f}\n"
+    msg += f"{'Shadow/Real ratio:':<22s} {ratio:>10.2f}x\n"
+    msg += f"{'Shadow open:':<22s} {s_open:>10d}\n"
+    msg += f"{'Shadow closed:':<22s} {s_closed:>10d}\n"
+    msg += f"{'Shadow deployed:':<22s} ${s_deployed:>10,.0f}\n"
+    msg += f"{'─' * 36}\n"
+    if shadow_pnl > real_pnl * 10 * 1.2:
+        msg += "Shadow outperforming by >20% — consider sizing up\n"
+    elif shadow_pnl < real_pnl * 10 * 0.8:
+        msg += "Shadow underperforming — current sizing is appropriate\n"
+    else:
+        msg += "Shadow and real tracking within 20%\n"
+    msg += "```"
+    await ctx.send(msg)
 
 
 @bot.command(name="performance")
@@ -10641,6 +10683,49 @@ def engineer_self_improve():
 
     except Exception as e:
         log.warning("ENGINEER error: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# SHADOW TRADING — 10x parallel portfolio for sizing validation
+# ---------------------------------------------------------------------------
+
+def shadow_open_position(market_id, strategy, direction, size_usd, entry_price):
+    """Open a shadow position at 10x the real size."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("INSERT INTO shadow_positions (market_id,strategy,direction,size_usd,entry_price,status) VALUES (?,?,?,?,?,'open')",
+                     (market_id, strategy, direction, size_usd * 10, entry_price))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.warning("Shadow open error: %s", e)
+
+
+def shadow_close_position(market_id, realized_pnl, exit_reason):
+    """Close a shadow position with 10x P&L."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("UPDATE shadow_positions SET status='closed', realized_pnl=?, exit_reason=?, closed_at=datetime('now') WHERE market_id=? AND status='open'",
+                     (realized_pnl * 10, exit_reason, market_id))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.warning("Shadow close error: %s", e)
+
+
+def shadow_compare_performance():
+    """Compare shadow vs real P&L over last 7 days. Returns (shadow_pnl, real_pnl, ratio)."""
+    try:
+        week_ago = (datetime.now(timezone.utc) - __import__("datetime").timedelta(days=7)).strftime("%Y-%m-%d")
+        conn = sqlite3.connect(DB_PATH)
+        _sr = conn.execute("SELECT SUM(realized_pnl) FROM shadow_positions WHERE status='closed' AND closed_at>=?", (week_ago,)).fetchone()
+        shadow_pnl = _sr[0] if _sr and _sr[0] else 0
+        _rr = conn.execute("SELECT SUM(realized_pnl) FROM positions WHERE status='closed' AND closed_at>=? AND realized_pnl IS NOT NULL", (week_ago,)).fetchone()
+        real_pnl = _rr[0] if _rr and _rr[0] else 0
+        conn.close()
+        return shadow_pnl, real_pnl
+    except Exception:
+        return 0, 0
 
 
 # PSYCHOLOGIST AGENT — Sentiment regime from Fear & Greed
