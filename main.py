@@ -4238,6 +4238,28 @@ def send_critical_alert(subject, message):
     return sms_ok or email_ok
 
 
+@bot.command(name="memory-query")
+async def memory_query_cmd(ctx, *, theme: str = ""):
+    """Query echo memory for historical patterns. Usage: !memory-query iran"""
+    if not theme:
+        await ctx.send("Usage: `!memory-query iran` or `!memory-query fed`")
+        return
+    events = echo_memory_query(theme, days=30, limit=10)
+    if not events:
+        await ctx.send(f"**Echo Memory**: No events for '{theme}' in last 30 days")
+        return
+    pattern = echo_memory_get_pattern(theme)
+    msg = f"**Echo Memory: {theme}**\n"
+    if pattern:
+        msg += f"> {pattern}\n"
+    msg += "```\n"
+    for e in events:
+        _pnl = f"${e['pnl']:+.2f}" if e.get("pnl") else "—"
+        msg += f"  [{e.get('date', '?')[:10]}] {e.get('event_type', '?'):12s} prob={e.get('prob', 0):.2f} {_pnl} {e.get('headline', '')[:40]}\n"
+    msg += "```"
+    await ctx.send(msg)
+
+
 @bot.command(name="vol-skew")
 async def vol_skew_cmd(ctx):
     """Show put/call IV skew on SPY and QQQ."""
@@ -9326,6 +9348,13 @@ async def scan_oracle_signals(channel=None):
             fired += 1
             log.info("ORACLE TRADE: %s | YES=$%.2f | Long %s / Short %s | $%.0f",
                      signal_name, yes_price, long_tk, short_tk, total_cost)
+            # Store in echo memory
+            _geo_st = _intel_get_geo_state()
+            _hl = _intel_get_relevant_headlines(signal_name, limit=1)
+            echo_memory_store("oracle_trade", signal_name, signal_name, yes_price,
+                              "elevated" if _geo_st.get("active") else "normal",
+                              _hl[0] if _hl else "", "", 0,
+                              f"delta={delta_1h:+.3f} long={long_tk} short={short_tk} size=${total_cost:.0f}")
             if channel:
                 try:
                     _trade_msg = (
@@ -10705,6 +10734,55 @@ def engineer_self_improve():
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# ECHO MARKET MEMORY — Historical event/outcome pattern matching
+# ---------------------------------------------------------------------------
+
+def echo_memory_store(event_type, theme, signal_name="", probability=0,
+                      geo_level="", headline="", trade_outcome="", realized_pnl=0, context=""):
+    """Store an event in echo memory for future pattern matching."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("INSERT INTO echo_memory (event_type,theme,signal_name,probability,geo_level,headline,trade_outcome,realized_pnl,context) VALUES (?,?,?,?,?,?,?,?,?)",
+                     (event_type, theme, signal_name, probability, geo_level, headline, trade_outcome, realized_pnl, context))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.warning("Echo memory store error: %s", e)
+
+
+def echo_memory_query(theme, days=30, limit=5):
+    """Query echo memory for similar past events. Returns list of event dicts."""
+    try:
+        cutoff = (datetime.now(timezone.utc) - __import__("datetime").timedelta(days=days)).strftime("%Y-%m-%d")
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute("""
+            SELECT event_type, theme, signal_name, probability, geo_level,
+                   headline, trade_outcome, realized_pnl, context, created_at
+            FROM echo_memory WHERE theme LIKE ? AND created_at >= ?
+            ORDER BY created_at DESC LIMIT ?
+        """, (f"%{theme}%", cutoff, limit)).fetchall()
+        conn.close()
+        return [{"event_type": r[0], "theme": r[1], "signal": r[2], "prob": r[3],
+                 "geo": r[4], "headline": r[5][:60] if r[5] else "", "outcome": r[6],
+                 "pnl": r[7], "context": r[8], "date": r[9]} for r in rows]
+    except Exception:
+        return []
+
+
+def echo_memory_get_pattern(theme):
+    """Summarize historical pattern for a theme. Returns summary string."""
+    events = echo_memory_query(theme, days=30, limit=20)
+    if not events:
+        return None
+    trades = [e for e in events if e.get("pnl") and e["pnl"] != 0]
+    if not trades:
+        return f"{len(events)} events in 30d, no trades"
+    wins = sum(1 for t in trades if t["pnl"] > 0)
+    total_pnl = sum(t["pnl"] for t in trades)
+    return f"Last 30d: {len(trades)} trades, {wins}/{len(trades)} wins, ${total_pnl:+.2f}"
+
+
 # VOLATILITY SKEW SCANNER — Put/Call IV analysis for options strategy
 # ---------------------------------------------------------------------------
 _VOL_SKEW_CACHE = {}  # {underlying: {"put_iv": x, "call_iv": y, "skew": z, "ts": datetime}}
