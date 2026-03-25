@@ -4479,6 +4479,24 @@ async def auto_paper_execute(channel, opp):
         release_trade_lock(opp.get("market", "")[:60])
         return False
 
+    # === MONTE CARLO VALIDATION (crypto and prediction entries) ===
+    _mc_ticker = opp.get("ticker", "")
+    if _mc_ticker and _is_crypto_opp:
+        try:
+            _mc = montecarlo_simulate(_mc_ticker, horizon_days=3)
+            if _mc.get("available"):
+                _mc_mult, _mc_skip = montecarlo_size_adjustment(_mc)
+                if _mc_skip:
+                    log.info("MC SKIP: %s prob=%.0f%% below 45%%", _mc_ticker, _mc["prob_profit"] * 100)
+                    release_trade_lock(opp.get("market", "")[:60])
+                    return False
+                if _mc_mult < 1.0:
+                    total_cost *= _mc_mult
+                    shares = max(1, int(shares * _mc_mult))
+                    log.info("MC REDUCE: %s prob=%.0f%% size %.1fx", _mc_ticker, _mc["prob_profit"] * 100, _mc_mult)
+        except Exception:
+            pass
+
     PAPER_PORTFOLIO["cash"] -= total_cost
     _side_label = "BUY_NO" if opp.get("side") == "NO" else "BUY"
     _pos_market = _mkey if "_mkey" in dir() and _mkey.startswith("CRYPTO:") else opp["market"][:60]
@@ -8259,6 +8277,19 @@ async def scan_oracle_signals(channel=None):
 
         if leg_size < 10:
             continue
+
+        # Monte Carlo validation on oracle trade legs
+        try:
+            _mc_o = montecarlo_simulate(sig["long"], sig["short"], horizon_days=5)
+            if _mc_o.get("available"):
+                _mc_o_mult, _mc_o_skip = montecarlo_size_adjustment(_mc_o)
+                if _mc_o_skip:
+                    log.info("MC SKIP ORACLE: %s prob=%.0f%%", signal_name, _mc_o["prob_profit"] * 100)
+                    continue
+                leg_size *= _mc_o_mult
+                log.info("MC ORACLE: %s prob=%.0f%% → %.1fx", signal_name, _mc_o["prob_profit"] * 100, _mc_o_mult)
+        except Exception:
+            pass
 
         # AI Consensus: get second opinion on high-conviction oracle trades
         _ai_verdict = "APPROVE"
