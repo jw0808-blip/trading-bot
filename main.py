@@ -293,7 +293,7 @@ GITHUB_REPO     = os.environ.get("GITHUB_REPO", "jw0808-blip/trading-bot")
 
 # Trading Mode
 TRADING_MODE    = os.environ.get("TRADING_MODE", "paper")
-DRY_RUN_MODE    = True  # Safe default: dry-run on
+DRY_RUN_MODE    = False  # Paper orders enabled (ALPACA_BASE_URL must be paper-api)
 PAPER_PORTFOLIO = {"cash": 10000.0, "positions": [], "trades": [], "pnl": 0.0}
 
 # OpenAI
@@ -2953,7 +2953,24 @@ async def paper_pnl_cmd(ctx):
                     if live_price > 0 and shares > 0:
                         upnl = (live_price * shares) - cost
                         price_src = f"${live_price:,.2f}"
-            elif strategy in ("crash_hedge_put", "crash_hedge_short"):
+            elif strategy == "crash_hedge_put":
+                _opt_sym = pos.get("option_symbol", "")
+                if _opt_sym:
+                    _oq = _pnl_req.get(f"https://data.alpaca.markets/v1beta1/options/quotes/latest?symbols={_opt_sym}",
+                                       headers=_alp_hdr, timeout=5)
+                    if _oq.status_code == 200:
+                        _odata = _oq.json().get("quotes", {}).get(_opt_sym, {})
+                        _ask = float(_odata.get("ap", 0) or 0)
+                        _bid = float(_odata.get("bp", 0) or 0)
+                        _opt_mid = (_bid + _ask) / 2 if _bid > 0 and _ask > 0 else (_ask or _bid)
+                        if _opt_mid > 0:
+                            _contracts = pos.get("contracts", 1)
+                            _opt_val = _opt_mid * 100 * _contracts
+                            upnl = _opt_val - cost
+                            price_src = f"${_opt_mid:.2f}/c"
+                if not price_src:
+                    price_src = "no option symbol"
+            elif strategy == "crash_hedge_short":
                 price_src = "no live feed"
             else:
                 # Prediction markets — use entry_price as current (hold to resolution)
@@ -7030,6 +7047,12 @@ async def check_crash_hedges(channel):
         if success:
             strike = round(spy_price * (1 - cfg["put_strike_offset"]), 0)
             size_usd = portfolio_value * cfg["put_size_pct"]
+            _expiry = datetime.now(timezone.utc) + __import__("datetime").timedelta(days=cfg["put_dte"])
+            _dtf = (4 - _expiry.weekday()) % 7
+            if _dtf == 0 and _expiry.hour > 16:
+                _dtf = 7
+            _expiry = _expiry + __import__("datetime").timedelta(days=_dtf)
+            _occ_symbol = _build_options_symbol("SPY", _expiry, strike, "P")
             _put_pos = {
                 "market": f"HEDGE:SPY PUT ${strike:.0f}",
                 "side": "BUY", "shares": 1,
@@ -7038,6 +7061,9 @@ async def check_crash_hedges(channel):
                 "platform": "Alpaca", "ev": 0,
                 "strategy": "crash_hedge_put",
                 "stop_price": 0, "target_price": 0,
+                "option_symbol": _occ_symbol,
+                "contracts": max(1, int(size_usd / (spy_price * 0.005 * 100))),
+                "entry_premium": size_usd / max(1, int(size_usd / (spy_price * 0.005 * 100))) / 100,
             }
             PAPER_PORTFOLIO["positions"].append(_put_pos)
             PAPER_PORTFOLIO["cash"] -= size_usd
@@ -7249,6 +7275,24 @@ async def run_exit_manager(channel=None):
                     if _spot > 0 and _ep > 0 and _sh > 0:
                         current_price = _spot * _sh
                         log.info("CRYPTO PRICE: %s spot=$%.4f value=$%.2f", _tk, _spot, current_price)
+            elif strategy == "crash_hedge_put":
+                # Fetch option price from Alpaca options API
+                _opt_sym = pos.get("option_symbol", "")
+                if _opt_sym:
+                    _oq = _pr.get(f"https://data.alpaca.markets/v1beta1/options/quotes/latest?symbols={_opt_sym}",
+                                  headers={"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}, timeout=5)
+                    if _oq.status_code == 200:
+                        _odata = _oq.json().get("quotes", {}).get(_opt_sym, {})
+                        _ask = float(_odata.get("ap", 0) or 0)
+                        _bid = float(_odata.get("bp", 0) or 0)
+                        _opt_mid = (_bid + _ask) / 2 if _bid > 0 and _ask > 0 else (_ask or _bid)
+                        if _opt_mid > 0:
+                            _contracts = pos.get("contracts", 1)
+                            _entry_prem = pos.get("entry_premium", pos.get("cost", 0) / max(_contracts, 1) / 100)
+                            current_price = _opt_mid * 100 * _contracts
+                            _opt_pnl = (_opt_mid - _entry_prem) * 100 * _contracts
+                            log.info("HEDGE OPT: %s mid=$%.2f entry=$%.2f contracts=%d pnl=$%+.2f",
+                                     _opt_sym, _opt_mid, _entry_prem, _contracts, _opt_pnl)
             elif strategy == "crash_hedge_short":
                 # Fetch SPY price for stop/target checks
                 _spy = _get_spy_price()
@@ -7319,11 +7363,20 @@ async def run_exit_manager(channel=None):
                 else:
                     log.info("ARB POS: %s age=%.0fh rate=%.4f%%", market[:20], age_hours, pos.get("entry_price", 0) * 100)
             elif strategy == "crash_hedge_put":
-                # Puts expire worthless or in-the-money — exit at DTE or 7-day TTL
-                if age_hours > CRASH_HEDGE_CONFIG.get("put_dte", 7) * 24:
+                # Price-based exits: 100% gain (double) or 50% loss (stop)
+                _cost = pos.get("cost", 0)
+                if current_price is not None and _cost > 0:
+                    _pct_change = (current_price - _cost) / _cost
+                    if _pct_change >= 1.0:
+                        exit_reason = f"HEDGE PUT TP: +{_pct_change*100:.0f}% (${current_price:.2f} vs ${_cost:.2f})"
+                    elif _pct_change <= -0.5:
+                        exit_reason = f"HEDGE PUT SL: {_pct_change*100:.0f}% (${current_price:.2f} vs ${_cost:.2f})"
+                # TTL: expire at DTE
+                if not exit_reason and age_hours > CRASH_HEDGE_CONFIG.get("put_dte", 7) * 24:
                     exit_reason = f"HEDGE PUT EXPIRED: {age_hours:.0f}h"
-                else:
-                    log.info("HEDGE PUT: %s age=%.0fh", market[:30], age_hours)
+                if not exit_reason:
+                    _pct_str = f" pnl={((current_price - _cost) / _cost)*100:+.0f}%" if current_price and _cost > 0 else ""
+                    log.info("HEDGE PUT: %s age=%.0fh%s", market[:30], age_hours, _pct_str)
             elif strategy == "crash_hedge_short":
                 # Check stop-loss and target on SPY short
                 if current_price is not None and pos.get("stop_price") and pos.get("entry_price"):
@@ -7510,7 +7563,9 @@ def scan_pairs_opportunities():
             log.info("PAIRS SIGNAL: %s/%s corr=%.3f zscore=%.2f dir=%s", ticker_a, ticker_b, corr, zscore, direction)
             # Auto-execute pairs trade in paper mode
             if TRADING_MODE == "paper" and AUTO_PAPER_ENABLED:
-                _pair_size = PAPER_PORTFOLIO.get("cash", 25000) * 0.015  # 1.5% per leg
+                _base_size = PAPER_PORTFOLIO.get("cash", 25000) * 0.015  # 1.5% per leg base
+                _kelly_mult = min((abs(zscore) / 2.0) * corr, 2.0)  # Half-Kelly scaling
+                _pair_size = _base_size * _kelly_mult
                 if direction == "short_a_long_b":
                     _long_tk, _short_tk = ticker_b, ticker_a
                 else:
