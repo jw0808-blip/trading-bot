@@ -1511,8 +1511,9 @@ async def portfolio(ctx):
     log_to_github(log_entry)
 
 
-@bot.command()
-async def cycle(ctx):
+@bot.command(name="ev-scan")
+async def ev_scan(ctx):
+    """Run EV scan across all platforms (formerly !cycle)."""
     msg = await ctx.send("Running EV scan across ALL platforms...")
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     fng_val, fng_label = get_fear_greed()
@@ -3356,6 +3357,155 @@ async def resolve_cmd(ctx, outcome: str = "", *, market_search: str = ""):
         PAPER_PORTFOLIO["cash"] += matched.get("shares", 1) * 1.0
     await ctx.send(f"**Resolved: {'WIN' if outcome_val == 1.0 else 'LOSS'}** | {matched.get('market', '')}\nEntry: ${matched.get('entry_price', 0):.3f} | P&L: ${result['pnl']:+,.2f} | Brier: {result['brier_score']:.4f}\nUse `!calibration` for overall accuracy.")
 
+@bot.command(name="cycle")
+async def cycle_cmd(ctx, *, ticker: str = ""):
+    """EchoEdge Cycle: parallel analysis → consensus recommendation for a ticker."""
+    if not ticker:
+        await ctx.send("Usage: `!cycle NVDA` or `!cycle PFE/MRK`")
+        return
+    ticker = ticker.strip().upper()
+    msg = await ctx.send(f"Running EchoEdge cycle for **{ticker}**...")
+    import requests as _cy_req
+
+    signals = []  # list of (direction, confidence, source)
+    notes = []
+
+    is_pair = "/" in ticker
+    tk_a = ticker.split("/")[0] if is_pair else ticker
+    tk_b = ticker.split("/")[1] if is_pair else None
+
+    # ── 1. Regime check ──
+    regime_info = get_regime("equities")
+    vix = regime_info.get("vix", 0) or 0
+    regime_name = regime_info.get("regime", "normal")
+    notes.append(f"VIX: {vix:.1f} | Regime: {regime_name}")
+    if regime_name == "extreme":
+        signals.append(("SHORT", 30, "regime_extreme"))
+    elif regime_name == "elevated":
+        signals.append(("SHORT", 15, "regime_elevated"))
+    elif regime_name == "low":
+        signals.append(("LONG", 10, "regime_low_vol"))
+
+    # ── 2. Fear & Greed ──
+    fng_val, fng_label = get_fear_greed()
+    notes.append(f"F&G: {fng_val}/100 ({fng_label})")
+    psych = _PSYCH_STATE
+    if psych["contrarian_mode"]:
+        signals.append(("LONG", 20, "contrarian_fear"))
+        notes.append("Psychologist: CONTRARIAN MODE (extreme fear → buy signal)")
+    elif psych["caution_mode"]:
+        signals.append(("NEUTRAL", 15, "caution_greed"))
+        notes.append("Psychologist: CAUTION MODE (extreme greed → reduce size)")
+
+    # ── 3. Oracle signal check ──
+    try:
+        _prices = _oracle_get_all_prices()
+        for title, yes_price in _prices.items():
+            sig = _oracle_match_signal(title)
+            if sig and ticker in (sig["long"], sig["short"]):
+                _dir = "LONG" if ticker == sig["long"] else "SHORT"
+                _conf = int(yes_price * 80)  # 0.70 → 56, 0.50 → 40
+                signals.append((_dir, _conf, f"oracle:{sig['name']}"))
+                notes.append(f"Oracle: {sig['name']} YES=${yes_price:.2f} → {_dir} {ticker}")
+    except Exception:
+        pass
+
+    # ── 4. Pairs Z-score (if pair) ──
+    if is_pair and tk_b:
+        try:
+            corr, zscore, mean_ratio = calculate_pair_zscore(tk_a, tk_b, 252)
+            if zscore is not None and corr is not None:
+                notes.append(f"Z-score: {zscore:.2f} | Corr: {corr:.3f}")
+                if abs(zscore) >= 1.0 and corr >= 0.85:
+                    _dir = "LONG" if zscore < 0 else "SHORT"  # Mean reversion: buy low Z, sell high Z
+                    _conf = min(int(abs(zscore) * 25 * corr), 80)
+                    signals.append((_dir, _conf, f"pairs_z={zscore:.1f}"))
+                    # Historian stats
+                    _hs = historian_analyze_pair(tk_a, tk_b)
+                    if _hs.get("available"):
+                        notes.append(f"Historian: {_hs['reversion_rate']*100:.0f}% revert rate, "
+                                     f"avg {_hs['avg_reversion_days']:.0f}d, {_hs['sample_size']} samples")
+                else:
+                    notes.append("Z-score below entry threshold or low correlation")
+        except Exception:
+            notes.append("Pairs calc error")
+    else:
+        # Single ticker — check price trend via Alpaca
+        try:
+            _hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+            _r = _cy_req.get(f"https://data.alpaca.markets/v2/stocks/{tk_a}/quotes/latest", headers=_hdr, timeout=5)
+            if _r.status_code == 200:
+                _q = _r.json().get("quote", {})
+                _bid = float(_q.get("bp", 0) or 0)
+                _ask = float(_q.get("ap", 0) or 0)
+                _mid = (_bid + _ask) / 2
+                notes.append(f"Price: ${_mid:,.2f}")
+        except Exception:
+            pass
+
+    # ── 5. Top 3 headlines from Meteorologist ──
+    _hl_found = False
+    for theme, entries in _INTEL_HEADLINE_MEMORY.items():
+        if not entries:
+            continue
+        # Check if any headline mentions our ticker or related keywords
+        _tk_lower = ticker.lower().replace("/", " ")
+        for _, h in sorted(entries, key=lambda x: x[0], reverse=True)[:5]:
+            if any(w in h.lower() for w in _tk_lower.split()):
+                if not _hl_found:
+                    notes.append("Headlines:")
+                    _hl_found = True
+                notes.append(f"  • {h[:75]}")
+                if sum(1 for n in notes if n.startswith("  •")) >= 3:
+                    break
+        if sum(1 for n in notes if n.startswith("  •")) >= 3:
+            break
+
+    # ── Consensus ──
+    if not signals:
+        direction = "NEUTRAL"
+        confidence = 50
+    else:
+        long_score = sum(c for d, c, _ in signals if d == "LONG")
+        short_score = sum(c for d, c, _ in signals if d == "SHORT")
+        neutral_score = sum(c for d, c, _ in signals if d == "NEUTRAL")
+
+        if long_score > short_score and long_score > neutral_score:
+            direction = "LONG"
+            confidence = min(long_score, 95)
+        elif short_score > long_score and short_score > neutral_score:
+            direction = "SHORT"
+            confidence = min(short_score, 95)
+        else:
+            direction = "NEUTRAL"
+            confidence = min(max(long_score, short_score, neutral_score), 95)
+
+    # Position sizing suggestion
+    portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
+        p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+    _base_pct = 0.015 if confidence >= 60 else 0.01 if confidence >= 40 else 0.005
+    _size = portfolio_value * _base_pct * psychologist_size_multiplier()
+
+    # Direction emoji
+    _emoji = {"LONG": "+", "SHORT": "-", "NEUTRAL": "~"}[direction]
+
+    result = f"**EchoEdge Cycle: {ticker}**\n```\n"
+    result += f"Consensus: {_emoji} {direction} | Confidence: {confidence}/100\n"
+    result += f"Suggested size: ${_size:,.0f} ({_base_pct*100:.1f}% of ${portfolio_value:,.0f})\n"
+    result += f"{'─' * 45}\n"
+    result += f"Signal contributors:\n"
+    for d, c, src in signals:
+        result += f"  {d:7s} {c:>3d}pts  {src}\n"
+    if not signals:
+        result += "  (no signals — defaulting to NEUTRAL)\n"
+    result += f"{'─' * 45}\n"
+    for note in notes:
+        result += f"{note}\n"
+    result += f"```"
+
+    await msg.edit(content=result)
+
+
 @bot.command(name="security-status")
 async def security_status(ctx):
     """Show security status including hostname, circuit breaker, key rotation."""
@@ -3659,6 +3809,29 @@ async def alert_scan_task():
                         await _check_hedge_fn(_hedge_ch)
                 except Exception as hedge_err:
                     log.warning("Crash hedge scan error: %s", hedge_err)
+            # === PSYCHOLOGIST AGENT (every cycle) ===
+            try:
+                _psych = psychologist_update()
+                if _psych.get("regime_changed"):
+                    _psych_ch = bot.get_channel(int(DISCORD_CHANNEL_ID)) if DISCORD_CHANNEL_ID else None
+                    if _psych_ch:
+                        if _psych["contrarian_mode"]:
+                            await _psych_ch.send(
+                                f"**PSYCHOLOGIST — CONTRARIAN MODE**\n"
+                                f"Fear & Greed: {_psych['last_fng']}/100 ({_psych['last_label']})\n"
+                                f"Extreme fear detected — biasing toward mean reversion, away from momentum")
+                        elif _psych["caution_mode"]:
+                            await _psych_ch.send(
+                                f"**PSYCHOLOGIST — CAUTION MODE**\n"
+                                f"Fear & Greed: {_psych['last_fng']}/100 ({_psych['last_label']})\n"
+                                f"Extreme greed detected — all position sizes tightened to 0.5x")
+                        else:
+                            await _psych_ch.send(
+                                f"**PSYCHOLOGIST — NORMAL MODE**\n"
+                                f"Fear & Greed: {_psych['last_fng']}/100 ({_psych['last_label']})\n"
+                                f"Sentiment regime cleared")
+            except Exception as _pserr:
+                log.warning("Psychologist error: %s", _pserr)
             # === ORACLE ENGINE (runs every cycle, market hours preferred) ===
             try:
                 _oracle_ch = bot.get_channel(int(DISCORD_CHANNEL_ID)) if DISCORD_CHANNEL_ID else None
@@ -3794,6 +3967,10 @@ async def auto_paper_execute(channel, opp):
 
     ev = opp.get("ev", 0)
     if ev < ALERT_CONFIG["min_ev_threshold"]:
+        return False
+    # === PSYCHOLOGIST: skip momentum in contrarian mode ===
+    if psychologist_should_skip_momentum() and opp.get("type", "").lower() == "momentum":
+        log.info("PSYCHOLOGIST: skip momentum %s (contrarian mode)", opp.get("market", "")[:30])
         return False
     # === BLACKLIST (sports, memes, long-term junk) ===
     _mkt_lower = opp.get("market", "").lower()
@@ -7508,7 +7685,7 @@ async def scan_oracle_signals(channel=None):
         base_size = portfolio_value * _size_pct
         # Scale by conviction: higher probability & larger delta = more size
         kelly_mult = min(yes_price * (1 + abs(delta_1h) * 5), 2.0)
-        leg_size = base_size * kelly_mult
+        leg_size = base_size * kelly_mult * psychologist_size_multiplier()
 
         if leg_size < 10:
             continue
@@ -8356,6 +8533,166 @@ def get_equities_exposure(positions, total_portfolio):
     return eq_value, eq_value / max(total_portfolio, 1)
 
 # --- PAIRS TRADING ENGINE ---
+# ---------------------------------------------------------------------------
+# PSYCHOLOGIST AGENT — Sentiment regime from Fear & Greed
+# ---------------------------------------------------------------------------
+_PSYCH_STATE = {
+    "contrarian_mode": False,   # F&G < 20 — bias toward mean reversion
+    "caution_mode": False,      # F&G > 80 — tighten all sizing to 0.5x
+    "last_fng": 50,
+    "last_label": "Neutral",
+    "last_check": None,
+    "regime_changed": False,    # True when mode just changed (for one-time Discord notify)
+}
+
+
+def psychologist_update(channel_send_fn=None):
+    """Check Fear & Greed and update sentiment regime. Call every scan cycle.
+    Returns the current psych state dict."""
+    state = _PSYCH_STATE
+    fng_val, fng_label = get_fear_greed()
+    state["last_fng"] = fng_val
+    state["last_label"] = fng_label
+    state["last_check"] = datetime.now(timezone.utc)
+
+    old_contrarian = state["contrarian_mode"]
+    old_caution = state["caution_mode"]
+
+    state["contrarian_mode"] = fng_val < 20
+    state["caution_mode"] = fng_val > 80
+    state["regime_changed"] = (state["contrarian_mode"] != old_contrarian or
+                                state["caution_mode"] != old_caution)
+
+    if state["regime_changed"]:
+        if state["contrarian_mode"]:
+            log.info("PSYCHOLOGIST: CONTRARIAN MODE ON — F&G=%d (%s), bias mean-reversion", fng_val, fng_label)
+        elif state["caution_mode"]:
+            log.info("PSYCHOLOGIST: CAUTION MODE ON — F&G=%d (%s), sizing tightened 0.5x", fng_val, fng_label)
+        elif old_contrarian or old_caution:
+            log.info("PSYCHOLOGIST: NORMAL MODE — F&G=%d (%s), regime cleared", fng_val, fng_label)
+
+    return state
+
+
+def psychologist_size_multiplier():
+    """Return a sizing multiplier based on current psych state.
+    Caution mode → 0.5x, else 1.0x."""
+    if _PSYCH_STATE["caution_mode"]:
+        return 0.5
+    return 1.0
+
+
+def psychologist_should_skip_momentum():
+    """In contrarian mode, skip momentum entries and favor mean-reversion."""
+    return _PSYCH_STATE["contrarian_mode"]
+
+
+# ---------------------------------------------------------------------------
+# HISTORIAN AGENT — Historical reversion statistics for pairs
+# ---------------------------------------------------------------------------
+_HISTORIAN_CACHE = {}  # {pair_key: {"stats": {...}, "fetched_at": datetime}}
+
+
+def historian_analyze_pair(ticker_a, ticker_b):
+    """Fetch 2yr history, calculate reversion stats for a pair.
+    Returns dict with reversion_rate, avg_reversion_hours, max_adverse_z, sample_size.
+    Results cached for 24 hours."""
+    pair_key = f"{ticker_a}/{ticker_b}"
+    now = datetime.now(timezone.utc)
+
+    # Check cache
+    cached = _HISTORIAN_CACHE.get(pair_key)
+    if cached and (now - cached["fetched_at"]).total_seconds() < 86400:
+        return cached["stats"]
+
+    stats = {"reversion_rate": 0.5, "avg_reversion_days": 5.0, "max_adverse_z": 3.0,
+             "sample_size": 0, "available": False}
+    try:
+        import yfinance as yf
+        import numpy as np
+
+        data_a = yf.download(ticker_a, period="2y", progress=False)
+        data_b = yf.download(ticker_b, period="2y", progress=False)
+        if len(data_a) < 200 or len(data_b) < 200:
+            _HISTORIAN_CACHE[pair_key] = {"stats": stats, "fetched_at": now}
+            return stats
+
+        pa = data_a["Close"].values.flatten()
+        pb = data_b["Close"].values.flatten()
+        min_len = min(len(pa), len(pb))
+        pa, pb = pa[-min_len:], pb[-min_len:]
+        ratio = pa / pb
+        mean_r = float(np.mean(ratio))
+        std_r = float(np.std(ratio))
+        if std_r == 0:
+            _HISTORIAN_CACHE[pair_key] = {"stats": stats, "fetched_at": now}
+            return stats
+
+        zscores = (ratio - mean_r) / std_r
+
+        # Find all entries where |Z| >= 2.0 (extreme signal)
+        entries = []
+        in_signal = False
+        entry_idx = 0
+        entry_z = 0
+        max_adverse = 0
+
+        for i in range(len(zscores)):
+            z = float(zscores[i])
+            if not in_signal and abs(z) >= 2.0:
+                in_signal = True
+                entry_idx = i
+                entry_z = z
+                max_adverse = abs(z)
+            elif in_signal:
+                max_adverse = max(max_adverse, abs(z))
+                # Reversion: Z crosses back through 0.5 toward mean
+                if abs(z) < 0.5 or (entry_z > 0 and z < 0) or (entry_z < 0 and z > 0):
+                    entries.append({
+                        "reverted": True,
+                        "days": i - entry_idx,
+                        "max_adverse": max_adverse,
+                    })
+                    in_signal = False
+                # Blowout: Z extends beyond 4.0 (broken)
+                elif abs(z) > 4.0:
+                    entries.append({
+                        "reverted": False,
+                        "days": i - entry_idx,
+                        "max_adverse": max_adverse,
+                    })
+                    in_signal = False
+
+        if entries:
+            reverted = [e for e in entries if e["reverted"]]
+            stats["reversion_rate"] = len(reverted) / len(entries)
+            if reverted:
+                stats["avg_reversion_days"] = sum(e["days"] for e in reverted) / len(reverted)
+            stats["max_adverse_z"] = max(e["max_adverse"] for e in entries)
+            stats["sample_size"] = len(entries)
+            stats["available"] = True
+
+    except Exception as e:
+        log.warning("HISTORIAN error %s: %s", pair_key, e)
+
+    _HISTORIAN_CACHE[pair_key] = {"stats": stats, "fetched_at": now}
+    return stats
+
+
+def historian_size_multiplier(stats):
+    """Convert historian stats to a position size multiplier.
+    High reversion rate (>70%) → 1.5x, Low (<40%) → 0.5x, else 1.0x."""
+    if not stats.get("available") or stats["sample_size"] < 3:
+        return 1.0  # No data, neutral
+    rate = stats["reversion_rate"]
+    if rate >= 0.70:
+        return 1.5
+    elif rate <= 0.40:
+        return 0.5
+    else:
+        return 1.0
+
+
 def calculate_pair_zscore(ticker_a, ticker_b, lookback=252):
     """Calculate Z-score of price ratio spread for a pair."""
     try:
@@ -8441,11 +8778,20 @@ def scan_pairs_opportunities():
                 log.info("PAIRS DEDUP: %s already open", _pair_key)
                 continue
             log.info("PAIRS SIGNAL: %s/%s corr=%.3f zscore=%.2f dir=%s", ticker_a, ticker_b, corr, zscore, direction)
+            # Historian Agent: fetch reversion stats and adjust sizing
+            _hist_stats = historian_analyze_pair(ticker_a, ticker_b)
+            _hist_mult = historian_size_multiplier(_hist_stats)
+            if _hist_stats.get("available"):
+                log.info("HISTORIAN: %s/%s reversion=%.0f%% avg=%.1fd max_z=%.1f samples=%d → %.1fx",
+                         ticker_a, ticker_b, _hist_stats["reversion_rate"] * 100,
+                         _hist_stats["avg_reversion_days"], _hist_stats["max_adverse_z"],
+                         _hist_stats["sample_size"], _hist_mult)
             # Auto-execute pairs trade in paper mode
             if TRADING_MODE == "paper" and AUTO_PAPER_ENABLED:
                 _base_size = PAPER_PORTFOLIO.get("cash", 25000) * 0.015  # 1.5% per leg base
                 _kelly_mult = min((abs(zscore) / 2.0) * corr, 2.0)  # Half-Kelly scaling
-                _pair_size = _base_size * _kelly_mult
+                _psych_mult = psychologist_size_multiplier()
+                _pair_size = _base_size * _kelly_mult * _hist_mult * _psych_mult
                 if direction == "short_a_long_b":
                     _long_tk, _short_tk = ticker_b, ticker_a
                 else:
