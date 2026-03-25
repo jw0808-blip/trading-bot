@@ -4179,6 +4179,96 @@ async def week_cmd(ctx):
         await msg.edit(content=f"Weekly summary error: {e}")
 
 
+@bot.command(name="performance")
+async def performance_cmd(ctx, window: str = "7"):
+    """Performance attribution by strategy. Usage: !performance 7 (or 30, 90)"""
+    _days = int(window) if window.isdigit() else 7
+    msg = await ctx.send(f"Calculating {_days}-day performance attribution...")
+
+    try:
+        import sqlite3 as _pfsq
+        import numpy as np
+        conn = _pfsq.connect(DB_PATH)
+        cutoff = (datetime.now(timezone.utc) - __import__("datetime").timedelta(days=_days)).strftime("%Y-%m-%d")
+
+        strats = conn.execute("SELECT DISTINCT strategy FROM positions WHERE status='closed' AND closed_at>=? AND realized_pnl IS NOT NULL", (cutoff,)).fetchall()
+
+        lines = []
+        for (strat,) in strats:
+            if not strat:
+                continue
+            rows = conn.execute("""
+                SELECT realized_pnl, size_usd,
+                       (julianday(closed_at) - julianday(created_at)) * 24 as hold_h
+                FROM positions WHERE status='closed' AND strategy=? AND closed_at>=? AND realized_pnl IS NOT NULL
+                ORDER BY closed_at DESC
+            """, (strat, cutoff)).fetchall()
+
+            if not rows:
+                continue
+            pnls = [r[0] for r in rows]
+            holds = [r[2] or 0 for r in rows]
+            total = len(pnls)
+            wins = sum(1 for p in pnls if p > 0)
+            total_pnl = sum(pnls)
+            avg_pnl = total_pnl / total
+            std_pnl = float(np.std(pnls)) if total > 1 else 1
+
+            # Sharpe
+            sharpe = (avg_pnl / std_pnl * np.sqrt(252)) if std_pnl > 0 else 0
+
+            # Sortino (downside deviation only)
+            neg = [p for p in pnls if p < 0]
+            down_dev = float(np.std(neg)) if len(neg) > 1 else 1
+            sortino = (avg_pnl / down_dev * np.sqrt(252)) if down_dev > 0 else 0
+
+            # Max drawdown
+            cum = np.cumsum(pnls)
+            max_dd = float(np.min(cum - np.maximum.accumulate(cum))) if len(cum) > 0 else 0
+
+            # Profit factor
+            gross_wins = sum(p for p in pnls if p > 0)
+            gross_losses = abs(sum(p for p in pnls if p < 0))
+            pf = gross_wins / gross_losses if gross_losses > 0 else float("inf")
+
+            avg_hold = sum(holds) / total if total > 0 else 0
+
+            lines.append({
+                "strategy": strat, "trades": total, "wins": wins,
+                "wr": wins / total * 100, "pnl": total_pnl, "avg": avg_pnl,
+                "sharpe": sharpe, "sortino": sortino, "max_dd": max_dd,
+                "pf": pf, "avg_hold": avg_hold,
+                "best": max(pnls), "worst": min(pnls),
+            })
+
+        conn.close()
+
+        if not lines:
+            await msg.edit(content=f"**Performance**: No closed trades in last {_days} days")
+            return
+
+        lines.sort(key=lambda x: x["pnl"], reverse=True)
+
+        result = f"**Performance Attribution** ({_days}d)\n```\n"
+        result += f"{'Strategy':<14s} {'Trades':>6s} {'WR%':>5s} {'P&L':>9s} {'Sharpe':>7s} {'PF':>5s} {'MaxDD':>8s}\n"
+        result += f"{'─' * 58}\n"
+        for l in lines:
+            _carry = " ★" if l["pnl"] == max(x["pnl"] for x in lines) else ""
+            _drag = " ▼" if l["pnl"] == min(x["pnl"] for x in lines) and l["pnl"] < 0 else ""
+            result += (f"  {l['strategy']:12s} {l['trades']:>6d} {l['wr']:>4.0f}% "
+                       f"${l['pnl']:>+8.2f} {l['sharpe']:>7.2f} {l['pf']:>5.1f} "
+                       f"${l['max_dd']:>+7.2f}{_carry}{_drag}\n")
+        result += f"{'─' * 58}\n"
+        _total = sum(l["pnl"] for l in lines)
+        result += f"  {'TOTAL':12s}        ${_total:>+8.2f}\n"
+        result += "```"
+        result += "\n★ = carrying the firm | ▼ = dragging"
+        await msg.edit(content=result)
+
+    except Exception as e:
+        await msg.edit(content=f"Performance error: {e}")
+
+
 @bot.command(name="backtest")
 async def backtest_cmd(ctx, strategy: str = "pairs", days: str = "90"):
     """Backtest a strategy over historical data. Usage: !backtest pairs 90"""
