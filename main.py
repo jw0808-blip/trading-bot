@@ -1559,7 +1559,8 @@ async def manual_log(ctx, *, message: str):
 
 
 @bot.command()
-async def status(ctx):
+async def integrations(ctx):
+    """Show API integration connection status."""
     checks = {
         "Kalshi":           bool(KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY),
         "Polymarket":       bool(POLY_WALLET_ADDRESS),
@@ -3033,6 +3034,173 @@ async def paper_pnl_cmd(ctx):
         msg += f"  +{len(pos_lines)-15} more\n"
     msg += f"```"
     await ctx.send(msg)
+
+@bot.command(name="status")
+async def status_cmd(ctx):
+    """One-screen dashboard: cash, equity, P&L, positions, signals, regime, funding, AI summary."""
+    import sqlite3 as _ssq, requests as _sr
+    now = datetime.now(timezone.utc)
+    ts = now.strftime("%H:%M UTC")
+    _alp = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+
+    # ── Portfolio basics ──
+    cash = PAPER_PORTFOLIO.get("cash", 0)
+    positions = PAPER_PORTFOLIO.get("positions", [])
+    total_cost = sum(p.get("cost", 0) for p in positions)
+
+    # ── Realized P&L from SQLite ──
+    total_realized = 0.0
+    trades_today = 0
+    try:
+        _sc = _ssq.connect(DB_PATH)
+        _row = _sc.execute("SELECT SUM(realized_pnl) FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL").fetchone()
+        if _row and _row[0]:
+            total_realized = _row[0]
+        _today = now.strftime("%Y-%m-%d")
+        _trow = _sc.execute("SELECT COUNT(*) FROM positions WHERE created_at LIKE ?", (f"{_today}%",)).fetchone()
+        trades_today = _trow[0] if _trow else 0
+        _sc.close()
+    except Exception:
+        pass
+
+    # ── Live prices + unrealized P&L per position ──
+    total_unrealized = 0.0
+    pos_lines = []
+    by_strategy = {}
+
+    for pos in positions:
+        strategy = pos.get("strategy", "prediction")
+        if pos.get("platform", "").lower() == "crypto" and strategy not in ("crypto", "momentum"):
+            strategy = "crypto"
+        market = pos.get("market", "")
+        cost = pos.get("cost", 0)
+        shares = pos.get("shares", 0)
+        entry_price = pos.get("entry_price", 0)
+        upnl = 0.0
+
+        try:
+            if strategy in ("pairs", "oracle_trade"):
+                _ll = pos.get("long_leg", "")
+                _sl = pos.get("short_leg", "")
+                if not _ll and "PAIRS:" in market:
+                    parts = market.replace("PAIRS:", "").split("/")
+                    _ll, _sl = parts[0], parts[1] if len(parts) > 1 else ""
+                _el = pos.get("entry_long_price", 0)
+                _es = pos.get("entry_short_price", 0)
+                if _ll and _sl and _el > 0 and _es > 0:
+                    _rl = _sr.get(f"https://data.alpaca.markets/v2/stocks/{_ll}/quotes/latest", headers=_alp, timeout=3)
+                    _rs = _sr.get(f"https://data.alpaca.markets/v2/stocks/{_sl}/quotes/latest", headers=_alp, timeout=3)
+                    if _rl.status_code == 200 and _rs.status_code == 200:
+                        _lp = float(_rl.json().get("quote", {}).get("ap", 0) or 0)
+                        _sp = float(_rs.json().get("quote", {}).get("bp", 0) or 0)
+                        if _lp > 0 and _sp > 0:
+                            _sz = cost / 2
+                            upnl = ((_lp - _el) * (_sz / _el)) + ((_es - _sp) * (_sz / _es))
+            elif strategy in ("crypto", "momentum"):
+                _tk = market.replace("CRYPTO:", "").split()[0]
+                _rc = _sr.get(f"https://api.coinbase.com/v2/prices/{_tk}-USD/spot", timeout=3)
+                if _rc.status_code == 200:
+                    _spot = float(_rc.json().get("data", {}).get("amount", 0))
+                    if _spot > 0 and shares > 0:
+                        upnl = (_spot * shares) - cost
+            elif strategy == "prediction":
+                if entry_price > 0 and shares > 0:
+                    upnl = (entry_price * shares) - cost
+        except Exception:
+            pass
+
+        total_unrealized += upnl
+        by_strategy[strategy] = by_strategy.get(strategy, 0) + 1
+        _pnl_tag = f"${upnl:+.0f}" if abs(upnl) >= 0.5 else "~$0"
+        _age = ""
+        try:
+            _et = datetime.strptime(pos.get("timestamp", ""), "%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc)
+            _h = (now - _et).total_seconds() / 3600
+            _age = f"{_h:.0f}h"
+        except Exception:
+            pass
+        pos_lines.append(f"  {market[:28]:28s} ${cost:>6.0f} {_pnl_tag:>6s} {_age:>4s} {strategy[:6]}")
+
+    combined_pnl = total_realized + total_unrealized
+    equity = cash + total_cost + total_unrealized
+    total_return = ((equity / 25000) - 1) * 100
+
+    # ── Regime + VIX ──
+    regime_info = get_regime("equities")
+    vix = regime_info.get("vix")
+    regime_name = regime_info.get("regime", "?")
+    fng_val, fng_label = get_fear_greed()
+
+    # ── Phemex funding rates (inline, non-async) ──
+    funding_lines = []
+    for asset in ["BTC", "ETH"]:
+        try:
+            _fr = _sr.get(f"https://api.phemex.com/v1/md/ticker/24hr?symbol=s{asset}USDT", timeout=3)
+            if _fr.status_code == 200:
+                _rate = float(_fr.json().get("result", {}).get("fundingRate", "0")) / 1e8
+                funding_lines.append(f"{asset}={_rate*100:.4f}%")
+        except Exception:
+            pass
+    funding_str = " | ".join(funding_lines) if funding_lines else "unavailable"
+
+    # ── Oracle signals ──
+    oracle_lines = []
+    try:
+        _prices = _oracle_get_all_prices()
+        for title, yes_price in _prices.items():
+            sig = _oracle_match_signal(title)
+            if sig:
+                _status = "🔴" if yes_price >= sig["threshold"] else "⚪"
+                oracle_lines.append(f"  {_status} {sig['name']:14s} {yes_price:.2f}/{sig['threshold']:.2f} → {sig['long']}/{sig['short']}")
+    except Exception:
+        pass
+
+    # ── AI summary (one line) ──
+    _strat_str = ", ".join(f"{v} {k}" for k, v in sorted(by_strategy.items()))
+    mkt_status = "open" if is_market_open() else "closed"
+    if combined_pnl > 50:
+        _mood = "Strong day"
+    elif combined_pnl > 0:
+        _mood = "Slightly green"
+    elif combined_pnl > -50:
+        _mood = "Slightly red"
+    else:
+        _mood = "Drawdown day"
+    _summary = (f"{_mood} | {len(positions)} positions ({_strat_str}) | "
+                f"{trades_today} trades today | VIX {vix:.0f} {regime_name} | mkt {mkt_status}")
+
+    # ── Build output (two messages to fit Discord 2000-char limit) ──
+    m1 = f"**TraderJoes Firm Status** | {ts}\n```\n"
+    m1 += f"{'Cash:':<20s} ${cash:>10,.2f}\n"
+    m1 += f"{'Cost basis:':<20s} ${total_cost:>10,.2f}\n"
+    m1 += f"{'Unrealized P&L:':<20s} ${total_unrealized:>+10,.2f}\n"
+    m1 += f"{'Realized P&L:':<20s} ${total_realized:>+10,.2f}\n"
+    m1 += f"{'Combined P&L:':<20s} ${combined_pnl:>+10,.2f}\n"
+    m1 += f"{'Equity:':<20s} ${equity:>10,.2f}  ({total_return:+.1f}%)\n"
+    m1 += f"{'─' * 46}\n"
+    m1 += f"VIX: {vix:.1f} | Regime: {regime_name.upper()} | F&G: {fng_val}/100 ({fng_label})\n"
+    m1 += f"Funding: {funding_str}\n"
+    m1 += f"{'─' * 46}\n"
+    m1 += f"{'Position':28s} {'Cost':>6s} {'P&L':>6s} {'Age':>4s} {'Strat'}\n"
+    for line in pos_lines[:12]:
+        m1 += line + "\n"
+    if len(pos_lines) > 12:
+        m1 += f"  +{len(pos_lines)-12} more\n"
+    m1 += f"```"
+
+    m2 = ""
+    if oracle_lines:
+        m2 = f"```\nOracle Signals:\n"
+        for line in oracle_lines[:6]:
+            m2 += line + "\n"
+        m2 += f"```"
+
+    m2 += f"\n> {_summary}"
+
+    await ctx.send(m1)
+    if m2.strip():
+        await ctx.send(m2)
+
 
 @bot.command(name="oracle-status")
 async def oracle_status_cmd(ctx):
