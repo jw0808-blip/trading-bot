@@ -2887,42 +2887,110 @@ async def scan_pairs_cmd(ctx):
 
 @bot.command(name="paper-pnl")
 async def paper_pnl_cmd(ctx):
-    import sqlite3 as _sq, json as _js
+    import sqlite3 as _sq, requests as _pnl_req
     cash = PAPER_PORTFOLIO.get("cash", 0)
-    try:
-        conn = _sq.connect(DB_PATH)
-        conn.row_factory = _sq.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM positions WHERE status='open' ORDER BY created_at DESC")
-        rows = [dict(r) for r in c.fetchall()]
-        conn.close()
-    except Exception as e:
-        await ctx.send(f"DB error: {e}")
-        return
-    if not rows:
+    positions = PAPER_PORTFOLIO.get("positions", [])
+    if not positions:
         await ctx.send(f"No open positions. Cash: ${cash:,.2f}")
         return
-    total_cost = sum(r.get("size_usd", 0) for r in rows)
-    pairs_pos = [r for r in rows if r.get("strategy") == "pairs"]
-    crypto_pos = [r for r in rows if r.get("strategy") == "crypto"]
-    pred_pos = [r for r in rows if r.get("strategy") not in ("pairs","crypto","pead","options_spread")]
-    other_pos = [r for r in rows if r.get("strategy") in ("pead","options_spread")]
-    msg = f"**Paper P&L** (SQLite)\n================================\n"
-    msg += f"Cash: ${cash:,.2f}\n"
-    msg += f"Positions: {len(rows)} ({len(pairs_pos)} pairs, {len(crypto_pos)} crypto, {len(pred_pos)} prediction, {len(other_pos)} other)\n"
-    msg += f"Cost basis: ${total_cost:,.2f}\n"
-    msg += f"Total portfolio: ${cash+total_cost:,.2f}\n================================\n"
-    for r in rows[:15]:
-        meta = {}
-        try: meta = _js.loads(r.get("metadata") or "{}")
-        except: pass
-        ev = meta.get("ev", r.get("ev", 0))
-        z = r.get("entry_zscore", 0)
-        strat = r.get("strategy","?")
-        extra = f"Z:{z:+.2f}" if strat == "pairs" else f"EV:{ev*100:.1f}%"
-        msg += f"  {r.get('market_id','')[:30]} | ${r.get('size_usd',0):.0f} | {extra} | {r.get('platform','')}\n"
-    if len(rows) > 15:
-        msg += f"  +{len(rows)-15} more\n"
+
+    # --- Fetch total realized P&L from SQLite ---
+    total_realized = 0.0
+    try:
+        _rc = _sq.connect(DB_PATH)
+        _row = _rc.execute("SELECT SUM(realized_pnl) FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL").fetchone()
+        if _row and _row[0]:
+            total_realized = _row[0]
+        _rc.close()
+    except Exception:
+        pass
+
+    # --- Fetch live prices and calculate unrealized P&L per position ---
+    _alp_hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+    pos_lines = []
+    total_unrealized = 0.0
+    total_cost = 0.0
+
+    for pos in positions:
+        strategy = pos.get("strategy", "prediction")
+        if pos.get("platform", "").lower() == "crypto" and strategy not in ("crypto", "momentum"):
+            strategy = "crypto"
+        market = pos.get("market", "")
+        cost = pos.get("cost", 0)
+        shares = pos.get("shares", 0)
+        entry_price = pos.get("entry_price", 0)
+        total_cost += cost
+
+        live_price = None
+        upnl = 0.0
+        price_src = ""
+
+        try:
+            if strategy == "pairs":
+                _ll = pos.get("long_leg", market.replace("PAIRS:", "").split("/")[0] if "PAIRS:" in market else "")
+                _sl = pos.get("short_leg", market.replace("PAIRS:", "").split("/")[1] if "PAIRS:" in market and "/" in market else "")
+                if _ll and _sl:
+                    _rl = _pnl_req.get(f"https://data.alpaca.markets/v2/stocks/{_ll}/quotes/latest", headers=_alp_hdr, timeout=5)
+                    _rs = _pnl_req.get(f"https://data.alpaca.markets/v2/stocks/{_sl}/quotes/latest", headers=_alp_hdr, timeout=5)
+                    if _rl.status_code == 200 and _rs.status_code == 200:
+                        _lp = float(_rl.json().get("quote", {}).get("ap", 0) or 0)
+                        _sp = float(_rs.json().get("quote", {}).get("bp", 0) or 0)
+                        _el = pos.get("entry_long_price", 0)
+                        _es = pos.get("entry_short_price", 0)
+                        if _lp > 0 and _sp > 0 and _el > 0 and _es > 0:
+                            _sz = cost / 2
+                            _lpnl = (_lp - _el) * (_sz / _el)
+                            _spnl = (_es - _sp) * (_sz / _es)
+                            upnl = _lpnl + _spnl
+                            price_src = f"L:{_ll}=${_lp:.0f} S:{_sl}=${_sp:.0f}"
+                        else:
+                            price_src = "no entry leg prices"
+            elif strategy in ("crypto", "momentum"):
+                _tk = market.replace("CRYPTO:", "").split()[0]
+                _rc = _pnl_req.get(f"https://api.coinbase.com/v2/prices/{_tk}-USD/spot", timeout=5)
+                if _rc.status_code == 200:
+                    live_price = float(_rc.json().get("data", {}).get("amount", 0))
+                    if live_price > 0 and shares > 0:
+                        upnl = (live_price * shares) - cost
+                        price_src = f"${live_price:,.2f}"
+            elif strategy in ("crash_hedge_put", "crash_hedge_short"):
+                price_src = "no live feed"
+            else:
+                # Prediction markets — use entry_price as current (hold to resolution)
+                if entry_price > 0 and shares > 0:
+                    upnl = (entry_price * shares) - cost  # net of slippage/fees
+                price_src = "held"
+        except Exception:
+            price_src = "err"
+
+        total_unrealized += upnl
+        _pnl_str = f"${upnl:+,.2f}" if upnl != 0 else "$0.00"
+        _label = market[:35]
+        pos_lines.append(f"  {_label:35s} ${cost:>7.0f}  {_pnl_str:>9s}  {price_src}")
+
+    # --- Build output ---
+    combined = total_realized + total_unrealized
+    equity = cash + total_cost + total_unrealized
+    start_capital = 25000
+    total_return = ((equity / start_capital) - 1) * 100
+
+    msg = f"**Paper P&L Dashboard**\n"
+    msg += f"```\n"
+    msg += f"{'Realized P&L (closed):':<26s} ${total_realized:>+10,.2f}\n"
+    msg += f"{'Unrealized P&L (open):':<26s} ${total_unrealized:>+10,.2f}\n"
+    msg += f"{'Combined P&L:':<26s} ${combined:>+10,.2f}\n"
+    msg += f"{'─' * 42}\n"
+    msg += f"{'Cash:':<26s} ${cash:>10,.2f}\n"
+    msg += f"{'Cost basis:':<26s} ${total_cost:>10,.2f}\n"
+    msg += f"{'Equity:':<26s} ${equity:>10,.2f}\n"
+    msg += f"{'Return from $25K:':<26s} {total_return:>+10.1f}%\n"
+    msg += f"{'─' * 42}\n"
+    msg += f"{'Position':35s} {'Cost':>7s}  {'Unr P&L':>9s}  {'Price'}\n"
+    for line in pos_lines[:15]:
+        msg += line + "\n"
+    if len(pos_lines) > 15:
+        msg += f"  +{len(pos_lines)-15} more\n"
+    msg += f"```"
     await ctx.send(msg)
 
 @bot.command(name="paper-reset")
