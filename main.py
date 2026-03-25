@@ -4027,6 +4027,15 @@ async def alert_scan_task():
                     log.info("Oracle engine fired %d signals this cycle", _oracle_fired)
             except Exception as _oerr:
                 log.warning("Oracle engine error: %s", _oerr)
+            # === OPTIONS THETA HARVEST (market hours, after crash hedge) ===
+            if is_market_open():
+                try:
+                    _theta_ch = bot.get_channel(int(DISCORD_CHANNEL_ID)) if DISCORD_CHANNEL_ID else None
+                    _theta_fired = await scan_theta_harvest(_theta_ch)
+                    if _theta_fired > 0:
+                        log.info("Theta harvest opened %d spread(s)", _theta_fired)
+                except Exception as _therr:
+                    log.warning("Theta harvest error: %s", _therr)
             # === EVENT SYNTHETICS (cross-platform arb execution) ===
             try:
                 _synth_ch = bot.get_channel(int(DISCORD_CHANNEL_ID)) if DISCORD_CHANNEL_ID else None
@@ -8119,6 +8128,199 @@ async def scan_oracle_signals(channel=None):
     return fired
 
 
+# ---------------------------------------------------------------------------
+# OPTIONS THETA HARVEST — Sell put credit spreads on high IV
+# ---------------------------------------------------------------------------
+OPTIONS_THETA_CONFIG = {
+    "enabled": True,
+    "underlyings": ["SPY", "QQQ"],
+    "iv_rank_threshold": 50,     # IV rank > 50% to sell premium
+    "dte_target": 2,             # 2-day expiry
+    "spread_width": 5,           # $5 wide spread
+    "size_pct": 0.01,            # 1% of portfolio
+    "tp_pct": 0.50,              # Take profit at 50% of credit
+    "sl_pct": 2.00,              # Stop loss at 200% of credit
+    "max_concurrent": 2,         # Max open theta positions
+    "cooldown_hours": 24,        # Min hours between entries
+}
+
+
+async def scan_theta_harvest(channel=None):
+    """Scan for put credit spread opportunities on SPY/QQQ when IV is elevated."""
+    cfg = OPTIONS_THETA_CONFIG
+    if not cfg["enabled"] or not ALPACA_API_KEY:
+        return 0
+    if not is_market_open():
+        return 0
+
+    # Count existing theta positions
+    theta_count = sum(1 for p in PAPER_PORTFOLIO.get("positions", [])
+                      if p.get("strategy") == "options_spread")
+    if theta_count >= cfg["max_concurrent"]:
+        return 0
+
+    # Cooldown check
+    try:
+        import sqlite3 as _tsq
+        _tc = _tsq.connect(DB_PATH)
+        _tr = _tc.execute("SELECT closed_at FROM positions WHERE strategy='options_spread' ORDER BY created_at DESC LIMIT 1").fetchone()
+        _tc.close()
+        if _tr and _tr[0]:
+            _tt = datetime.fromisoformat(_tr[0]).replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - _tt).total_seconds() < cfg["cooldown_hours"] * 3600:
+                return 0
+    except Exception:
+        pass
+
+    hdrs = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+    fired = 0
+
+    for underlying in cfg["underlyings"]:
+        try:
+            # Get current price
+            _qr = requests.get(f"https://data.alpaca.markets/v2/stocks/{underlying}/quotes/latest",
+                               headers=hdrs, timeout=5)
+            if _qr.status_code != 200:
+                continue
+            _q = _qr.json().get("quote", {})
+            spot = (float(_q.get("ap", 0) or 0) + float(_q.get("bp", 0) or 0)) / 2
+            if spot <= 0:
+                continue
+
+            # Fetch options chain from Alpaca for 2-DTE
+            expiry = datetime.now(timezone.utc) + __import__("datetime").timedelta(days=cfg["dte_target"])
+            # Round to next trading day
+            while expiry.weekday() >= 5:
+                expiry += __import__("datetime").timedelta(days=1)
+            exp_str = expiry.strftime("%Y-%m-%d")
+
+            _or = requests.get(
+                f"https://data.alpaca.markets/v1beta1/options/snapshots/{underlying}",
+                headers=hdrs, params={"feed": "indicative", "expiration_date": exp_str},
+                timeout=10)
+
+            if _or.status_code != 200:
+                log.info("THETA: %s options chain unavailable (%d)", underlying, _or.status_code)
+                continue
+
+            snapshots = _or.json().get("snapshots", {})
+            if not snapshots:
+                continue
+
+            # Find ATM put and OTM put for credit spread
+            strike_short = round(spot * 0.99, 0)  # 1% OTM short put
+            strike_long = strike_short - cfg["spread_width"]  # Long put further OTM
+
+            # Calculate IV rank from the options data
+            # Use the implied vol from the ATM option as a proxy
+            best_short = None
+            best_short_iv = 0
+            for sym, snap in snapshots.items():
+                if "P" not in sym:
+                    continue
+                greeks = snap.get("greeks", {})
+                iv = float(greeks.get("implied_volatility", 0) or 0)
+                quote = snap.get("latestQuote", {})
+                bid = float(quote.get("bp", 0) or 0)
+                ask = float(quote.get("ap", 0) or 0)
+                mid = (bid + ask) / 2
+
+                # Extract strike from OCC symbol
+                try:
+                    _strike_part = sym[-8:]
+                    _sym_strike = int(_strike_part) / 1000
+                except (ValueError, IndexError):
+                    continue
+
+                if abs(_sym_strike - strike_short) < 3 and mid > 0:
+                    if iv > best_short_iv:
+                        best_short = {"symbol": sym, "strike": _sym_strike, "mid": mid, "iv": iv, "bid": bid}
+                        best_short_iv = iv
+
+            if not best_short or best_short_iv < 0.01:
+                continue
+
+            # IV rank proxy: compare current IV to recent VIX
+            regime = get_regime("equities")
+            vix = regime.get("vix", 20) or 20
+            # Simple IV rank: if IV > VIX * 1.2 → high IV rank
+            iv_rank = min(best_short_iv / (vix / 100 * 1.5) * 100, 100) if vix > 0 else 50
+
+            if iv_rank < cfg["iv_rank_threshold"]:
+                log.info("THETA: %s IV rank %.0f%% below %d%% threshold", underlying, iv_rank, cfg["iv_rank_threshold"])
+                continue
+
+            # Calculate credit and position size
+            credit = best_short["bid"] * 0.8  # Conservative fill estimate
+            if credit <= 0.05:
+                continue
+
+            portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
+                p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+            max_risk = cfg["spread_width"] - credit
+            contracts = max(1, int(portfolio_value * cfg["size_pct"] / (max_risk * 100)))
+            total_credit = credit * 100 * contracts
+            total_risk = max_risk * 100 * contracts
+
+            market_id = f"THETA:{underlying} {strike_short:.0f}/{strike_long:.0f}P {exp_str}"
+
+            # Dedup
+            if any(p.get("market", "") == market_id for p in PAPER_PORTFOLIO.get("positions", [])):
+                continue
+
+            # Record paper position
+            PAPER_PORTFOLIO["cash"] -= total_risk  # Risk is the margin
+            _theta_pos = {
+                "market": market_id,
+                "side": "SELL",
+                "shares": contracts,
+                "entry_price": credit,
+                "cost": total_risk,
+                "value": total_credit,
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                "platform": "Alpaca",
+                "ev": credit / max_risk if max_risk > 0 else 0,
+                "strategy": "options_spread",
+                "short_strike": strike_short,
+                "long_strike": strike_long,
+                "underlying": underlying,
+                "expiry": exp_str,
+                "credit_received": total_credit,
+                "max_loss": total_risk,
+            }
+            PAPER_PORTFOLIO["positions"].append(_theta_pos)
+            db_log_paper_trade(_theta_pos)
+            db_open_position(
+                market_id=market_id, platform="Alpaca", strategy="options_spread",
+                direction="SELL", size_usd=total_risk, shares=contracts,
+                entry_price=credit, stop_price=credit * (1 + cfg["sl_pct"]),
+                target_price=credit * (1 - cfg["tp_pct"]),
+                metadata={"underlying": underlying, "short_strike": strike_short,
+                          "long_strike": strike_long, "expiry": exp_str,
+                          "iv_rank": iv_rank, "credit": credit,
+                          "total_credit": total_credit, "max_risk": total_risk,
+                          "contracts": contracts},
+            )
+
+            fired += 1
+            log.info("THETA HARVEST: %s %d/%dP x%d credit=$%.2f iv_rank=%.0f%%",
+                     underlying, int(strike_short), int(strike_long), contracts, total_credit, iv_rank)
+            if channel:
+                try:
+                    await channel.send(
+                        f"**THETA HARVEST** — {underlying} Put Credit Spread\n"
+                        f"Sell {strike_short:.0f}P / Buy {strike_long:.0f}P | Exp: {exp_str}\n"
+                        f"Credit: ${total_credit:.0f} | Max risk: ${total_risk:.0f} | IV rank: {iv_rank:.0f}%\n"
+                        f"TP: 50% (${total_credit*0.5:.0f}) | SL: 200% (${total_credit*2:.0f})")
+                except Exception:
+                    pass
+
+        except Exception as _te:
+            log.warning("THETA scan %s error: %s", underlying, _te)
+
+    return fired
+
+
 def reconcile_alpaca_positions():
     """Close any Alpaca positions that have no matching open position in PAPER_PORTFOLIO.
     Prevents orphaned directional risk from failed pairs orders."""
@@ -8741,6 +8943,28 @@ async def run_exit_manager(channel=None):
                     exit_reason = f"HEDGE SHORT TTL: {age_hours:.0f}h"
                 if not exit_reason:
                     log.info("HEDGE SHORT: %s age=%.0fh entry=$%.2f", market[:30], age_hours, pos.get("entry_price", 0))
+            elif strategy == "options_spread":
+                # TP at 50% of credit received, SL at 200%, or expiry
+                _credit = pos.get("credit_received", pos.get("cost", 0) * 0.5)
+                _max_loss = pos.get("max_loss", pos.get("cost", 0))
+                if current_price is not None and _credit > 0:
+                    _spread_pnl = _credit - current_price  # Positive = profitable
+                    if _spread_pnl >= _credit * 0.50:
+                        exit_reason = f"THETA TP: +{_spread_pnl/_credit*100:.0f}% of credit"
+                    elif current_price >= _credit * 3.0:  # 200% loss = 3x the credit
+                        exit_reason = f"THETA SL: cost ${current_price:.0f} vs credit ${_credit:.0f}"
+                _expiry = pos.get("expiry", "")
+                if _expiry:
+                    try:
+                        _exp_dt = datetime.strptime(_expiry, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                        if datetime.now(timezone.utc) > _exp_dt + __import__("datetime").timedelta(hours=16):
+                            exit_reason = f"THETA EXPIRED: {_expiry}"
+                    except Exception:
+                        pass
+                if not exit_reason and age_hours > 72:
+                    exit_reason = f"THETA TTL: {age_hours:.0f}h"
+                if not exit_reason:
+                    log.info("THETA POS: %s age=%.0fh credit=$%.0f", market[:30], age_hours, _credit)
             elif strategy == "event_synthetic":
                 # Hold to resolution (max 30 days) — arbs resolve when market closes
                 if age_hours > 720:
