@@ -21,6 +21,9 @@ TRADINGVIEW_SIGNALS = {
     "latest_signal": {},  # Updated via webhook or manual command
     "signal_expiry_minutes": 30,  # Signals older than this are ignored
     "max_boost_points": 15,  # Max points added to edge score
+    "history": [],  # Rolling list of last 50 signals received
+    "auto_execute": True,  # Auto-execute when TV + cycle agree
+    "auto_execute_size_pct": 0.01,  # 1% of portfolio per auto-exec
 }
 
 import discord
@@ -3674,6 +3677,39 @@ async def squeeze_scan_cmd(ctx):
     await msg.edit(content=result)
 
 
+@bot.command(name="tv-signals")
+async def tv_signals_cmd(ctx):
+    """Show last 10 TradingView webhook signals received."""
+    history = TRADINGVIEW_SIGNALS.get("history", [])
+    if not history:
+        await ctx.send("**TV Signals**: No signals received yet. Send webhooks to port 8080.")
+        return
+
+    msg = "**TradingView Signal History**\n```\n"
+    msg += f"Auto-execute: {'ON' if TRADINGVIEW_SIGNALS.get('auto_execute') else 'OFF'}\n"
+    msg += f"{'─' * 55}\n"
+    msg += f"{'Time':>8s} {'Signal':>6s} {'Asset':>6s} {'Indicator':>14s} {'Price':>8s} {'Exec':>4s}\n"
+
+    for sig in reversed(history[-10:]):
+        _ts = sig.get("timestamp")
+        _time_str = _ts.strftime("%H:%M") if hasattr(_ts, "strftime") else "?"
+        _signal = sig.get("signal", "?")[:6]
+        _asset = sig.get("asset", "?")[:6]
+        _ind = sig.get("indicator", "?")[:14]
+        _price = sig.get("price", 0)
+        _price_str = f"${_price:.2f}" if _price else "—"
+        _exec = "YES" if sig.get("executed") else "no"
+        msg += f"  {_time_str:>6s} {_signal:>6s} {_asset:>6s} {_ind:>14s} {_price_str:>8s} {_exec:>4s}\n"
+
+    msg += f"{'─' * 55}\n"
+    msg += f"Total signals: {len(history)} | Last 24h: "
+    _cutoff = datetime.utcnow() - __import__("datetime").timedelta(hours=24)
+    _recent = sum(1 for s in history if hasattr(s.get("timestamp"), "timestamp") and s["timestamp"] > _cutoff)
+    msg += f"{_recent}\n"
+    msg += "```"
+    await ctx.send(msg)
+
+
 @bot.command(name="security-status")
 async def security_status(ctx):
     """Show security status including hostname, circuit breaker, key rotation."""
@@ -6857,6 +6893,79 @@ async def execute_ibkr_order(action, symbol, amount):
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+def _tv_execute_signal(sig_entry):
+    """Auto-execute a TradingView signal on Alpaca if it aligns with cycle consensus.
+    Called synchronously from webhook handler thread."""
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        return
+    asset = sig_entry.get("asset", "")
+    signal = sig_entry.get("signal", "")
+    if not asset or asset == "MARKET":
+        return
+
+    # Check if we already have a position in this ticker
+    for p in PAPER_PORTFOLIO.get("positions", []):
+        if asset in p.get("market", "").upper() or asset in p.get("long_leg", "").upper():
+            log.info("TV EXEC SKIP: %s already in portfolio", asset)
+            return
+
+    # Determine direction
+    is_buy = signal in ("BUY", "LONG", "BULLISH", "GREEN_DOT")
+    is_sell = signal in ("SELL", "SHORT", "BEARISH", "RED_DOT")
+    if not is_buy and not is_sell:
+        return
+
+    # Size calculation
+    portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
+        p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+    size = portfolio_value * TRADINGVIEW_SIGNALS.get("auto_execute_size_pct", 0.01)
+    if size > PAPER_PORTFOLIO.get("cash", 0) or size < 10:
+        return
+
+    # Submit to Alpaca
+    hdrs = {
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+        "Content-Type": "application/json",
+    }
+    side = "buy" if is_buy else "sell"
+    body = {"symbol": asset, "notional": str(round(size, 2)),
+            "side": side, "type": "market", "time_in_force": "day"}
+
+    try:
+        r = requests.post(f"{ALPACA_BASE_URL}/v2/orders", json=body, headers=hdrs, timeout=10)
+        if r.status_code in (200, 201):
+            order_id = r.json().get("id", "unknown")
+            sig_entry["executed"] = True
+            sig_entry["order_id"] = order_id
+
+            # Record in paper portfolio
+            _tv_pos = {
+                "market": f"TV:{asset}",
+                "side": signal, "shares": 1,
+                "entry_price": float(sig_entry.get("price", 0) or 0),
+                "cost": size, "value": size,
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                "platform": "Alpaca", "ev": 0,
+                "strategy": "tv_signal",
+                "indicator": sig_entry.get("indicator", ""),
+            }
+            PAPER_PORTFOLIO["cash"] -= size
+            PAPER_PORTFOLIO["positions"].append(_tv_pos)
+            db_open_position(
+                market_id=f"TV:{asset}", platform="Alpaca", strategy="tv_signal",
+                direction=signal, size_usd=size, shares=1,
+                entry_price=float(sig_entry.get("price", 0) or 0),
+                metadata={"signal": signal, "indicator": sig_entry.get("indicator", ""),
+                          "order_id": order_id, "source": "tradingview_webhook"},
+            )
+            log.info("TV AUTO-EXEC: %s %s $%.0f order=%s", signal, asset, size, order_id)
+        else:
+            log.warning("TV EXEC FAILED: %s %s HTTP %d: %s", signal, asset, r.status_code, r.text[:100])
+    except Exception as e:
+        log.warning("TV EXEC error: %s", e)
+
+
 class TVWebhookHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
@@ -6871,12 +6980,28 @@ class TVWebhookHandler(BaseHTTPRequestHandler):
             sig_type = data.get("signal", data.get("action", "")).upper()
             asset = data.get("asset", data.get("ticker", "MARKET")).upper()
             indicator = data.get("indicator", data.get("source", "TradingView"))
+            price = data.get("price", data.get("close", 0))
             if sig_type:
-                TRADINGVIEW_SIGNALS["latest_signal"] = {
+                _sig_entry = {
                     "signal": sig_type, "asset": asset, "indicator": indicator,
-                    "timestamp": datetime.utcnow(), "source": "webhook",
+                    "price": price, "timestamp": datetime.utcnow(), "source": "webhook",
+                    "executed": False,
                 }
-                log.info("TV Webhook: %s %s (%s)", sig_type, asset, indicator)
+                TRADINGVIEW_SIGNALS["latest_signal"] = _sig_entry
+                # Store in history (rolling last 50)
+                TRADINGVIEW_SIGNALS["history"].append(_sig_entry)
+                if len(TRADINGVIEW_SIGNALS["history"]) > 50:
+                    TRADINGVIEW_SIGNALS["history"] = TRADINGVIEW_SIGNALS["history"][-50:]
+
+                log.info("TV Webhook: %s %s (%s) price=%s", sig_type, asset, indicator, price)
+
+                # Auto-execute: if buy/sell signal and auto_execute enabled
+                if TRADINGVIEW_SIGNALS.get("auto_execute") and sig_type in ("BUY", "SELL", "LONG", "SHORT"):
+                    try:
+                        _tv_execute_signal(_sig_entry)
+                    except Exception as _tve:
+                        log.warning("TV auto-execute error: %s", _tve)
+
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b'{"status":"ok"}')
@@ -8965,6 +9090,12 @@ async def run_exit_manager(channel=None):
                     exit_reason = f"THETA TTL: {age_hours:.0f}h"
                 if not exit_reason:
                     log.info("THETA POS: %s age=%.0fh credit=$%.0f", market[:30], age_hours, _credit)
+            elif strategy == "tv_signal":
+                # TradingView signals: 24h TTL
+                if age_hours > 24:
+                    exit_reason = f"TV SIGNAL TTL: {age_hours:.0f}h"
+                else:
+                    log.info("TV POS: %s age=%.0fh", market[:30], age_hours)
             elif strategy == "event_synthetic":
                 # Hold to resolution (max 30 days) — arbs resolve when market closes
                 if age_hours > 720:
