@@ -4027,6 +4027,14 @@ async def alert_scan_task():
                     log.info("Oracle engine fired %d signals this cycle", _oracle_fired)
             except Exception as _oerr:
                 log.warning("Oracle engine error: %s", _oerr)
+            # === EVENT SYNTHETICS (cross-platform arb execution) ===
+            try:
+                _synth_ch = bot.get_channel(int(DISCORD_CHANNEL_ID)) if DISCORD_CHANNEL_ID else None
+                _synth_fired = await execute_event_synthetics(_synth_ch)
+                if _synth_fired > 0:
+                    log.info("Event synthetics fired %d arb positions", _synth_fired)
+            except Exception as _serr:
+                log.warning("Event synthetics error: %s", _serr)
             # Run exit manager every cycle
             try:
                 exits = await run_exit_manager()
@@ -5240,6 +5248,104 @@ def find_cross_platform_arbs():
         ARB_HISTORY.pop(0)
     
     return arbs
+
+
+async def execute_event_synthetics(channel=None):
+    """Execute cross-platform arbs as event_synthetic positions.
+    Buys both legs (YES on one platform + NO on other) when spread > 2%."""
+    arbs = find_cross_platform_arbs()
+    if not arbs:
+        return 0
+
+    fired = 0
+    for arb in arbs[:3]:  # Max 3 arbs per cycle
+        spread_pct = arb.get("profit_pct", 0)
+        if spread_pct < 2.0:  # Need > 2% spread to execute
+            continue
+
+        title = arb.get("title", "")[:60]
+        market_id = f"SYNTH:{title[:40]}"
+
+        # Dedup
+        if any(p.get("market", "") == market_id for p in PAPER_PORTFOLIO.get("positions", [])):
+            continue
+
+        total_cost = arb.get("total_cost", 0)
+        spread = arb.get("spread", 0)
+        portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
+            p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+        size = min(portfolio_value * 0.01, 250)  # 1% or $250 max
+
+        if size > PAPER_PORTFOLIO.get("cash", 0):
+            continue
+
+        # Record as paper position (execution on both platforms is paper-mode)
+        PAPER_PORTFOLIO["cash"] -= size
+        _synth_pos = {
+            "market": market_id,
+            "side": arb.get("strategy", f"spread=${spread:.3f}")[:60],
+            "shares": int(size / max(total_cost, 0.01)),
+            "entry_price": total_cost,
+            "cost": size,
+            "value": size,
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            "platform": arb.get("type", "CROSS-PLATFORM"),
+            "ev": spread,
+            "strategy": "event_synthetic",
+        }
+        PAPER_PORTFOLIO["positions"].append(_synth_pos)
+        db_log_paper_trade(_synth_pos)
+        db_open_position(
+            market_id=market_id, platform=arb.get("type", "CROSS-PLATFORM"),
+            strategy="event_synthetic", direction="arb",
+            size_usd=size, shares=int(size / max(total_cost, 0.01)),
+            entry_price=total_cost,
+            metadata={"spread": spread, "profit_pct": spread_pct,
+                      "strategy_detail": arb.get("strategy", ""),
+                      "kalshi_ticker": arb.get("kalshi_ticker", ""),
+                      "poly_slug": arb.get("poly_slug", "")},
+        )
+
+        fired += 1
+        log.info("EVENT SYNTHETIC: %s spread=%.1f%% cost=$%.0f", title[:40], spread_pct, size)
+        if channel:
+            try:
+                await channel.send(
+                    f"**EVENT SYNTHETIC** — {spread_pct:.1f}% spread\n"
+                    f"{title[:60]}\n"
+                    f"{arb.get('strategy', '')}\n"
+                    f"Size: ${size:.0f}")
+            except Exception:
+                pass
+
+    return fired
+
+
+@bot.command(name="arb-scan")
+async def arb_scan_new(ctx):
+    """Scan for cross-platform mispricings with spread percentage."""
+    msg = await ctx.send("Scanning Kalshi + Polymarket for mispricings...")
+    arbs = find_cross_platform_arbs()
+    if not arbs:
+        await msg.edit(content="**Arb Scan**: No mispricings found. Markets are efficient.")
+        return
+
+    result = "**Cross-Platform Mispricings**\n```\n"
+    result += f"{'Event':40s} {'Type':12s} {'Spread':>7s} {'Cost':>6s}\n"
+    result += f"{'─' * 68}\n"
+    for a in arbs[:10]:
+        _t = a.get("title", "")[:38]
+        _type = a.get("type", "")[:10]
+        _spread = a.get("profit_pct", 0)
+        _cost = a.get("total_cost", 0)
+        _marker = " ★" if _spread >= 2.0 else ""
+        result += f"  {_t:38s} {_type:12s} {_spread:>5.1f}% ${_cost:>.3f}{_marker}\n"
+        if a.get("strategy"):
+            result += f"    {a['strategy'][:62]}\n"
+    result += f"{'─' * 68}\n"
+    result += f"★ = executable (>2% spread)\n"
+    result += "```"
+    await msg.edit(content=result)
 
 
 @bot.command(name="arb")
@@ -8635,6 +8741,12 @@ async def run_exit_manager(channel=None):
                     exit_reason = f"HEDGE SHORT TTL: {age_hours:.0f}h"
                 if not exit_reason:
                     log.info("HEDGE SHORT: %s age=%.0fh entry=$%.2f", market[:30], age_hours, pos.get("entry_price", 0))
+            elif strategy == "event_synthetic":
+                # Hold to resolution (max 30 days) — arbs resolve when market closes
+                if age_hours > 720:
+                    exit_reason = f"SYNTH TTL: {age_hours:.0f}h (30d max)"
+                else:
+                    log.info("SYNTH POS: %s age=%.0fh spread=%.1f%%", market[:30], age_hours, pos.get("ev", 0) * 100)
             elif strategy == "prediction":
                 log.info("PRED POS: %s age=%.0fh ev=%.1f%%", market[:30], age_hours, pos.get("ev", 0) * 100)
                 # Hold to resolution — no TTL exit
