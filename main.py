@@ -1766,10 +1766,10 @@ async def paper_trade(ctx, side: str = "", *, args: str = ""):
 # BACKTESTING
 # ============================================================================
 
-@bot.command()
-async def backtest(ctx, *, strategy: str = "momentum-crypto"):
-    """Run a walk-forward backtest. Uses real CoinGecko data when possible.
-    Usage: !backtest momentum-crypto  or  !backtest mean-reversion
+@bot.command(name="backtest-legacy")
+async def backtest_legacy(ctx, *, strategy: str = "momentum-crypto"):
+    """Run legacy walk-forward backtest. Uses real CoinGecko data.
+    Usage: !backtest-legacy momentum-crypto  or  !backtest-legacy mean-reversion
     """
     msg = await ctx.send(f"Running backtest: **{strategy}**... fetching real data from CoinGecko")
     

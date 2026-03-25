@@ -43,6 +43,32 @@ body { font-family: 'Courier New', monospace; background: #0a0e17; color: #c8d6e
 .headline .theme { color: #f59e0b; font-weight: bold; }
 @keyframes scroll { from { transform: translateX(0); } to { transform: translateX(-50%); } }
 .loading { color: #484f58; text-align: center; padding: 20px; }
+/* Mobile nav bar */
+.mobile-nav { display: none; position: fixed; bottom: 0; left: 0; right: 0; background: #0d1117; border-top: 1px solid #21262d; padding: 8px 0; z-index: 100; }
+.mobile-nav-inner { display: flex; justify-content: space-around; }
+.mobile-nav a { color: #58a6ff; text-decoration: none; font-size: 10px; text-align: center; padding: 4px 8px; }
+.mobile-nav a span { display: block; font-size: 16px; }
+/* Mobile responsive */
+@media (max-width: 768px) {
+  body { font-size: 14px; }
+  .war-room { height: auto; min-height: 100vh; padding-bottom: 60px; }
+  .top-bar { padding: 8px 10px; gap: 4px; justify-content: space-between; }
+  .metric { min-width: 60px; }
+  .metric-label { font-size: 9px; }
+  .metric-value { font-size: 15px; }
+  .main-panels { grid-template-columns: 1fr; grid-template-rows: auto auto auto; }
+  .panel { max-height: 40vh; padding: 10px; }
+  .pos-row { padding: 8px 0; font-size: 13px; cursor: pointer; }
+  .pos-row:active { background: #161b22; }
+  .signal-row { margin-bottom: 12px; }
+  .signal-name { font-size: 12px; }
+  .signal-bar-bg { height: 12px; }
+  .event-row { font-size: 12px; padding: 6px 0; }
+  .bottom-bar { display: none; }
+  .mobile-nav { display: block; }
+  .panel-title { font-size: 12px; padding-bottom: 8px; margin-bottom: 10px; }
+  .tag { font-size: 10px; padding: 2px 6px; }
+}
 .tag { font-size: 9px; padding: 1px 4px; border-radius: 2px; margin-left: 4px; }
 .tag-pairs { background: #1f3a5f; color: #58a6ff; }
 .tag-crypto { background: #3a1f5f; color: #a855f7; }
@@ -141,17 +167,32 @@ function OracleSignals({oracle}) {
 
 function IntelFeed({intel}) {
   if (!intel?.events) return <div className="panel"><div className="panel-title">Intelligence Feed</div><div className="loading">Loading...</div></div>;
+  const isMobile = window.innerWidth < 768;
+  const events = isMobile ? intel.events.slice(0, 5) : intel.events;
   return (
     <div className="panel">
-      <div className="panel-title">Intelligence Feed</div>
-      {intel.events.map((e, i) => (
+      <div className="panel-title">Intelligence Feed {isMobile && `(${intel.events.length})`}</div>
+      {events.map((e, i) => (
         <div key={i} className="event-row">
           <span className="event-time">{e.timestamp?.slice(11,16)}</span>{' '}
           <span className="event-agent">[{e.agent}]</span>{' '}
           <span className="event-msg">{e.message}</span>
         </div>
       ))}
-      {intel.events.length === 0 && <div style={{color:'#484f58'}}>No agent events yet. Waiting for scan cycle...</div>}
+      {intel.events.length === 0 && <div style={{color:'#484f58'}}>No agent events yet...</div>}
+    </div>
+  );
+}
+
+function MobileNav() {
+  return (
+    <div className="mobile-nav">
+      <div className="mobile-nav-inner">
+        <a href="#top"><span>$</span>Portfolio</a>
+        <a href="#signals"><span>~</span>Signals</a>
+        <a href="#intel"><span>!</span>Intel</a>
+        <a href="/api/status" target="_blank"><span>{'{}'}</span>API</a>
+      </div>
     </div>
   );
 }
@@ -183,11 +224,12 @@ function App() {
     <div className="war-room">
       <TopBar status={status} />
       <div className="main-panels">
-        <Positions status={status} />
-        <OracleSignals oracle={oracle} />
-        <IntelFeed intel={intel} />
+        <div id="top"><Positions status={status} /></div>
+        <div id="signals"><OracleSignals oracle={oracle} /></div>
+        <div id="intel"><IntelFeed intel={intel} /></div>
       </div>
       <Headlines oracle={oracle} />
+      <MobileNav />
     </div>
   );
 }
