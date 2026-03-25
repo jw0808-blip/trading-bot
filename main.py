@@ -1441,6 +1441,13 @@ async def on_ready():
             log.warning("Position backfill error: %s", _e)
     log.info("TraderJoes bot online as %s | Cash: $%.2f | Positions: %d",
              bot.user, PAPER_PORTFOLIO.get("cash", 0), len(PAPER_PORTFOLIO.get("positions", [])))
+    # Reconcile Alpaca positions — close any orphans from failed pairs orders
+    try:
+        _recon = reconcile_alpaca_positions()
+        if _recon > 0:
+            log.info("Startup reconciliation closed %d orphaned positions", _recon)
+    except Exception as _re:
+        log.warning("Startup reconciliation error: %s", _re)
     if not daily_report_task.is_running():
         daily_report_task.start()
     if not alert_scan_task.is_running():
@@ -7284,6 +7291,70 @@ async def scan_oracle_signals(channel=None):
     return fired
 
 
+def reconcile_alpaca_positions():
+    """Close any Alpaca positions that have no matching open position in PAPER_PORTFOLIO.
+    Prevents orphaned directional risk from failed pairs orders."""
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        return 0
+    try:
+        hdrs = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+        r = requests.get(f"{ALPACA_BASE_URL}/v2/positions", headers=hdrs, timeout=10)
+        if r.status_code != 200:
+            log.warning("RECONCILE: Alpaca positions fetch failed: %d", r.status_code)
+            return 0
+        alpaca_positions = r.json()
+        if not alpaca_positions:
+            return 0
+
+        # Build set of tickers that PAPER_PORTFOLIO knows about
+        known_tickers = set()
+        for pos in PAPER_PORTFOLIO.get("positions", []):
+            # Pairs: long_leg and short_leg
+            ll = pos.get("long_leg", "")
+            sl = pos.get("short_leg", "")
+            if ll:
+                known_tickers.add(ll.upper())
+            if sl:
+                known_tickers.add(sl.upper())
+            # Market string fallback for non-pairs
+            mkt = pos.get("market", "")
+            if "PAIRS:" in mkt:
+                parts = mkt.replace("PAIRS:", "").split("/")
+                for p in parts:
+                    known_tickers.add(p.strip().upper())
+
+        closed = 0
+        for ap in alpaca_positions:
+            sym = ap.get("symbol", "").upper()
+            qty = float(ap.get("qty", 0))
+            side = ap.get("side", "")
+            mkt_val = float(ap.get("market_value", 0))
+
+            if sym in known_tickers:
+                continue  # Matched — this position is tracked
+
+            # Orphaned position — close it
+            log.warning("RECONCILE: Orphaned %s %s qty=%.2f val=$%.2f — closing",
+                        side, sym, abs(qty), abs(mkt_val))
+            try:
+                _cr = requests.delete(f"{ALPACA_BASE_URL}/v2/positions/{sym}",
+                                      headers=hdrs, timeout=10)
+                if _cr.status_code == 200:
+                    log.info("RECONCILE: Closed orphaned %s %s", side, sym)
+                    closed += 1
+                else:
+                    log.warning("RECONCILE: Failed to close %s: %d %s", sym, _cr.status_code, _cr.text[:100])
+            except Exception as _ce:
+                log.warning("RECONCILE: Error closing %s: %s", sym, _ce)
+
+        if closed > 0:
+            log.info("RECONCILE: Closed %d orphaned Alpaca positions", closed)
+        return closed
+    except Exception as e:
+        log.warning("RECONCILE error: %s", e)
+        return 0
+
+
 def _get_spy_price():
     """Fetch current SPY price from Alpaca."""
     try:
@@ -7905,7 +7976,7 @@ EQUITIES_CONFIG = {
                  ("AAPL", "MSFT"), ("PG", "CL"), ("WMT", "COST"), ("T", "VZ"), ("BA", "LMT"),
                  ("CAT", "DE"), ("FDX", "UPS"), ("INTC", "TXN"), ("MCD", "SBUX"), ("NKE", "LULU"),
                  ("PFE", "MRK"), ("COP", "EOG"), ("ADBE", "CRM"), ("NFLX", "DIS"), ("PYPL", "AFRM"),
-                 ("GM", "F"), ("USB", "PNC"), ("MMM", "HON"), ("ABT", "MDT"), ("AMZN", "EBAY"),
+                 ("USB", "PNC"), ("MMM", "HON"), ("ABT", "MDT"), ("AMZN", "EBAY"),
         ],
         "min_correlation": 0.85,
         "lookback_days": 252,
@@ -8111,9 +8182,11 @@ def scan_pairs_opportunities():
                              _short_tk, _entry_short_price, _short_order_id)
                 except Exception as _ep_err:
                     log.warning("Alpaca pairs order failed: %s", _ep_err)
+                    reconcile_alpaca_positions()
                     continue  # Don't open position if orders failed
 
                 if not _orders_ok:
+                    reconcile_alpaca_positions()
                     continue
 
                 _pair_pos = {
