@@ -3496,17 +3496,18 @@ async def auto_paper_execute(channel, opp):
     price = 0.50  # default for prediction markets
 
     # Use explicit NO price for NO contracts, otherwise extract from detail
+    _is_crypto_opp = opp.get("platform", "").lower() == "crypto"
     if opp.get("side") == "NO" and opp.get("no_price"):
         price = opp["no_price"]
     else:
         detail = opp.get("detail", "")
         import re
-        price_match = re.search(r"\$([0-9.]+)", detail)
+        price_match = re.search(r"\$([0-9.,]+)", detail)
         if price_match:
             try:
-                price = float(price_match.group(1))
-                if price > 1:
-                    price = price / 100  # normalize if > $1
+                price = float(price_match.group(1).replace(",", ""))
+                if price > 1 and not _is_crypto_opp:
+                    price = price / 100  # normalize prediction market cents to dollars
             except ValueError:
                 price = 0.50
 
