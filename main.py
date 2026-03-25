@@ -4179,6 +4179,129 @@ async def week_cmd(ctx):
         await msg.edit(content=f"Weekly summary error: {e}")
 
 
+@bot.command(name="backtest")
+async def backtest_cmd(ctx, strategy: str = "pairs", days: str = "90"):
+    """Backtest a strategy over historical data. Usage: !backtest pairs 90"""
+    _days = int(days) if days.isdigit() else 90
+    msg = await ctx.send(f"Backtesting **{strategy}** over {_days} days...")
+
+    try:
+        import yfinance as yf
+        import numpy as np
+
+        trades = []
+
+        if strategy == "pairs":
+            cfg = EQUITIES_CONFIG["pairs"]
+            for ticker_a, ticker_b in cfg["seed"][:20]:
+                try:
+                    data_a = yf.download(ticker_a, period=f"{_days}d", progress=False)
+                    data_b = yf.download(ticker_b, period=f"{_days}d", progress=False)
+                    if len(data_a) < 50 or len(data_b) < 50:
+                        continue
+                    pa = data_a["Close"].values.flatten()
+                    pb = data_b["Close"].values.flatten()
+                    ml = min(len(pa), len(pb))
+                    pa, pb = pa[-ml:], pb[-ml:]
+                    ratio = pa / pb
+                    mean_r = float(np.mean(ratio))
+                    std_r = float(np.std(ratio))
+                    if std_r == 0:
+                        continue
+                    zscores = (ratio - mean_r) / std_r
+
+                    # Simulate entry/exit
+                    in_trade = False
+                    entry_z = 0
+                    entry_idx = 0
+                    for i in range(len(zscores)):
+                        z = float(zscores[i])
+                        if not in_trade and abs(z) >= cfg.get("zscore_entry", 1.0):
+                            in_trade = True
+                            entry_z = z
+                            entry_idx = i
+                        elif in_trade:
+                            if abs(z) < cfg.get("zscore_exit", 0.5) or (entry_z > 0 and z < 0) or (entry_z < 0 and z > 0):
+                                # Simplified PnL: z-score reversion * notional
+                                pnl = (abs(entry_z) - abs(z)) * 50  # ~$50 per z-point
+                                trades.append({"pair": f"{ticker_a}/{ticker_b}", "pnl": pnl,
+                                              "hold_days": i - entry_idx, "entry_z": entry_z})
+                                in_trade = False
+                            elif i - entry_idx > cfg.get("ttl_days", 7):
+                                pnl = (abs(entry_z) - abs(z)) * 50
+                                trades.append({"pair": f"{ticker_a}/{ticker_b}", "pnl": pnl,
+                                              "hold_days": i - entry_idx, "entry_z": entry_z})
+                                in_trade = False
+                except Exception:
+                    continue
+
+        elif strategy == "crypto":
+            # Replay momentum signals on top cryptos
+            for sym in ["BTC", "ETH", "SOL", "AVAX", "LINK"]:
+                try:
+                    data = yf.download(f"{sym}-USD", period=f"{_days}d", progress=False)
+                    if len(data) < 30:
+                        continue
+                    closes = data["Close"].values.flatten()
+                    for i in range(1, len(closes)):
+                        chg = (closes[i] - closes[i-1]) / closes[i-1] * 100
+                        if abs(chg) > 8:  # Momentum signal
+                            # Hold 1 day
+                            if i + 1 < len(closes):
+                                next_chg = (closes[i+1] - closes[i]) / closes[i] * 100
+                                pnl = next_chg * 2.5  # ~$250 position
+                                trades.append({"pair": sym, "pnl": pnl, "hold_days": 1, "entry_z": chg})
+                except Exception:
+                    continue
+        else:
+            await msg.edit(content=f"Unknown strategy: {strategy}. Use: pairs, crypto")
+            return
+
+        if not trades:
+            await msg.edit(content=f"**Backtest {strategy}**: No trades generated in {_days} days")
+            return
+
+        # Calculate stats
+        pnls = [t["pnl"] for t in trades]
+        wins = sum(1 for p in pnls if p > 0)
+        total_pnl = sum(pnls)
+        avg_pnl = total_pnl / len(pnls)
+        std_pnl = float(np.std(pnls)) if len(pnls) > 1 else 1
+        sharpe = avg_pnl / std_pnl * np.sqrt(252) if std_pnl > 0 else 0
+        cum = np.cumsum(pnls)
+        max_dd = float(np.min(cum - np.maximum.accumulate(cum)))
+        best = max(pnls)
+        worst = min(pnls)
+
+        # Store in SQLite
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("INSERT INTO backtest_results (strategy,days,run_at,total_trades,win_rate,total_pnl,avg_pnl,sharpe,max_drawdown,best_trade,worst_trade) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                         (strategy, _days, now_str(), len(trades), wins/len(trades), total_pnl, avg_pnl, sharpe, max_dd, best, worst))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+        result = f"**Backtest: {strategy}** ({_days} days)\n```\n"
+        result += f"{'Trades:':<22s} {len(trades):>10d}\n"
+        result += f"{'Win rate:':<22s} {wins/len(trades)*100:>9.0f}%\n"
+        result += f"{'Total P&L:':<22s} ${total_pnl:>+10,.2f}\n"
+        result += f"{'Avg P&L/trade:':<22s} ${avg_pnl:>+10,.2f}\n"
+        result += f"{'Sharpe (ann):':<22s} {sharpe:>10.2f}\n"
+        result += f"{'Max drawdown:':<22s} ${max_dd:>+10,.2f}\n"
+        result += f"{'Best trade:':<22s} ${best:>+10,.2f}\n"
+        result += f"{'Worst trade:':<22s} ${worst:>+10,.2f}\n"
+        result += "```"
+        await msg.edit(content=result)
+
+    except Exception as e:
+        await msg.edit(content=f"Backtest error: {e}")
+
+def now_str():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
 @bot.command(name="pairs-scan")
 async def pairs_scan_cmd(ctx):
     """Show discovered pairs by sector from S&P 500 scan."""
