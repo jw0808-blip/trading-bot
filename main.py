@@ -1455,6 +1455,10 @@ async def on_ready():
         daily_report_task.start()
     if not alert_scan_task.is_running():
         alert_scan_task.start()
+    if not morning_briefing_task.is_running():
+        morning_briefing_task.start()
+    if not evening_briefing_task.is_running():
+        evening_briefing_task.start()
 
 
 @bot.command()
@@ -2012,6 +2016,317 @@ async def before_daily():
     await asyncio.sleep((target - now).total_seconds())
 
 
+
+
+# ============================================================================
+# MORNING / EVENING / WEEK BRIEFINGS
+# ============================================================================
+
+async def _build_morning_briefing():
+    """Comprehensive morning briefing — runs all checks, returns list of message strings."""
+    import sqlite3 as _msq
+    from zoneinfo import ZoneInfo
+    now = datetime.now(timezone.utc)
+    et_now = datetime.now(ZoneInfo("America/New_York"))
+    msgs = []
+
+    cash = PAPER_PORTFOLIO.get("cash", 0)
+    positions = PAPER_PORTFOLIO.get("positions", [])
+    total_cost = sum(p.get("cost", 0) for p in positions)
+    equity = cash + total_cost
+    total_realized = 0.0
+    try:
+        _c = _msq.connect(DB_PATH)
+        _r = _c.execute("SELECT SUM(realized_pnl) FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL").fetchone()
+        if _r and _r[0]:
+            total_realized = _r[0]
+        _c.close()
+    except Exception:
+        pass
+    ret_pct = ((equity / 25000) - 1) * 100
+
+    # Overnight activity (last 12h)
+    twelve_h_ago = (now - __import__("datetime").timedelta(hours=12)).strftime("%Y-%m-%d %H:%M")
+    overnight_closed = []
+    overnight_opened = []
+    try:
+        _c = _msq.connect(DB_PATH)
+        for r in _c.execute("SELECT market_id, strategy, realized_pnl, exit_reason FROM positions WHERE status='closed' AND closed_at>=? ORDER BY closed_at DESC LIMIT 10", (twelve_h_ago,)):
+            overnight_closed.append({"market": r[0], "strategy": r[1], "pnl": r[2], "reason": r[3]})
+        for r in _c.execute("SELECT market_id, strategy, size_usd FROM positions WHERE status='open' AND created_at>=? ORDER BY created_at DESC LIMIT 10", (twelve_h_ago,)):
+            overnight_opened.append({"market": r[0], "strategy": r[1], "size": r[2]})
+        _c.close()
+    except Exception:
+        pass
+
+    regime = get_regime("equities")
+    vix = regime.get("vix", 0) or 0
+    regime_name = regime.get("regime", "?")
+    fng_val, fng_label = get_fear_greed()
+
+    # Message 1: Portfolio + Overnight
+    m1 = f"**MORNING BRIEFING** | {et_now.strftime('%A %b %d, %I:%M %p ET')}\n```\n"
+    m1 += f"{'Cash:':<22s} ${cash:>10,.2f}\n"
+    m1 += f"{'Equity:':<22s} ${equity:>10,.2f}  ({ret_pct:+.1f}%)\n"
+    m1 += f"{'Realized P&L:':<22s} ${total_realized:>+10,.2f}\n"
+    m1 += f"{'Positions:':<22s} {len(positions):>10d}\n"
+    m1 += f"{'VIX:':<22s} {vix:>10.1f}  ({regime_name.upper()})\n"
+    m1 += f"{'Fear & Greed:':<22s} {fng_val:>10d}/100 ({fng_label})\n"
+    if _PSYCH_STATE.get("contrarian_mode"):
+        m1 += f"{'Psychologist:':<22s} {'CONTRARIAN':>10s}\n"
+    m1 += f"{'─' * 36}\n"
+    if overnight_closed:
+        m1 += f"Closed overnight ({len(overnight_closed)}):\n"
+        for oc in overnight_closed[:5]:
+            m1 += f"  {oc['market'][:28]:28s} ${oc['pnl'] or 0:>+7.2f} {(oc['reason'] or '')[:15]}\n"
+    if overnight_opened:
+        m1 += f"Opened overnight ({len(overnight_opened)}):\n"
+        for oo in overnight_opened[:5]:
+            m1 += f"  {oo['market'][:28]:28s} ${oo['size'] or 0:>7.0f} {oo['strategy'][:10]}\n"
+    if not overnight_closed and not overnight_opened:
+        m1 += f"No overnight activity\n"
+    m1 += f"```"
+    msgs.append(m1)
+
+    # Message 2: Intelligence + Oracle + Risk + Allocation + Engineer
+    m2 = "```\n"
+    m2 += "INTELLIGENCE:\n"
+    for theme in sorted(_INTEL_HEADLINE_MEMORY.keys()):
+        entries = _INTEL_HEADLINE_MEMORY.get(theme, [])
+        if entries:
+            latest = sorted(entries, key=lambda x: x[0], reverse=True)[0][1]
+            m2 += f"  [{theme:8s}] {latest[:55]}\n"
+    geo = _intel_get_geo_state()
+    if geo.get("active"):
+        m2 += f"  *** GEO ALERT: {geo['theme']} — {geo['count']} escalation headlines ***\n"
+    m2 += f"{'─' * 50}\nORACLE SIGNALS:\n"
+    try:
+        _prices = _oracle_get_all_prices()
+        _found = False
+        for title, yes_price in sorted(_prices.items(), key=lambda x: x[1], reverse=True):
+            sig = _oracle_match_signal(title)
+            if sig:
+                pct = yes_price / sig["threshold"] * 100
+                bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
+                m2 += f"  {sig['name']:14s} {bar} {pct:>5.0f}%\n"
+                _found = True
+        if not _found:
+            m2 += "  No matching signals\n"
+    except Exception:
+        m2 += "  Fetch error\n"
+    m2 += f"{'─' * 50}\nRISK: {len(_RISK_STATE.get('corr_flags', []))} correlations"
+    m2 += f" | {len(_RISK_STATE.get('strategy_pauses', {}))} pauses\n"
+    m2 += "ALLOC: " + " ".join(f"{s}={w:.1f}x" for s, w in sorted(_META_ALLOC.items()) if w != 1.0)
+    if all(v == 1.0 for v in _META_ALLOC.values()):
+        m2 += "all balanced"
+    m2 += "\n"
+    recent_eng = [e for e in _ENGINEER_LOG if (now - e["timestamp"]).total_seconds() < 43200] if _ENGINEER_LOG else []
+    if recent_eng:
+        m2 += f"ENGINEER: "
+        for adj in recent_eng[-2:]:
+            m2 += f"{adj['strategy']} {adj['metric']} {adj['old']:.2f}→{adj['new']:.2f}  "
+        m2 += "\n"
+    m2 += "```"
+    msgs.append(m2)
+
+    # Message 3: Recommendations
+    m3 = "**Today's Actions:**\n"
+    if _PSYCH_STATE.get("contrarian_mode"):
+        m3 += "• Contrarian mode active — favor mean-reversion\n"
+    if geo.get("active"):
+        m3 += f"• Geo risk: {geo['theme']} escalation — sizing at 0.5%\n"
+    if _RISK_STATE.get("strategy_pauses"):
+        m3 += f"• Paused: {', '.join(_RISK_STATE['strategy_pauses'].keys())}\n"
+    if vix > 25:
+        m3 += f"• VIX {vix:.0f} elevated — crash hedges active\n"
+    expiring = [p for p in positions if p.get("strategy") == "prediction"
+                and "march 31" in p.get("market", "").lower()]
+    if expiring:
+        m3 += f"• {len(expiring)} markets expire March 31\n"
+    if not any([_PSYCH_STATE.get("contrarian_mode"), geo.get("active"),
+                _RISK_STATE.get("strategy_pauses"), vix > 25, expiring]):
+        m3 += "• All systems green — normal operations\n"
+    msgs.append(m3)
+    return msgs
+
+
+async def _build_evening_briefing():
+    """End-of-day summary."""
+    import sqlite3 as _esq
+    from zoneinfo import ZoneInfo
+    now = datetime.now(timezone.utc)
+    et_now = datetime.now(ZoneInfo("America/New_York"))
+    today = now.strftime("%Y-%m-%d")
+    msgs = []
+
+    closed_today = []
+    opened_today = []
+    try:
+        _c = _esq.connect(DB_PATH)
+        for r in _c.execute("SELECT market_id, strategy, size_usd, realized_pnl, exit_reason FROM positions WHERE status='closed' AND closed_at>=? ORDER BY closed_at DESC", (today,)):
+            closed_today.append({"market": r[0], "strategy": r[1], "size": r[2], "pnl": r[3] or 0, "reason": r[4]})
+        for r in _c.execute("SELECT market_id, strategy, size_usd FROM positions WHERE status='open' AND created_at>=? ORDER BY created_at DESC", (today,)):
+            opened_today.append({"market": r[0], "strategy": r[1], "size": r[2]})
+        _c.close()
+    except Exception:
+        pass
+
+    net_pnl = sum(c["pnl"] for c in closed_today)
+    best = max(closed_today, key=lambda x: x["pnl"]) if closed_today else None
+    worst = min(closed_today, key=lambda x: x["pnl"]) if closed_today else None
+
+    strat_pnl = {}
+    for c in closed_today:
+        s = c["strategy"] or "?"
+        strat_pnl.setdefault(s, {"pnl": 0, "trades": 0})
+        strat_pnl[s]["pnl"] += c["pnl"]
+        strat_pnl[s]["trades"] += 1
+
+    cash = PAPER_PORTFOLIO.get("cash", 0)
+    positions = PAPER_PORTFOLIO.get("positions", [])
+    equity = cash + sum(p.get("cost", 0) for p in positions)
+
+    m1 = f"**EVENING BRIEFING** | {et_now.strftime('%A %b %d, %I:%M %p ET')}\n```\n"
+    m1 += f"{'Net P&L today:':<22s} ${net_pnl:>+10,.2f}\n"
+    m1 += f"{'Trades closed:':<22s} {len(closed_today):>10d}\n"
+    m1 += f"{'Trades opened:':<22s} {len(opened_today):>10d}\n"
+    m1 += f"{'Equity (EOD):':<22s} ${equity:>10,.2f}\n"
+    m1 += f"{'─' * 36}\n"
+    if strat_pnl:
+        for s, d in sorted(strat_pnl.items(), key=lambda x: x[1]["pnl"], reverse=True):
+            m1 += f"  {s:16s} ${d['pnl']:>+8.2f} ({d['trades']} trades)\n"
+    if best and best["pnl"] > 0:
+        m1 += f"{'─' * 36}\nBest:  {best['market'][:28]} ${best['pnl']:+.2f}\n"
+    if worst and worst["pnl"] < 0:
+        m1 += f"Worst: {worst['market'][:28]} ${worst['pnl']:+.2f}\n"
+    m1 += "```"
+    msgs.append(m1)
+
+    m2 = "```\nOVERNIGHT WATCH:\n"
+    for p in sorted(positions, key=lambda x: x.get("timestamp", ""))[:5]:
+        m2 += f"  {p.get('market', '')[:28]:28s} ${p.get('cost', 0):>6.0f} {p.get('strategy', '?')[:8]}\n"
+    expiring = [p for p in positions if p.get("strategy") == "prediction"
+                and any(x in p.get("market", "").lower() for x in ["march 31", "april 1", "march 30"])]
+    if expiring:
+        m2 += f"{'─' * 40}\nEXPIRING SOON ({len(expiring)}):\n"
+        for p in expiring:
+            m2 += f"  {p.get('market', '')[:40]} ${p.get('cost', 0):.0f}\n"
+    m2 += f"{'─' * 40}\nALLOC TOMORROW: "
+    m2 += " ".join(f"{s}={w:.1f}x" for s, w in sorted(_META_ALLOC.items()) if w != 1.0)
+    if all(v == 1.0 for v in _META_ALLOC.values()):
+        m2 += "all balanced"
+    m2 += "\n```"
+    msgs.append(m2)
+    return msgs
+
+
+async def _build_week_summary():
+    """Full week performance summary."""
+    import sqlite3 as _wsq
+    now = datetime.now(timezone.utc)
+    week_ago = (now - __import__("datetime").timedelta(days=7)).strftime("%Y-%m-%d")
+    msgs = []
+
+    try:
+        _c = _wsq.connect(DB_PATH)
+        _r = _c.execute("SELECT COUNT(*), SUM(realized_pnl), AVG(realized_pnl) FROM positions WHERE status='closed' AND closed_at>=? AND realized_pnl IS NOT NULL", (week_ago,)).fetchone()
+        total_trades, total_pnl, avg_pnl = (_r[0] or 0), (_r[1] or 0), (_r[2] or 0)
+        _w = _c.execute("SELECT COUNT(*) FROM positions WHERE status='closed' AND closed_at>=? AND realized_pnl>0", (week_ago,)).fetchone()
+        wins = _w[0] or 0
+        strat_rows = _c.execute("SELECT strategy, COUNT(*), SUM(realized_pnl), AVG(realized_pnl) FROM positions WHERE status='closed' AND closed_at>=? AND realized_pnl IS NOT NULL GROUP BY strategy ORDER BY SUM(realized_pnl) DESC", (week_ago,)).fetchall()
+        day_rows = _c.execute("SELECT DATE(closed_at), SUM(realized_pnl), COUNT(*) FROM positions WHERE status='closed' AND closed_at>=? AND realized_pnl IS NOT NULL GROUP BY DATE(closed_at) ORDER BY DATE(closed_at)", (week_ago,)).fetchall()
+        best = _c.execute("SELECT market_id, realized_pnl, strategy FROM positions WHERE status='closed' AND closed_at>=? AND realized_pnl IS NOT NULL ORDER BY realized_pnl DESC LIMIT 1", (week_ago,)).fetchone()
+        worst = _c.execute("SELECT market_id, realized_pnl, strategy FROM positions WHERE status='closed' AND closed_at>=? AND realized_pnl IS NOT NULL ORDER BY realized_pnl ASC LIMIT 1", (week_ago,)).fetchone()
+        _c.close()
+    except Exception:
+        total_trades = total_pnl = avg_pnl = wins = 0
+        strat_rows = day_rows = []
+        best = worst = None
+
+    wr = (wins / total_trades * 100) if total_trades > 0 else 0
+    equity = PAPER_PORTFOLIO.get("cash", 0) + sum(p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+
+    m1 = f"**WEEKLY SUMMARY** | Week ending {now.strftime('%Y-%m-%d')}\n```\n"
+    m1 += f"{'Trades:':<22s} {total_trades:>10d}\n"
+    m1 += f"{'Win rate:':<22s} {wr:>9.0f}%\n"
+    m1 += f"{'Total P&L:':<22s} ${total_pnl:>+10,.2f}\n"
+    m1 += f"{'Avg P&L/trade:':<22s} ${avg_pnl:>+10,.2f}\n"
+    m1 += f"{'Equity:':<22s} ${equity:>10,.2f}\n"
+    m1 += f"{'─' * 36}\n"
+    if strat_rows:
+        m1 += "BY STRATEGY:\n"
+        for strat, cnt, spnl, savg in strat_rows:
+            m1 += f"  {(strat or '?'):16s} {cnt or 0:>3d} trades  ${spnl or 0:>+8.2f}\n"
+    if day_rows:
+        m1 += f"{'─' * 36}\nBY DAY:\n"
+        for day, dpnl, dcnt in day_rows:
+            m1 += f"  {day or '?':10s} ${dpnl or 0:>+8.2f} ({dcnt} trades)\n"
+    if best:
+        m1 += f"{'─' * 36}\nBest:  {(best[0] or '')[:25]} ${best[1] or 0:+.2f}\n"
+    if worst:
+        m1 += f"Worst: {(worst[0] or '')[:25]} ${worst[1] or 0:+.2f}\n"
+    m1 += "```"
+    msgs.append(m1)
+    return msgs
+
+
+# Scheduled tasks for morning/evening briefings
+@tasks.loop(hours=24)
+async def morning_briefing_task():
+    if DISCORD_CHANNEL_ID:
+        try:
+            ch = bot.get_channel(int(DISCORD_CHANNEL_ID))
+            if ch:
+                msgs = await _build_morning_briefing()
+                for m in msgs:
+                    await ch.send(m)
+                log.info("Morning briefing sent")
+        except Exception as e:
+            log.warning("Morning briefing error: %s", e)
+
+@morning_briefing_task.before_loop
+async def before_morning():
+    await bot.wait_until_ready()
+    import asyncio
+    from zoneinfo import ZoneInfo
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    target = now_et.replace(hour=9, minute=25, second=0, microsecond=0)
+    if now_et >= target:
+        target += __import__("datetime").timedelta(days=1)
+    # Skip weekends
+    while target.weekday() >= 5:
+        target += __import__("datetime").timedelta(days=1)
+    wait_secs = (target - now_et).total_seconds()
+    log.info("Morning briefing scheduled in %.0f minutes", wait_secs / 60)
+    await asyncio.sleep(wait_secs)
+
+@tasks.loop(hours=24)
+async def evening_briefing_task():
+    if DISCORD_CHANNEL_ID:
+        try:
+            ch = bot.get_channel(int(DISCORD_CHANNEL_ID))
+            if ch:
+                msgs = await _build_evening_briefing()
+                for m in msgs:
+                    await ch.send(m)
+                log.info("Evening briefing sent")
+        except Exception as e:
+            log.warning("Evening briefing error: %s", e)
+
+@evening_briefing_task.before_loop
+async def before_evening():
+    await bot.wait_until_ready()
+    import asyncio
+    from zoneinfo import ZoneInfo
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    target = now_et.replace(hour=16, minute=5, second=0, microsecond=0)
+    if now_et >= target:
+        target += __import__("datetime").timedelta(days=1)
+    while target.weekday() >= 5:
+        target += __import__("datetime").timedelta(days=1)
+    wait_secs = (target - now_et).total_seconds()
+    log.info("Evening briefing scheduled in %.0f minutes", wait_secs / 60)
+    await asyncio.sleep(wait_secs)
 
 
 # ============================================================================
@@ -3823,6 +4138,45 @@ async def risk_status_cmd(ctx):
     msg += f"Drawdown limit: ${_RISK_STATE['drawdown_limit']}/strategy/day\n"
     msg += "```"
     await ctx.send(msg)
+
+
+@bot.command(name="morning")
+async def morning_cmd(ctx):
+    """Run the full morning briefing manually."""
+    msg = await ctx.send("Generating morning briefing...")
+    try:
+        msgs = await _build_morning_briefing()
+        await msg.delete()
+        for m in msgs:
+            await ctx.send(m)
+    except Exception as e:
+        await msg.edit(content=f"Morning briefing error: {e}")
+
+
+@bot.command(name="evening")
+async def evening_cmd(ctx):
+    """Run the end-of-day briefing manually."""
+    msg = await ctx.send("Generating evening briefing...")
+    try:
+        msgs = await _build_evening_briefing()
+        await msg.delete()
+        for m in msgs:
+            await ctx.send(m)
+    except Exception as e:
+        await msg.edit(content=f"Evening briefing error: {e}")
+
+
+@bot.command(name="week")
+async def week_cmd(ctx):
+    """Show full week performance summary."""
+    msg = await ctx.send("Generating weekly summary...")
+    try:
+        msgs = await _build_week_summary()
+        await msg.delete()
+        for m in msgs:
+            await ctx.send(m)
+    except Exception as e:
+        await msg.edit(content=f"Weekly summary error: {e}")
 
 
 @bot.command(name="security-status")
