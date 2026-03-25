@@ -1,0 +1,9 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir ib_insync
+
+COPY ib_gateway.py .
+
+CMD ["python3", "ib_gateway.py"]

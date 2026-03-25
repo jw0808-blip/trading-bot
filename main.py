@@ -3566,10 +3566,20 @@ async def oracle_status_cmd(ctx):
         one_hour_ago = now - __import__("datetime").timedelta(hours=1)
         old = [(t, p) for t, p in history if t <= one_hour_ago]
         delta = yes_price - old[-1][1] if old else 0.0
-        status = "ACTIVE" if yes_price >= sig["threshold"] else "below"
-        signal_lines.append(
-            f"  {sig['name']:16s} YES=${yes_price:.2f} Δ1h={delta:+.3f} "
-            f"thr={sig['threshold']:.2f} {status:6s} → {sig['long']}/{sig['short']}")
+        _inv = sig.get("inverse", False)
+        if _inv:
+            _geo_gs = _intel_get_geo_state()
+            _geo_ok = _geo_gs.get("active") and _geo_gs.get("theme") == sig.get("geo_required", "")
+            status = "ACTIVE" if yes_price <= sig["threshold"] and _geo_ok else "watch"
+            signal_lines.append(
+                f"  {sig['name']:16s} YES=${yes_price:.2f} Δ1h={delta:+.3f} "
+                f"inv<{sig['threshold']:.2f} {status:6s} → {sig['long']}/{sig['short']}"
+                f"{' +GEO' if _geo_ok else ''}")
+        else:
+            status = "ACTIVE" if yes_price >= sig["threshold"] else "below"
+            signal_lines.append(
+                f"  {sig['name']:16s} YES=${yes_price:.2f} Δ1h={delta:+.3f} "
+                f"thr={sig['threshold']:.2f} {status:6s} → {sig['long']}/{sig['short']}")
 
     # Oracle positions with live P&L
     _alp_hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
@@ -8677,6 +8687,20 @@ def init_db():
             trade_outcome TEXT, realized_pnl REAL,
             context TEXT, created_at TEXT DEFAULT (datetime('now'))
         )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS ib_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT, side TEXT, qty REAL, order_type TEXT DEFAULT 'MKT',
+            limit_price REAL, strategy TEXT, market_id TEXT,
+            status TEXT DEFAULT 'pending', ib_order_id TEXT,
+            error TEXT, created_at TEXT DEFAULT (datetime('now')),
+            filled_at TEXT, fill_price REAL
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS ib_fills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ib_order_id TEXT, symbol TEXT, side TEXT, qty REAL,
+            fill_price REAL, commission REAL,
+            filled_at TEXT DEFAULT (datetime('now'))
+        )""")
         conn.commit()
         conn.close()
         log.info("SQLite initialized at %s", DB_PATH)
@@ -8928,6 +8952,10 @@ ORACLE_SIGNALS = [
      "threshold": 0.65,  "long": "UUP",  "short": "EEM"},
     {"name": "iran_attack",  "keywords": ["iran", "attack", "strike", "military"],
      "threshold": 0.65,  "long": "XLE",  "short": "UAL"},
+    # Inverse signal: fires when ceasefire prob DROPS below threshold + geo confirms
+    {"name": "iran_escalation", "keywords": ["iran", "ceasefire"],
+     "threshold": 0.35, "long": "XLE", "short": "UAL",
+     "inverse": True, "geo_required": "iran", "geo_min_headlines": 5},
 ]
 
 # Price history: {market_title_lower: [(timestamp, yes_price), ...]}
@@ -9003,7 +9031,7 @@ def _intel_get_relevant_headlines(signal_name, limit=3):
     # Map signal names to themes
     theme_map = {
         "fed_hike": "fed", "fed_cut": "fed",
-        "iran_ceasefire": "iran", "iran_attack": "iran",
+        "iran_ceasefire": "iran", "iran_attack": "iran", "iran_escalation": "iran",
         "tariff": "tariff", "recession": "recession",
     }
     theme = theme_map.get(signal_name, "")
@@ -9180,8 +9208,21 @@ async def scan_oracle_signals(channel=None):
         sig = _oracle_match_signal(title)
         if not sig:
             continue
-        if yes_price < sig["threshold"]:
-            continue
+        # Threshold check: normal signals fire above threshold, inverse fire below
+        _is_inverse = sig.get("inverse", False)
+        if _is_inverse:
+            if yes_price > sig["threshold"]:
+                continue  # Inverse: only fire when prob DROPS below threshold
+            # Check geo requirement
+            _geo_req = sig.get("geo_required", "")
+            _geo_min = sig.get("geo_min_headlines", 0)
+            if _geo_req:
+                _gs = _intel_get_geo_state()
+                if not _gs.get("active") or _gs.get("theme", "") != _geo_req or _gs.get("count", 0) < _geo_min:
+                    continue  # Geo not escalated enough
+        else:
+            if yes_price < sig["threshold"]:
+                continue
 
         signal_name = sig["name"]
         market_id = f"ORACLE:{signal_name}"

@@ -48,6 +48,25 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+  ib-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.ib-gateway
+    container_name: traderjoes-ib-gateway
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - traderjoes-bot
+    profiles:
+      - ib
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
   netdata:
     image: netdata/netdata:stable
     container_name: traderjoes-netdata
