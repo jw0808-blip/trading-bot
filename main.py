@@ -3805,8 +3805,13 @@ async def cycle_cmd(ctx, *, ticker: str = ""):
                 _q = _r.json().get("quote", {})
                 _bid = float(_q.get("bp", 0) or 0)
                 _ask = float(_q.get("ap", 0) or 0)
-                _mid = (_bid + _ask) / 2
-                notes.append(f"Price: ${_mid:,.2f}")
+                # Use both sides when available, else whichever is non-zero
+                if _bid > 0 and _ask > 0:
+                    _mid = (_bid + _ask) / 2
+                else:
+                    _mid = _bid or _ask
+                if _mid > 0:
+                    notes.append(f"Price: ${_mid:,.2f}")
         except Exception:
             pass
 
@@ -4442,42 +4447,51 @@ async def backtest_cmd(ctx, strategy: str = "pairs", days: str = "90"):
 
         if strategy == "pairs":
             cfg = EQUITIES_CONFIG["pairs"]
+            _lookback = 60  # Rolling 60-day window for Z-score (no look-ahead)
             for ticker_a, ticker_b in cfg["seed"][:20]:
                 try:
-                    data_a = yf.download(ticker_a, period=f"{_days}d", progress=False)
-                    data_b = yf.download(ticker_b, period=f"{_days}d", progress=False)
-                    if len(data_a) < 50 or len(data_b) < 50:
+                    data_a = yf.download(ticker_a, period=f"{_days + _lookback}d", progress=False)
+                    data_b = yf.download(ticker_b, period=f"{_days + _lookback}d", progress=False)
+                    if len(data_a) < _lookback + 20 or len(data_b) < _lookback + 20:
                         continue
                     pa = data_a["Close"].values.flatten()
                     pb = data_b["Close"].values.flatten()
                     ml = min(len(pa), len(pb))
                     pa, pb = pa[-ml:], pb[-ml:]
                     ratio = pa / pb
-                    mean_r = float(np.mean(ratio))
-                    std_r = float(np.std(ratio))
-                    if std_r == 0:
-                        continue
-                    zscores = (ratio - mean_r) / std_r
 
-                    # Simulate entry/exit
+                    # Walk-forward: compute Z-score using ONLY past data at each point
                     in_trade = False
                     entry_z = 0
                     entry_idx = 0
-                    for i in range(len(zscores)):
-                        z = float(zscores[i])
+                    entry_ratio = 0
+                    for i in range(_lookback, len(ratio)):
+                        # Rolling window: only use data[i-lookback:i] for mean/std
+                        _window = ratio[i - _lookback:i]
+                        _mean = float(np.mean(_window))
+                        _std = float(np.std(_window))
+                        if _std == 0:
+                            continue
+                        z = float((ratio[i] - _mean) / _std)
+
                         if not in_trade and abs(z) >= cfg.get("zscore_entry", 1.0):
                             in_trade = True
                             entry_z = z
                             entry_idx = i
+                            entry_ratio = float(ratio[i])
                         elif in_trade:
+                            exited = False
                             if abs(z) < cfg.get("zscore_exit", 0.5) or (entry_z > 0 and z < 0) or (entry_z < 0 and z > 0):
-                                # Simplified PnL: z-score reversion * notional
-                                pnl = (abs(entry_z) - abs(z)) * 50  # ~$50 per z-point
-                                trades.append({"pair": f"{ticker_a}/{ticker_b}", "pnl": pnl,
-                                              "hold_days": i - entry_idx, "entry_z": entry_z})
-                                in_trade = False
+                                exited = True
                             elif i - entry_idx > cfg.get("ttl_days", 7):
-                                pnl = (abs(entry_z) - abs(z)) * 50
+                                exited = True
+                            if exited:
+                                # Realistic PnL from ratio change on $350/leg notional
+                                exit_ratio = float(ratio[i])
+                                if entry_z > 0:  # Short spread — profit when ratio falls
+                                    pnl = (entry_ratio - exit_ratio) / entry_ratio * 350
+                                else:  # Long spread — profit when ratio rises
+                                    pnl = (exit_ratio - entry_ratio) / entry_ratio * 350
                                 trades.append({"pair": f"{ticker_a}/{ticker_b}", "pnl": pnl,
                                               "hold_days": i - entry_idx, "entry_z": entry_z})
                                 in_trade = False
@@ -9659,7 +9673,13 @@ def _get_spy_price():
                          headers=hdrs, timeout=5)
         if r.status_code == 200:
             quote = r.json().get("quote", {})
-            mid = (float(quote.get("ap", 0) or 0) + float(quote.get("bp", 0) or 0)) / 2
+            _ask = float(quote.get("ap", 0) or 0)
+            _bid = float(quote.get("bp", 0) or 0)
+            # Use both sides when available, else whichever is non-zero (after hours)
+            if _bid > 0 and _ask > 0:
+                mid = (_bid + _ask) / 2
+            else:
+                mid = _bid or _ask
             if mid > 0:
                 return mid
     except Exception as e:
