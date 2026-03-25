@@ -3097,9 +3097,9 @@ async def rebalance_cmd(ctx):
     report += "================================\nUse manual transfers to rebalance. Auto-rebalance coming soon."
     await msg.edit(content=report)
 
-@bot.command(name="performance")
-async def performance_cmd(ctx):
-    """Show performance attribution by strategy, platform, and regime."""
+@bot.command(name="performance-legacy")
+async def performance_legacy_cmd(ctx):
+    """Show legacy performance attribution."""
     pt = PERFORMANCE_TRACKER
     paper_trades = len(PAPER_PORTFOLIO.get("trades", []))
     paper_cash = PAPER_PORTFOLIO["cash"]
@@ -4177,6 +4177,68 @@ async def week_cmd(ctx):
             await ctx.send(m)
     except Exception as e:
         await msg.edit(content=f"Weekly summary error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# SMS/EMAIL ALERT SYSTEM
+# ---------------------------------------------------------------------------
+TWILIO_SID = os.environ.get("TWILIO_SID", "")
+TWILIO_TOKEN = os.environ.get("TWILIO_TOKEN", "")
+TWILIO_FROM = os.environ.get("TWILIO_FROM", "")
+TWILIO_TO = os.environ.get("TWILIO_TO", "")
+SMTP_EMAIL = os.environ.get("SMTP_EMAIL", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+SMTP_TO = os.environ.get("SMTP_TO", "")
+
+
+def send_sms(message):
+    if not all([TWILIO_SID, TWILIO_TOKEN, TWILIO_FROM, TWILIO_TO]):
+        return False
+    try:
+        r = requests.post(f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_SID}/Messages.json",
+            data={"To": TWILIO_TO, "From": TWILIO_FROM, "Body": f"[TraderJoes] {message[:140]}"},
+            auth=(TWILIO_SID, TWILIO_TOKEN), timeout=10)
+        return r.status_code in (200, 201)
+    except Exception as e:
+        log.warning("SMS error: %s", e)
+        return False
+
+
+def send_email(subject, body):
+    if not all([SMTP_EMAIL, SMTP_PASSWORD]):
+        return False
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        msg = MIMEText(body)
+        msg["Subject"] = f"[TraderJoes] {subject}"
+        msg["From"] = SMTP_EMAIL
+        msg["To"] = SMTP_TO or SMTP_EMAIL
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as server:
+            server.login(SMTP_EMAIL, SMTP_PASSWORD)
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        log.warning("Email error: %s", e)
+        return False
+
+
+def send_critical_alert(subject, message):
+    sms_ok = send_sms(message)
+    email_ok = send_email(subject, message)
+    log.info("CRITICAL ALERT: %s (sms=%s email=%s)", subject, sms_ok, email_ok)
+    return sms_ok or email_ok
+
+
+@bot.command(name="alert-test")
+async def alert_test_cmd(ctx):
+    """Test SMS and email alert channels."""
+    results = []
+    sms_ok = send_sms("Alert test — TraderJoes is operational")
+    results.append(f"SMS: {'OK' if sms_ok else 'FAILED' if TWILIO_SID else 'NOT CONFIGURED'}")
+    email_ok = send_email("Alert Test", "TraderJoes alert system operational.")
+    results.append(f"Email: {'OK' if email_ok else 'FAILED' if SMTP_EMAIL else 'NOT CONFIGURED'}")
+    await ctx.send(f"**Alert Test**\n" + "\n".join(results))
 
 
 @bot.command(name="performance")
@@ -8878,6 +8940,7 @@ def _intel_geo_monitor(channel_notify=None):
             log.warning("GEO ESCALATION: %s — %d escalation headlines in 1h, sizing tightened to 0.5%%",
                         worst_theme, worst_count)
             _agent_log_event("geo", f"ESCALATION: {worst_theme} — {worst_count} headlines in 1h")
+            send_critical_alert("Geo Escalation", f"{worst_theme}: {worst_count} escalation headlines in 1h")
     else:
         if was_active:
             log.info("GEO DE-ESCALATION: %s risk subsided (%d headlines)", state["theme"], worst_count)
@@ -10360,6 +10423,7 @@ def risk_check_daily_drawdown():
                 log.warning("RISK PAUSE: %s lost $%.2f today (limit $%d) — paused 24h",
                             strat, dd, limit)
                 _agent_log_event("risk", f"PAUSE {strat}: lost ${dd:.0f} today")
+                send_critical_alert("Strategy Paused", f"{strat} lost ${dd:.0f} today — paused 24h")
 
     except Exception as e:
         log.warning("RISK drawdown check error: %s", e)
