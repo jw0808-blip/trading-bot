@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TraderJoes War Room</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'Courier New', monospace; background: #0a0e17; color: #c8d6e5; font-size: 13px; }
+.war-room { display: grid; grid-template-rows: auto 1fr auto; height: 100vh; gap: 1px; background: #1a1f2e; }
+.top-bar { display: flex; justify-content: space-around; align-items: center; padding: 10px 20px; background: #0d1117; border-bottom: 1px solid #21262d; flex-wrap: wrap; gap: 8px; }
+.metric { text-align: center; }
+.metric-label { font-size: 10px; color: #6b7280; text-transform: uppercase; letter-spacing: 1px; }
+.metric-value { font-size: 18px; font-weight: bold; }
+.metric-value.green { color: #22c55e; }
+.metric-value.red { color: #ef4444; }
+.metric-value.amber { color: #f59e0b; }
+.metric-value.blue { color: #3b82f6; }
+.main-panels { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1px; overflow: hidden; }
+.panel { background: #0d1117; padding: 12px; overflow-y: auto; }
+.panel-title { font-size: 11px; color: #58a6ff; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #21262d; padding-bottom: 6px; margin-bottom: 8px; }
+.pos-row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #161b22; font-size: 12px; }
+.pos-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pos-cost { width: 60px; text-align: right; color: #8b949e; }
+.pos-pnl { width: 55px; text-align: right; font-weight: bold; }
+.signal-row { margin-bottom: 10px; }
+.signal-name { font-size: 11px; color: #8b949e; margin-bottom: 3px; display: flex; justify-content: space-between; }
+.signal-bar-bg { height: 8px; background: #21262d; border-radius: 4px; overflow: hidden; }
+.signal-bar { height: 100%; border-radius: 4px; transition: width 0.5s ease; }
+.signal-bar.hot { background: linear-gradient(90deg, #f59e0b, #ef4444); }
+.signal-bar.warm { background: linear-gradient(90deg, #22c55e, #f59e0b); }
+.signal-bar.cool { background: #3b82f6; }
+.event-row { padding: 4px 0; border-bottom: 1px solid #161b22; font-size: 11px; }
+.event-agent { color: #58a6ff; font-weight: bold; }
+.event-time { color: #484f58; font-size: 10px; }
+.event-msg { color: #c8d6e5; }
+.bottom-bar { background: #0d1117; padding: 8px 20px; border-top: 1px solid #21262d; overflow: hidden; }
+.headline-scroll { display: flex; gap: 40px; animation: scroll 60s linear infinite; white-space: nowrap; }
+.headline { font-size: 11px; color: #8b949e; }
+.headline .theme { color: #f59e0b; font-weight: bold; }
+@keyframes scroll { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+.loading { color: #484f58; text-align: center; padding: 20px; }
+.tag { font-size: 9px; padding: 1px 4px; border-radius: 2px; margin-left: 4px; }
+.tag-pairs { background: #1f3a5f; color: #58a6ff; }
+.tag-crypto { background: #3a1f5f; color: #a855f7; }
+.tag-pred { background: #1f5f3a; color: #22c55e; }
+.tag-oracle { background: #5f3a1f; color: #f59e0b; }
+.tag-hedge { background: #5f1f1f; color: #ef4444; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const API = window.location.origin;
+const REFRESH_MS = 15000;
+
+function useApi(endpoint) {
+  const [data, setData] = React.useState(null);
+  React.useEffect(() => {
+    const fetch_ = () => {
+      fetch(`${API}${endpoint}`)
+        .then(r => r.json())
+        .then(setData)
+        .catch(() => {});
+    };
+    fetch_();
+    const iv = setInterval(fetch_, REFRESH_MS);
+    return () => clearInterval(iv);
+  }, [endpoint]);
+  return data;
+}
+
+function fmt(n, d=0) { return n != null ? `$${Number(n).toLocaleString(undefined, {minimumFractionDigits:d,maximumFractionDigits:d})}` : '—'; }
+function pnlClass(n) { return n > 0 ? 'green' : n < 0 ? 'red' : ''; }
+function stratTag(s) {
+  const m = {pairs:'tag-pairs',crypto:'tag-crypto',prediction:'tag-pred',oracle_trade:'tag-oracle',crash_hedge_put:'tag-hedge',event_synthetic:'tag-pred',options_spread:'tag-hedge',tv_signal:'tag-oracle'};
+  return <span className={`tag ${m[s]||''}`}>{(s||'?').slice(0,6)}</span>;
+}
+
+function TopBar({status}) {
+  if (!status) return <div className="top-bar"><div className="loading">Connecting...</div></div>;
+  const s = status;
+  const combined = s.realized_pnl || 0;
+  const ret = s.return_pct || 0;
+  return (
+    <div className="top-bar">
+      <div className="metric"><div className="metric-label">Cash</div><div className="metric-value">{fmt(s.cash)}</div></div>
+      <div className="metric"><div className="metric-label">Equity</div><div className="metric-value blue">{fmt(s.equity)}</div></div>
+      <div className="metric"><div className="metric-label">Combined P&L</div><div className={`metric-value ${pnlClass(combined)}`}>{fmt(combined,2)}</div></div>
+      <div className="metric"><div className="metric-label">Return</div><div className={`metric-value ${pnlClass(ret)}`}>{ret>=0?'+':''}{ret.toFixed(1)}%</div></div>
+      <div className="metric"><div className="metric-label">VIX</div><div className={`metric-value ${s.vix>25?'red':s.vix>18?'amber':'green'}`}>{s.vix?.toFixed(1)||'—'}</div></div>
+      <div className="metric"><div className="metric-label">Regime</div><div className={`metric-value ${s.regime==='extreme'?'red':s.regime==='elevated'?'amber':'green'}`}>{(s.regime||'?').toUpperCase()}</div></div>
+      <div className="metric"><div className="metric-label">F&G</div><div className={`metric-value ${s.fng_value<20?'red':s.fng_value>80?'red':s.fng_value<40?'amber':'green'}`}>{s.fng_value}/100</div></div>
+      <div className="metric"><div className="metric-label">Positions</div><div className="metric-value">{s.position_count}</div></div>
+      {s.contrarian_mode && <div className="metric"><div className="metric-value amber">CONTRARIAN</div></div>}
+    </div>
+  );
+}
+
+function Positions({status}) {
+  if (!status?.positions) return <div className="panel"><div className="panel-title">Positions</div><div className="loading">Loading...</div></div>;
+  return (
+    <div className="panel">
+      <div className="panel-title">Open Positions ({status.positions.length})</div>
+      {status.positions.map((p, i) => (
+        <div key={i} className="pos-row">
+          <span className="pos-name">{p.market}{stratTag(p.strategy)}</span>
+          <span className="pos-cost">{fmt(p.cost)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function OracleSignals({oracle}) {
+  if (!oracle?.signals) return <div className="panel"><div className="panel-title">Oracle Signals</div><div className="loading">Loading...</div></div>;
+  const geo = oracle.geo_state || {};
+  return (
+    <div className="panel">
+      <div className="panel-title">Oracle Signals {geo.active && <span style={{color:'#ef4444'}}> GEO ALERT: {geo.theme}</span>}</div>
+      {oracle.signals.map((s, i) => {
+        const pct = Math.min(s.pct_to_threshold, 100);
+        const cls = pct >= 90 ? 'hot' : pct >= 60 ? 'warm' : 'cool';
+        return (
+          <div key={i} className="signal-row">
+            <div className="signal-name">
+              <span>{s.name} {s.active && '🔴'}</span>
+              <span>{s.long}/{s.short} — ${s.yes_price.toFixed(2)} / {s.threshold.toFixed(2)}</span>
+            </div>
+            <div className="signal-bar-bg"><div className={`signal-bar ${cls}`} style={{width: `${pct}%`}} /></div>
+          </div>
+        );
+      })}
+      {oracle.signals.length === 0 && <div style={{color:'#484f58'}}>No matching signals in current markets</div>}
+    </div>
+  );
+}
+
+function IntelFeed({intel}) {
+  if (!intel?.events) return <div className="panel"><div className="panel-title">Intelligence Feed</div><div className="loading">Loading...</div></div>;
+  return (
+    <div className="panel">
+      <div className="panel-title">Intelligence Feed</div>
+      {intel.events.map((e, i) => (
+        <div key={i} className="event-row">
+          <span className="event-time">{e.timestamp?.slice(11,16)}</span>{' '}
+          <span className="event-agent">[{e.agent}]</span>{' '}
+          <span className="event-msg">{e.message}</span>
+        </div>
+      ))}
+      {intel.events.length === 0 && <div style={{color:'#484f58'}}>No agent events yet. Waiting for scan cycle...</div>}
+    </div>
+  );
+}
+
+function Headlines({oracle}) {
+  if (!oracle?.headlines) return null;
+  const all = [];
+  Object.entries(oracle.headlines).forEach(([theme, hls]) => {
+    hls.forEach(h => all.push({theme, text: h}));
+  });
+  if (all.length === 0) return null;
+  const doubled = [...all, ...all];
+  return (
+    <div className="bottom-bar">
+      <div className="headline-scroll">
+        {doubled.map((h, i) => (
+          <span key={i} className="headline"><span className="theme">[{h.theme}]</span> {h.text.slice(0,80)}</span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const status = useApi('/api/status');
+  const intel = useApi('/api/intelligence');
+  const oracle = useApi('/api/oracle');
+  return (
+    <div className="war-room">
+      <TopBar status={status} />
+      <div className="main-panels">
+        <Positions status={status} />
+        <OracleSignals oracle={oracle} />
+        <IntelFeed intel={intel} />
+      </div>
+      <Headlines oracle={oracle} />
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

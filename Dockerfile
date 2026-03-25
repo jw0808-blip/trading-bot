@@ -9,6 +9,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
 COPY ai_logger.py .
+COPY dashboard/ dashboard/
 
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 \
     CMD python3 -c "import requests; requests.get('https://discord.com/api/v10/gateway', timeout=5)" || exit 1

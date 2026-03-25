@@ -7122,7 +7122,154 @@ def _tv_execute_signal(sig_entry):
         log.warning("TV EXEC error: %s", e)
 
 
+# Rolling agent event log for War Room dashboard
+_AGENT_EVENT_LOG = []  # [{timestamp, agent, message}] — last 100 events
+
+def _agent_log_event(agent, message):
+    """Log an agent event for the War Room intelligence feed."""
+    _AGENT_EVENT_LOG.append({
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "agent": agent,
+        "message": message[:120],
+    })
+    if len(_AGENT_EVENT_LOG) > 100:
+        _AGENT_EVENT_LOG.pop(0)
+
+
+import json as _json_api
+
+def _build_api_status():
+    """Build /api/status response."""
+    cash = PAPER_PORTFOLIO.get("cash", 0)
+    positions = PAPER_PORTFOLIO.get("positions", [])
+    total_cost = sum(p.get("cost", 0) for p in positions)
+    # Realized PnL
+    total_realized = 0.0
+    try:
+        import sqlite3 as _asq
+        _c = _asq.connect(DB_PATH)
+        _r = _c.execute("SELECT SUM(realized_pnl) FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL").fetchone()
+        if _r and _r[0]:
+            total_realized = _r[0]
+        _c.close()
+    except Exception:
+        pass
+    regime = get_regime("equities")
+    fng_val, fng_label = get_fear_greed()
+    equity = cash + total_cost
+    pos_list = []
+    for p in positions:
+        pos_list.append({
+            "market": p.get("market", "")[:40],
+            "strategy": p.get("strategy", "?"),
+            "cost": p.get("cost", 0),
+            "entry_price": p.get("entry_price", 0),
+            "shares": p.get("shares", 0),
+            "timestamp": p.get("timestamp", ""),
+            "platform": p.get("platform", ""),
+            "long_leg": p.get("long_leg", ""),
+            "short_leg": p.get("short_leg", ""),
+        })
+    return {
+        "cash": cash, "equity": equity, "cost_basis": total_cost,
+        "realized_pnl": total_realized, "combined_pnl": total_realized,
+        "return_pct": ((equity / 25000) - 1) * 100 if equity > 0 else 0,
+        "vix": regime.get("vix"), "regime": regime.get("regime", "?"),
+        "fng_value": fng_val, "fng_label": fng_label,
+        "positions": pos_list, "position_count": len(positions),
+        "contrarian_mode": _PSYCH_STATE.get("contrarian_mode", False),
+        "caution_mode": _PSYCH_STATE.get("caution_mode", False),
+    }
+
+
+def _build_api_intelligence():
+    """Build /api/intelligence response."""
+    return {"events": list(reversed(_AGENT_EVENT_LOG[-20:]))}
+
+
+def _build_api_oracle():
+    """Build /api/oracle response."""
+    signals = []
+    try:
+        prices = _oracle_get_all_prices()
+        for title, yes_price in prices.items():
+            sig = _oracle_match_signal(title)
+            if sig:
+                signals.append({
+                    "name": sig["name"], "market": title[:60],
+                    "yes_price": yes_price, "threshold": sig["threshold"],
+                    "pct_to_threshold": yes_price / sig["threshold"] * 100 if sig["threshold"] > 0 else 0,
+                    "long": sig["long"], "short": sig["short"],
+                    "active": yes_price >= sig["threshold"],
+                })
+    except Exception:
+        pass
+    # Headlines
+    headlines = {}
+    for theme, entries in _INTEL_HEADLINE_MEMORY.items():
+        recent = sorted(entries, key=lambda x: x[0], reverse=True)[:3]
+        headlines[theme] = [h for _, h in recent]
+    geo = _intel_get_geo_state()
+    # Serialize datetime fields
+    _geo_safe = {k: (v.strftime("%Y-%m-%d %H:%M UTC") if hasattr(v, "strftime") else v)
+                 for k, v in geo.items()}
+    return {"signals": signals, "headlines": headlines, "geo_state": _geo_safe}
+
+
+def _build_api_risk():
+    """Build /api/risk response."""
+    return {
+        "corr_flags": [{"t1": t1, "t2": t2, "corr": c} for t1, t2, c in _RISK_STATE.get("corr_flags", [])],
+        "daily_drawdown": _RISK_STATE.get("daily_drawdown", {}),
+        "pauses": {s: t.strftime("%Y-%m-%d %H:%M UTC") for s, t in _RISK_STATE.get("strategy_pauses", {}).items()},
+        "meta_alloc": dict(_META_ALLOC),
+        "meta_pnl": {k: v.get("pnl", 0) for k, v in _META_ALLOC_PNL.items()},
+    }
+
+
 class TVWebhookHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        """Serve API endpoints and dashboard."""
+        path = self.path.split("?")[0]
+        try:
+            if path == "/api/status":
+                data = _build_api_status()
+            elif path == "/api/intelligence":
+                data = _build_api_intelligence()
+            elif path == "/api/oracle":
+                data = _build_api_oracle()
+            elif path == "/api/risk":
+                data = _build_api_risk()
+            elif path == "/dashboard" or path == "/":
+                # Serve the HTML dashboard
+                try:
+                    with open("/app/dashboard/index.html", "r") as f:
+                        html = f.read()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.end_headers()
+                    self.wfile.write(html.encode())
+                except FileNotFoundError:
+                    self.send_response(404)
+                    self.end_headers()
+                    self.wfile.write(b"Dashboard not found")
+                return
+            else:
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b'{"error":"not found"}')
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(_json_api.dumps(data).encode())
+        except Exception as exc:
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(f'{{"error":"{exc}"}}'.encode())
+
     def do_POST(self):
         try:
             length = int(self.headers.get("Content-Length", 0))
@@ -8097,6 +8244,7 @@ def _intel_geo_monitor(channel_notify=None):
             state["notified"] = False
             log.warning("GEO ESCALATION: %s — %d escalation headlines in 1h, sizing tightened to 0.5%%",
                         worst_theme, worst_count)
+            _agent_log_event("geo", f"ESCALATION: {worst_theme} — {worst_count} headlines in 1h")
     else:
         if was_active:
             log.info("GEO DE-ESCALATION: %s risk subsided (%d headlines)", state["theme"], worst_count)
@@ -9472,6 +9620,7 @@ def risk_check_daily_drawdown():
                 _RISK_STATE["strategy_pauses"][strat] = pause_until
                 log.warning("RISK PAUSE: %s lost $%.2f today (limit $%d) — paused 24h",
                             strat, dd, limit)
+                _agent_log_event("risk", f"PAUSE {strat}: lost ${dd:.0f} today")
 
     except Exception as e:
         log.warning("RISK drawdown check error: %s", e)
@@ -9677,10 +9826,12 @@ def engineer_self_improve():
                 log.info("ENGINEER: %s %s %.3f→%.3f (%s)",
                          adjustment["strategy"], adjustment["metric"],
                          adjustment["old"], adjustment["new"], adjustment["reason"][:60])
+                _agent_log_event("engineer", f"{adjustment['strategy']} {adjustment['metric']} {adjustment['old']:.3f}→{adjustment['new']:.3f}")
 
             # Always log stats even without adjustment
             log.info("ENGINEER STATS: %s wr=%.0f%% avg_pnl=$%+.2f hold=%.0fh (%d trades)",
                      strategy, actual_wr * 100, avg_pnl, avg_hold, total)
+            _agent_log_event("engineer", f"{strategy}: wr={actual_wr*100:.0f}% pnl=${avg_pnl:+.2f} ({total} trades)")
 
         conn.close()
         _ENGINEER_LAST_CHECK = now
@@ -9721,10 +9872,13 @@ def psychologist_update(channel_send_fn=None):
     if state["regime_changed"]:
         if state["contrarian_mode"]:
             log.info("PSYCHOLOGIST: CONTRARIAN MODE ON — F&G=%d (%s), bias mean-reversion", fng_val, fng_label)
+            _agent_log_event("psychologist", f"CONTRARIAN MODE — F&G={fng_val} ({fng_label})")
         elif state["caution_mode"]:
             log.info("PSYCHOLOGIST: CAUTION MODE ON — F&G=%d (%s), sizing tightened 0.5x", fng_val, fng_label)
+            _agent_log_event("psychologist", f"CAUTION MODE — F&G={fng_val} ({fng_label})")
         elif old_contrarian or old_caution:
             log.info("PSYCHOLOGIST: NORMAL MODE — F&G=%d (%s), regime cleared", fng_val, fng_label)
+            _agent_log_event("psychologist", f"NORMAL MODE — F&G={fng_val} ({fng_label})")
 
     return state
 
@@ -9915,6 +10069,7 @@ def meta_alloc_refresh():
         log.info("META-ALLOC rebalanced: top=%s(1.5x, $%+.2f) bottom=%s(%.1fx, $%+.2f)",
                  top_strat, sorted_strats[0][1]["pnl"],
                  bottom_strat, _META_ALLOC[bottom_strat], sorted_strats[-1][1]["pnl"])
+        _agent_log_event("meta-alloc", f"Rebalanced: {top_strat}=1.5x(${sorted_strats[0][1]['pnl']:+.0f}) {bottom_strat}={_META_ALLOC[bottom_strat]:.1f}x(${sorted_strats[-1][1]['pnl']:+.0f})")
         return True
 
     except Exception as e:
