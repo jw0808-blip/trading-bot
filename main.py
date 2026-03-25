@@ -2945,6 +2945,23 @@ async def paper_pnl_cmd(ctx):
                             price_src = f"L:{_ll}=${_lp:.0f} S:{_sl}=${_sp:.0f}"
                         else:
                             price_src = "no entry leg prices"
+            elif strategy == "oracle_trade":
+                _ll = pos.get("long_leg", "")
+                _sl = pos.get("short_leg", "")
+                if _ll and _sl:
+                    _rl = _pnl_req.get(f"https://data.alpaca.markets/v2/stocks/{_ll}/quotes/latest", headers=_alp_hdr, timeout=5)
+                    _rs = _pnl_req.get(f"https://data.alpaca.markets/v2/stocks/{_sl}/quotes/latest", headers=_alp_hdr, timeout=5)
+                    if _rl.status_code == 200 and _rs.status_code == 200:
+                        _lp = float(_rl.json().get("quote", {}).get("ap", 0) or 0)
+                        _sp = float(_rs.json().get("quote", {}).get("bp", 0) or 0)
+                        _el = pos.get("entry_long_price", 0)
+                        _es = pos.get("entry_short_price", 0)
+                        if _lp > 0 and _sp > 0 and _el > 0 and _es > 0:
+                            _sz = cost / 2
+                            upnl = ((_lp - _el) * (_sz / _el)) + ((_es - _sp) * (_sz / _es))
+                            price_src = f"L:{_ll}=${_lp:.0f} S:{_sl}=${_sp:.0f}"
+                        else:
+                            price_src = "no entry leg prices"
             elif strategy in ("crypto", "momentum"):
                 _tk = market.replace("CRYPTO:", "").split()[0]
                 _rc = _pnl_req.get(f"https://api.coinbase.com/v2/prices/{_tk}-USD/spot", timeout=5)
@@ -3008,6 +3025,99 @@ async def paper_pnl_cmd(ctx):
     if len(pos_lines) > 15:
         msg += f"  +{len(pos_lines)-15} more\n"
     msg += f"```"
+    await ctx.send(msg)
+
+@bot.command(name="oracle-status")
+async def oracle_status_cmd(ctx):
+    """Show Oracle Engine status: active signals, probabilities, and P&L."""
+    import requests as _os_req
+    now = datetime.now(timezone.utc)
+
+    # Fetch current prices for all prediction markets
+    prices = _oracle_get_all_prices()
+
+    # Build signal status table
+    signal_lines = []
+    for title, yes_price in prices.items():
+        sig = _oracle_match_signal(title)
+        if not sig:
+            continue
+        # Calculate 1-hour delta
+        key = title.lower()
+        history = _ORACLE_PRICE_HISTORY.get(key, [])
+        one_hour_ago = now - __import__("datetime").timedelta(hours=1)
+        old = [(t, p) for t, p in history if t <= one_hour_ago]
+        delta = yes_price - old[-1][1] if old else 0.0
+        status = "ACTIVE" if yes_price >= sig["threshold"] else "below"
+        signal_lines.append(
+            f"  {sig['name']:16s} YES=${yes_price:.2f} Δ1h={delta:+.3f} "
+            f"thr={sig['threshold']:.2f} {status:6s} → {sig['long']}/{sig['short']}")
+
+    # Oracle positions with live P&L
+    _alp_hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+    pos_lines = []
+    total_oracle_pnl = 0.0
+    for pos in PAPER_PORTFOLIO.get("positions", []):
+        if pos.get("strategy") != "oracle_trade":
+            continue
+        market = pos.get("market", "")
+        cost = pos.get("cost", 0)
+        _ll = pos.get("long_leg", "")
+        _sl = pos.get("short_leg", "")
+        _el = pos.get("entry_long_price", 0)
+        _es = pos.get("entry_short_price", 0)
+        upnl = 0.0
+        price_info = ""
+        try:
+            if _ll and _sl and _el > 0 and _es > 0:
+                _rl = _os_req.get(f"https://data.alpaca.markets/v2/stocks/{_ll}/quotes/latest", headers=_alp_hdr, timeout=5)
+                _rs = _os_req.get(f"https://data.alpaca.markets/v2/stocks/{_sl}/quotes/latest", headers=_alp_hdr, timeout=5)
+                if _rl.status_code == 200 and _rs.status_code == 200:
+                    _lp = float(_rl.json().get("quote", {}).get("ap", 0) or 0)
+                    _sp = float(_rs.json().get("quote", {}).get("bp", 0) or 0)
+                    if _lp > 0 and _sp > 0:
+                        _sz = cost / 2
+                        upnl = ((_lp - _el) * (_sz / _el)) + ((_es - _sp) * (_sz / _es))
+                        price_info = f"L:{_ll}=${_lp:.0f} S:{_sl}=${_sp:.0f}"
+        except Exception:
+            price_info = "err"
+
+        # Get current probability
+        _src = pos.get("source_market", "").lower()
+        _hist = _ORACLE_PRICE_HISTORY.get(_src, [])
+        _prob = _hist[-1][1] if _hist else pos.get("entry_price", 0)
+
+        ts_str = pos.get("timestamp", "")
+        try:
+            entry_time = datetime.strptime(ts_str, "%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc)
+            age_h = (now - entry_time).total_seconds() / 3600
+        except Exception:
+            age_h = 0
+
+        total_oracle_pnl += upnl
+        pos_lines.append(
+            f"  {market:20s} ${cost:>6.0f} ${upnl:>+8.2f} prob={_prob:.2f} age={age_h:.0f}h {price_info}")
+
+    msg = "**Oracle Engine Status**\n```\n"
+    msg += f"Positions: {len(pos_lines)} / {ORACLE_CONFIG['max_oracle_positions']} max\n"
+    msg += f"Oracle P&L: ${total_oracle_pnl:+,.2f}\n"
+    msg += f"Signals tracked: {len(prices)} markets\n"
+    msg += f"{'─' * 50}\n"
+
+    if signal_lines:
+        msg += "Signals:\n"
+        for line in signal_lines:
+            msg += line + "\n"
+    else:
+        msg += "No matching signals in current markets\n"
+
+    if pos_lines:
+        msg += f"{'─' * 50}\n"
+        msg += f"{'Position':20s} {'Cost':>6s} {'Unr P&L':>8s} {'Prob':>8s} {'Age':>5s} Price\n"
+        for line in pos_lines:
+            msg += line + "\n"
+
+    msg += "```"
     await ctx.send(msg)
 
 @bot.command(name="paper-reset")
@@ -3356,6 +3466,14 @@ async def alert_scan_task():
                         await _check_hedge_fn(_hedge_ch)
                 except Exception as hedge_err:
                     log.warning("Crash hedge scan error: %s", hedge_err)
+            # === ORACLE ENGINE (runs every cycle, market hours preferred) ===
+            try:
+                _oracle_ch = bot.get_channel(int(DISCORD_CHANNEL_ID)) if DISCORD_CHANNEL_ID else None
+                _oracle_fired = await scan_oracle_signals(_oracle_ch)
+                if _oracle_fired > 0:
+                    log.info("Oracle engine fired %d signals this cycle", _oracle_fired)
+            except Exception as _oerr:
+                log.warning("Oracle engine error: %s", _oerr)
             # Run exit manager every cycle
             try:
                 exits = await run_exit_manager()
@@ -6878,6 +6996,294 @@ CRASH_HEDGE_CONFIG = {
 }
 
 
+# ---------------------------------------------------------------------------
+# ORACLE ENGINE — Prediction-market-driven equity trades
+# ---------------------------------------------------------------------------
+ORACLE_CONFIG = {
+    "enabled": True,
+    "base_size_pct": 0.0075,         # 0.75% of portfolio per leg
+    "ttl_hours": 48,                 # Max hold time
+    "cooldown_hours": 4,             # Min hours between same signal re-entry
+    "max_oracle_positions": 4,       # Max concurrent oracle trades
+}
+
+# Signal mapping: keyword patterns → equity legs
+# Each signal has: keywords (matched against market title), threshold, long_leg, short_leg
+ORACLE_SIGNALS = [
+    {"name": "fed_hike",     "keywords": ["fed", "raise", "rate", "increase", "hike", "25", "bps"],
+     "threshold": 0.70,  "long": "XLF",  "short": "TLT"},
+    {"name": "fed_cut",      "keywords": ["fed", "cut", "rate", "lower", "decrease"],
+     "threshold": 0.70,  "long": "TLT",  "short": "XLF"},
+    {"name": "iran_ceasefire", "keywords": ["iran", "ceasefire"],
+     "threshold": 0.70,  "long": "UAL",  "short": "XLE"},
+    {"name": "recession",    "keywords": ["recession"],
+     "threshold": 0.60,  "long": "GLD",  "short": "SPY"},
+    {"name": "tariff",       "keywords": ["tariff", "increase"],
+     "threshold": 0.65,  "long": "UUP",  "short": "EEM"},
+    {"name": "iran_attack",  "keywords": ["iran", "attack", "strike", "military"],
+     "threshold": 0.65,  "long": "XLE",  "short": "UAL"},
+]
+
+# Price history: {market_title_lower: [(timestamp, yes_price), ...]}
+_ORACLE_PRICE_HISTORY = {}
+
+
+def _oracle_match_signal(market_title):
+    """Match a market title against ORACLE_SIGNALS. Returns matching signal or None."""
+    title_lower = market_title.lower()
+    for sig in ORACLE_SIGNALS:
+        # All keywords must be present in the title
+        if all(kw in title_lower for kw in sig["keywords"]):
+            return sig
+    return None
+
+
+def _oracle_get_all_prices():
+    """Fetch YES prices for all active Polymarket + Kalshi markets. Returns {title: yes_price}."""
+    prices = {}
+    # Polymarket
+    try:
+        for mkt in get_polymarket_markets(limit=30):
+            title = mkt.get("question", mkt.get("title", ""))[:80]
+            yes_price = 0.0
+            op = mkt.get("outcomePrices", "")
+            if op:
+                try:
+                    parsed = json.loads(op) if isinstance(op, str) else op
+                    if len(parsed) >= 1:
+                        yes_price = float(parsed[0])
+                except (json.JSONDecodeError, ValueError, IndexError):
+                    pass
+            if yes_price <= 0:
+                tokens = mkt.get("tokens", [])
+                if len(tokens) >= 1:
+                    yes_price = float(tokens[0].get("price", 0))
+            if yes_price > 0 and title:
+                prices[title] = yes_price
+    except Exception as e:
+        log.warning("Oracle Polymarket fetch: %s", e)
+    # Kalshi
+    try:
+        for event in get_kalshi_events(limit=10)[:5]:
+            for mkt in get_kalshi_markets_for_event(event.get("event_ticker", "")):
+                title = mkt.get("title", "")[:80]
+                yes_price = (mkt.get("yes_ask", 0) / 100.0) if mkt.get("yes_ask") else 0
+                if yes_price > 0 and title:
+                    prices[title] = yes_price
+    except Exception as e:
+        log.warning("Oracle Kalshi fetch: %s", e)
+    return prices
+
+
+async def scan_oracle_signals(channel=None):
+    """Oracle Engine scanner — runs every 10-min cycle.
+    Fetches prediction market prices, detects threshold crossings, executes equity trades."""
+    if not ORACLE_CONFIG["enabled"]:
+        return 0
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        return 0
+
+    now = datetime.now(timezone.utc)
+    prices = _oracle_get_all_prices()
+    if not prices:
+        return 0
+
+    # Update price history
+    for title, px in prices.items():
+        key = title.lower()
+        if key not in _ORACLE_PRICE_HISTORY:
+            _ORACLE_PRICE_HISTORY[key] = []
+        _ORACLE_PRICE_HISTORY[key].append((now, px))
+        # Keep only last 2 hours of data
+        cutoff = now - __import__("datetime").timedelta(hours=2)
+        _ORACLE_PRICE_HISTORY[key] = [(t, p) for t, p in _ORACLE_PRICE_HISTORY[key] if t > cutoff]
+
+    # Count existing oracle positions
+    oracle_count = sum(1 for p in PAPER_PORTFOLIO.get("positions", [])
+                       if p.get("strategy") == "oracle_trade")
+    if oracle_count >= ORACLE_CONFIG["max_oracle_positions"]:
+        log.info("ORACLE: %d positions open (max %d)", oracle_count, ORACLE_CONFIG["max_oracle_positions"])
+        return 0
+
+    fired = 0
+    for title, yes_price in prices.items():
+        sig = _oracle_match_signal(title)
+        if not sig:
+            continue
+        if yes_price < sig["threshold"]:
+            continue
+
+        signal_name = sig["name"]
+        market_id = f"ORACLE:{signal_name}"
+
+        # Dedup: already open?
+        if any(p.get("market", "") == market_id for p in PAPER_PORTFOLIO.get("positions", [])):
+            continue
+
+        # Cooldown: check SQLite for recently closed
+        try:
+            import sqlite3 as _osq
+            _oc = _osq.connect(DB_PATH)
+            _ocr = _oc.cursor()
+            _ocr.execute("SELECT closed_at FROM positions WHERE market_id=? AND status='closed' ORDER BY closed_at DESC LIMIT 1", (market_id,))
+            _orow = _ocr.fetchone()
+            _oc.close()
+            if _orow and _orow[0]:
+                _oct = datetime.fromisoformat(_orow[0]).replace(tzinfo=timezone.utc)
+                _omins = (now - _oct).total_seconds() / 60
+                if _omins < ORACLE_CONFIG["cooldown_hours"] * 60:
+                    log.info("ORACLE COOLDOWN: %s closed %.0f min ago", signal_name, _omins)
+                    continue
+        except Exception:
+            pass
+
+        # Calculate 1-hour delta
+        key = title.lower()
+        delta_1h = 0.0
+        history = _ORACLE_PRICE_HISTORY.get(key, [])
+        one_hour_ago = now - __import__("datetime").timedelta(hours=1)
+        old_prices = [(t, p) for t, p in history if t <= one_hour_ago]
+        if old_prices:
+            delta_1h = yes_price - old_prices[-1][1]
+
+        # Half-Kelly sizing at 0.75% base
+        portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
+            p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+        base_size = portfolio_value * ORACLE_CONFIG["base_size_pct"]
+        # Scale by conviction: higher probability & larger delta = more size
+        kelly_mult = min(yes_price * (1 + abs(delta_1h) * 5), 2.0)
+        leg_size = base_size * kelly_mult
+
+        if leg_size < 10:
+            continue
+
+        long_tk = sig["long"]
+        short_tk = sig["short"]
+
+        log.info("ORACLE SIGNAL: %s YES=$%.2f (Δ1h=%+.3f) → Long %s / Short %s | $%.0f/leg",
+                 signal_name, yes_price, delta_1h, long_tk, short_tk, leg_size)
+
+        # Execute both legs via Alpaca
+        import math as _omath
+        _alp_hdr = {
+            "APCA-API-KEY-ID": ALPACA_API_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+            "Content-Type": "application/json",
+        }
+        _alp_url = f"{ALPACA_BASE_URL}/v2/orders"
+        _data_hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+
+        try:
+            # Long leg — buy with notional
+            _long_body = {
+                "symbol": long_tk, "notional": str(round(leg_size, 2)),
+                "side": "buy", "type": "market", "time_in_force": "day",
+            }
+            _rl = requests.post(_alp_url, json=_long_body, headers=_alp_hdr, timeout=10)
+            if _rl.status_code not in (200, 201):
+                log.warning("ORACLE LONG FAILED: %s HTTP %d: %s", long_tk, _rl.status_code, _rl.text[:200])
+                continue
+            _long_oid = _rl.json().get("id", "unknown")
+            log.info("ORACLE LONG ORDER: %s id=%s", long_tk, _long_oid)
+
+            # Short leg — whole shares only
+            _short_price = 0
+            try:
+                _sq = requests.get(f"https://data.alpaca.markets/v2/stocks/{short_tk}/quotes/latest",
+                                   headers=_data_hdr, timeout=5)
+                if _sq.status_code == 200:
+                    _short_price = float(_sq.json().get("quote", {}).get("ap", 0) or 0)
+            except Exception:
+                pass
+            _short_shares = _omath.floor(leg_size / _short_price) if _short_price > 0 else 0
+            if _short_shares < 1:
+                log.warning("ORACLE SHORT SKIP: %s — 0 shares at $%.2f", short_tk, _short_price)
+                try:
+                    requests.delete(f"{_alp_url}/{_long_oid}", headers=_alp_hdr, timeout=5)
+                except Exception:
+                    pass
+                continue
+
+            _short_body = {
+                "symbol": short_tk, "qty": str(_short_shares),
+                "side": "sell", "type": "market", "time_in_force": "day",
+            }
+            _rs = requests.post(_alp_url, json=_short_body, headers=_alp_hdr, timeout=10)
+            if _rs.status_code not in (200, 201):
+                log.warning("ORACLE SHORT FAILED: %s HTTP %d: %s — cancelling long", short_tk, _rs.status_code, _rs.text[:200])
+                try:
+                    requests.delete(f"{_alp_url}/{_long_oid}", headers=_alp_hdr, timeout=5)
+                except Exception:
+                    pass
+                continue
+            _short_oid = _rs.json().get("id", "unknown")
+            log.info("ORACLE SHORT ORDER: %s id=%s", short_tk, _short_oid)
+
+            # Get fill prices
+            _entry_long_price = 0
+            _entry_short_price = 0
+            try:
+                _ql = requests.get(f"https://data.alpaca.markets/v2/stocks/{long_tk}/quotes/latest", headers=_data_hdr, timeout=5)
+                if _ql.status_code == 200:
+                    _entry_long_price = float(_ql.json().get("quote", {}).get("ap", 0) or 0)
+                _entry_short_price = _short_price  # Already fetched
+            except Exception:
+                pass
+
+            total_cost = leg_size * 2
+            if total_cost > PAPER_PORTFOLIO.get("cash", 0):
+                log.warning("ORACLE: insufficient cash $%.0f for $%.0f trade", PAPER_PORTFOLIO.get("cash", 0), total_cost)
+                continue
+
+            PAPER_PORTFOLIO["cash"] -= total_cost
+            _oracle_pos = {
+                "market": market_id,
+                "side": f"Long {long_tk} / Short {short_tk}",
+                "shares": 1, "entry_price": yes_price, "cost": total_cost,
+                "value": total_cost,
+                "timestamp": now.strftime("%Y-%m-%d %H:%M UTC"),
+                "platform": "Alpaca", "ev": delta_1h,
+                "strategy": "oracle_trade",
+                "long_leg": long_tk, "short_leg": short_tk,
+                "entry_long_price": _entry_long_price,
+                "entry_short_price": _entry_short_price,
+                "signal_threshold": sig["threshold"],
+                "source_market": title[:60],
+                "long_order_id": _long_oid,
+                "short_order_id": _short_oid,
+            }
+            PAPER_PORTFOLIO["positions"].append(_oracle_pos)
+            db_log_paper_trade(_oracle_pos)
+            db_open_position(
+                market_id=market_id, platform="Alpaca", strategy="oracle_trade",
+                direction=f"Long {long_tk} / Short {short_tk}",
+                size_usd=total_cost, shares=1, entry_price=yes_price,
+                long_leg=long_tk, short_leg=short_tk,
+                metadata={"signal": signal_name, "threshold": sig["threshold"],
+                          "yes_price": yes_price, "delta_1h": delta_1h,
+                          "source_market": title[:60],
+                          "long_order_id": _long_oid, "short_order_id": _short_oid,
+                          "entry_long_price": _entry_long_price,
+                          "entry_short_price": _entry_short_price},
+            )
+
+            fired += 1
+            log.info("ORACLE TRADE: %s | YES=$%.2f | Long %s / Short %s | $%.0f",
+                     signal_name, yes_price, long_tk, short_tk, total_cost)
+            if channel:
+                try:
+                    await channel.send(
+                        f"**ORACLE TRADE** — {signal_name}\n"
+                        f"Signal: {title[:50]} YES=${yes_price:.2f} (Δ1h={delta_1h:+.3f})\n"
+                        f"Long {long_tk} / Short {short_tk} | ${total_cost:.0f}")
+                except Exception:
+                    pass
+        except Exception as _oe:
+            log.warning("Oracle execution error for %s: %s", signal_name, _oe)
+
+    return fired
+
+
 def _get_spy_price():
     """Fetch current SPY price from Alpaca."""
     try:
@@ -7275,6 +7681,26 @@ async def run_exit_manager(channel=None):
                     if _spot > 0 and _ep > 0 and _sh > 0:
                         current_price = _spot * _sh
                         log.info("CRYPTO PRICE: %s spot=$%.4f value=$%.2f", _tk, _spot, current_price)
+            elif strategy == "oracle_trade":
+                # Fetch live prices for both legs via Alpaca
+                _oll = pos.get("long_leg", "")
+                _osl = pos.get("short_leg", "")
+                if _oll and _osl:
+                    _hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+                    _orl = _pr.get(f"https://data.alpaca.markets/v2/stocks/{_oll}/quotes/latest", headers=_hdr, timeout=5)
+                    _ors = _pr.get(f"https://data.alpaca.markets/v2/stocks/{_osl}/quotes/latest", headers=_hdr, timeout=5)
+                    if _orl.status_code == 200 and _ors.status_code == 200:
+                        _olp = float(_orl.json().get("quote", {}).get("ap", 0) or 0)
+                        _osp = float(_ors.json().get("quote", {}).get("ap", 0) or 0)
+                        _oel = pos.get("entry_long_price", 0)
+                        _oes = pos.get("entry_short_price", 0)
+                        if _olp > 0 and _osp > 0 and _oel > 0 and _oes > 0:
+                            _osz = pos.get("cost", 0) / 2
+                            _olpnl = (_olp - _oel) * (_osz / _oel)
+                            _ospnl = (_oes - _osp) * (_osz / _oes)
+                            current_price = pos.get("cost", 0) + _olpnl + _ospnl
+                            log.info("ORACLE PRICE: %s L:%s=$%.2f S:%s=$%.2f net=$%+.2f",
+                                     market[:20], _oll, _olpnl, _osl, _ospnl, _olpnl + _ospnl)
             elif strategy == "crash_hedge_put":
                 # Fetch option price from Alpaca options API
                 _opt_sym = pos.get("option_symbol", "")
@@ -7362,6 +7788,31 @@ async def run_exit_manager(channel=None):
                     exit_reason = f"FUNDING-ARB TTL: {age_hours:.0f}h"
                 else:
                     log.info("ARB POS: %s age=%.0fh rate=%.4f%%", market[:20], age_hours, pos.get("entry_price", 0) * 100)
+            elif strategy == "oracle_trade":
+                # Check if signal is still valid — re-fetch probability
+                _src_mkt = pos.get("source_market", "")
+                _sig_thresh = pos.get("signal_threshold", 0.65)
+                _current_prob = 0.0
+                if _src_mkt:
+                    _all_px = _oracle_get_all_prices() if not _ORACLE_PRICE_HISTORY else {}
+                    # Check price history first (populated by scan_oracle_signals)
+                    _hkey = _src_mkt.lower()
+                    _hist = _ORACLE_PRICE_HISTORY.get(_hkey, [])
+                    if _hist:
+                        _current_prob = _hist[-1][1]
+                    else:
+                        _current_prob = _all_px.get(_src_mkt, 0)
+                # Signal invalidated — probability dropped below threshold
+                if _current_prob > 0 and _current_prob < _sig_thresh:
+                    exit_reason = f"ORACLE INVALIDATED: prob={_current_prob:.2f} < {_sig_thresh:.2f}"
+                # TTL
+                elif age_hours > ORACLE_CONFIG["ttl_hours"]:
+                    exit_reason = f"ORACLE TTL: {age_hours:.0f}h"
+                else:
+                    _opnl = ""
+                    if current_price is not None:
+                        _opnl = f" pnl=${current_price - pos.get('cost', 0):+.2f}"
+                    log.info("ORACLE POS: %s age=%.0fh prob=%.2f%s", market[:25], age_hours, _current_prob, _opnl)
             elif strategy == "crash_hedge_put":
                 # Price-based exits: 100% gain (double) or 50% loss (stop)
                 _cost = pos.get("cost", 0)
