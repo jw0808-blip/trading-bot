@@ -1326,7 +1326,7 @@ def get_market_forecast():
         "top_headlines": headlines[:5],
     }
 
-CRYPTO_MEME_BLACKLIST = {"SHIB","DOGE","PEPE","FLOKI","BONK","WIF","RAIN","HYPE","BOME","MEME","TRUMP","MELANIA"}
+CRYPTO_MEME_BLACKLIST = {"SHIB","DOGE","PEPE","FLOKI","BONK","WIF","RAIN","HYPE","BOME","MEME","TRUMP","MELANIA","SIREN"}
 CRYPTO_MIN_VOLUME_24H = 10_000_000  # $10M minimum 24h volume
 CRYPTO_MIN_PRICE = 1.00  # Skip assets under $1.00
 
