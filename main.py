@@ -10686,6 +10686,118 @@ def engineer_self_improve():
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# MASTER ARBITER — Conflict resolution matrix for ALL trades
+# ---------------------------------------------------------------------------
+
+def arbiter_check(strategy, ticker_a, ticker_b=None, zscore=None, corr=None,
+                  is_momentum=False, conviction_score=0):
+    """Master arbiter: run all checks in hierarchy. Returns (proceed, size_mult, reasons).
+    Check order: Risk → Psychologist → Monte Carlo → Historian → AI Consensus."""
+    reasons = []
+    size_mult = 1.0
+
+    # Level 1: Risk Agent veto
+    if risk_is_strategy_paused(strategy):
+        reasons.append(f"L1 RISK: {strategy} paused — STOP")
+        _agent_log_event("arbiter", f"BLOCKED {strategy}: paused")
+        return False, 0, reasons
+    if ticker_a:
+        blocked, reason = risk_is_correlated_blocked(ticker_a)
+        if blocked:
+            reasons.append(f"L1 RISK: {ticker_a} corr blocked ({reason}) — STOP")
+            _agent_log_event("arbiter", f"BLOCKED {ticker_a}: {reason}")
+            return False, 0, reasons
+    if ticker_b:
+        blocked, reason = risk_is_correlated_blocked(ticker_b)
+        if blocked:
+            reasons.append(f"L1 RISK: {ticker_b} corr blocked ({reason}) — STOP")
+            return False, 0, reasons
+    reasons.append("L1 RISK: PASS")
+
+    # Level 2: Psychologist veto
+    if _PSYCH_STATE.get("caution_mode") and is_momentum:
+        reasons.append("L2 PSYCH: CAUTION + momentum — STOP")
+        _agent_log_event("arbiter", f"BLOCKED {ticker_a}: caution mode + momentum")
+        return False, 0, reasons
+    if _PSYCH_STATE.get("contrarian_mode"):
+        if not is_momentum:  # Mean reversion in contrarian = good
+            size_mult *= 1.5
+            reasons.append("L2 PSYCH: CONTRARIAN + mean-reversion — 1.5x")
+        else:
+            reasons.append("L2 PSYCH: CONTRARIAN + momentum — STOP")
+            return False, 0, reasons
+    else:
+        psych_m = psychologist_size_multiplier()
+        size_mult *= psych_m
+        reasons.append(f"L2 PSYCH: {psych_m:.1f}x")
+
+    # Level 3: Monte Carlo gate
+    if ticker_a:
+        try:
+            _mc = montecarlo_simulate(ticker_a, ticker_b, entry_zscore=zscore,
+                                       horizon_days=7 if ticker_b else 3)
+            if _mc.get("available"):
+                prob = _mc["prob_profit"]
+                if prob < 0.45:
+                    reasons.append(f"L3 MC: prob={prob:.0%} — SKIP")
+                    _agent_log_event("arbiter", f"BLOCKED {ticker_a}: MC prob {prob:.0%}")
+                    return False, 0, reasons
+                elif prob < 0.55:
+                    size_mult *= 0.5
+                    reasons.append(f"L3 MC: prob={prob:.0%} — REDUCE 0.5x")
+                else:
+                    reasons.append(f"L3 MC: prob={prob:.0%} — PASS")
+            else:
+                reasons.append("L3 MC: no data — PASS")
+        except Exception:
+            reasons.append("L3 MC: error — PASS")
+
+    # Level 4: Historian multiplier (pairs only)
+    if ticker_b and strategy == "pairs":
+        _hs = historian_analyze_pair(ticker_a, ticker_b)
+        _hm = historian_size_multiplier(_hs)
+        size_mult *= _hm
+        if _hs.get("available"):
+            reasons.append(f"L4 HIST: revert={_hs['reversion_rate']*100:.0f}% — {_hm:.1f}x")
+        else:
+            reasons.append("L4 HIST: no data — 1.0x")
+
+    # Level 5: AI Consensus (high conviction only)
+    # Only query AI if score > 70 AND MC > 60% but Historian < 50%
+    if conviction_score > 70 and OPENAI_API_KEY:
+        try:
+            _mc_check = montecarlo_simulate(ticker_a, ticker_b, entry_zscore=zscore, horizon_days=5)
+            _mc_prob = _mc_check.get("prob_profit", 0.5) if _mc_check.get("available") else 0.5
+            _hist_rate = historian_analyze_pair(ticker_a, ticker_b).get("reversion_rate", 0.5) if ticker_b else 0.5
+            if _mc_prob > 0.60 and _hist_rate < 0.50:
+                _verdict, _reason = ai_get_second_opinion(
+                    f"{ticker_a}/{ticker_b}" if ticker_b else ticker_a,
+                    "LONG" if (zscore and zscore < 0) else "SHORT",
+                    conviction_score, [f"MC prob {_mc_prob:.0%}", f"Historian revert {_hist_rate:.0%}"])
+                if _verdict == "REJECT":
+                    reasons.append(f"L5 AI: REJECT — {_reason[:40]}")
+                    return False, 0, reasons
+                elif _verdict == "REDUCE":
+                    size_mult *= 0.5
+                    reasons.append(f"L5 AI: REDUCE — {_reason[:40]}")
+                else:
+                    reasons.append(f"L5 AI: APPROVE")
+            else:
+                reasons.append("L5 AI: not needed (MC/Hist aligned)")
+        except Exception:
+            reasons.append("L5 AI: error — PASS")
+
+    # Meta-allocation
+    _meta = meta_alloc_multiplier(strategy)
+    size_mult *= _meta
+    if _meta != 1.0:
+        reasons.append(f"META: {strategy}={_meta:.1f}x")
+
+    _agent_log_event("arbiter", f"APPROVED {ticker_a or '?'}/{ticker_b or '-'} {strategy} {size_mult:.2f}x")
+    return True, size_mult, reasons
+
+
 # SHADOW TRADING — 10x parallel portfolio for sizing validation
 # ---------------------------------------------------------------------------
 
@@ -11328,35 +11440,18 @@ def scan_pairs_opportunities():
                          ticker_a, ticker_b, _hist_stats["reversion_rate"] * 100,
                          _hist_stats["avg_reversion_days"], _hist_stats["max_adverse_z"],
                          _hist_stats["sample_size"], _hist_mult)
-            # Risk Management: check strategy pause and correlation
-            if risk_is_strategy_paused("pairs"):
-                log.info("RISK BLOCK: pairs strategy paused")
+            # Master Arbiter: unified pre-trade check
+            _arb_ok, _arb_mult, _arb_reasons = arbiter_check(
+                "pairs", ticker_a, ticker_b, zscore=zscore, corr=corr)
+            if not _arb_ok:
+                log.info("ARBITER BLOCK: %s/%s — %s", ticker_a, ticker_b, _arb_reasons[-1] if _arb_reasons else "?")
                 continue
-            _corr_blocked, _corr_reason = risk_is_correlated_blocked(ticker_a)
-            if not _corr_blocked:
-                _corr_blocked, _corr_reason = risk_is_correlated_blocked(ticker_b)
-            if _corr_blocked:
-                log.info("RISK BLOCK: %s/%s concentration risk (%s)", ticker_a, ticker_b, _corr_reason)
-                continue
-            # Monte Carlo Agent: simulate spread paths
-            _mc = montecarlo_simulate(ticker_a, ticker_b, entry_zscore=zscore, horizon_days=7)
-            _mc_mult, _mc_skip = montecarlo_size_adjustment(_mc)
-            if _mc.get("available"):
-                log.info("MONTE CARLO: %s/%s prob=%.0f%% EV=%.4f maxDD95=%.4f kelly=%.1f%% → %s",
-                         ticker_a, ticker_b, _mc["prob_profit"] * 100, _mc["expected_value"],
-                         _mc["max_drawdown_95"], _mc["kelly_fraction"] * 100,
-                         "SKIP" if _mc_skip else f"{_mc_mult:.1f}x")
-            if _mc_skip:
-                log.info("MONTE CARLO SKIP: %s/%s prob=%.0f%% below 45%% threshold",
-                         ticker_a, ticker_b, _mc["prob_profit"] * 100)
-                continue
+            log.info("ARBITER: %s/%s approved %.2fx (%d checks)", ticker_a, ticker_b, _arb_mult, len(_arb_reasons))
             # Auto-execute pairs trade in paper mode
             if TRADING_MODE == "paper" and AUTO_PAPER_ENABLED:
                 _base_size = PAPER_PORTFOLIO.get("cash", 25000) * 0.015  # 1.5% per leg base
                 _kelly_mult = min((abs(zscore) / 2.0) * corr, 2.0)  # Half-Kelly scaling
-                _psych_mult = psychologist_size_multiplier()
-                _meta_mult = meta_alloc_multiplier("pairs")
-                _pair_size = _base_size * _kelly_mult * _hist_mult * _psych_mult * _mc_mult * _meta_mult
+                _pair_size = _base_size * _kelly_mult * _hist_mult * _arb_mult
                 if direction == "short_a_long_b":
                     _long_tk, _short_tk = ticker_b, ticker_a
                 else:
