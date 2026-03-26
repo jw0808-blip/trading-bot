@@ -7551,6 +7551,112 @@ def get_alpaca_balance():
         return f"Error: {exc}"
 
 
+def _alpaca_limit_at_mid(symbol, side, notional=None, qty=None, max_attempts=3, timeout_sec=45):
+    """Submit limit order at bid/ask midpoint, retry up to max_attempts, fallback to market.
+    Returns (order_id, fill_price, fill_type) where fill_type is 'limit' or 'market'."""
+    import requests as _lreq, time as _ltime
+    _hdr = {
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+        "Content-Type": "application/json",
+    }
+    _data_hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+    _orders_url = f"{ALPACA_BASE_URL}/v2/orders"
+
+    for attempt in range(1, max_attempts + 1):
+        # Fetch current bid/ask
+        try:
+            _qr = _lreq.get(f"https://data.alpaca.markets/v2/stocks/{symbol}/quotes/latest",
+                            headers=_data_hdr, timeout=5)
+            _qd = _qr.json().get("quote", {}) if _qr.status_code == 200 else {}
+            _bid = float(_qd.get("bp", 0) or 0)
+            _ask = float(_qd.get("ap", 0) or 0)
+        except Exception:
+            _bid, _ask = 0, 0
+
+        if _bid <= 0 or _ask <= 0:
+            log.warning("LIMIT-MID: %s no quote (bid=%.2f ask=%.2f) — skip to market", symbol, _bid, _ask)
+            break  # Fall through to market order
+
+        _mid = round((_bid + _ask) / 2, 2)
+        _body = {
+            "symbol": symbol,
+            "side": side,
+            "type": "limit",
+            "limit_price": str(_mid),
+            "time_in_force": "day",
+        }
+        if notional is not None:
+            # Limit orders require qty, not notional — estimate shares from mid
+            _est_shares = round(notional / _mid, 4) if _mid > 0 else 0
+            if _est_shares <= 0:
+                break
+            _body["qty"] = str(_est_shares)
+        elif qty is not None:
+            _body["qty"] = str(qty)
+
+        _r = _lreq.post(_orders_url, json=_body, headers=_hdr, timeout=10)
+        if _r.status_code not in (200, 201):
+            log.warning("LIMIT-MID: %s attempt %d submit failed: %s", symbol, attempt, _r.text[:200])
+            break  # Fall through to market
+
+        _oid = _r.json().get("id", "")
+        log.info("LIMIT-MID: %s attempt %d limit=$%.2f (bid=%.2f ask=%.2f) id=%s",
+                 symbol, attempt, _mid, _bid, _ask, _oid[:12])
+
+        # Poll for fill
+        _deadline = _ltime.time() + timeout_sec
+        _filled = False
+        _fill_price = 0
+        while _ltime.time() < _deadline:
+            _ltime.sleep(5)
+            try:
+                _sr = _lreq.get(f"{_orders_url}/{_oid}", headers=_hdr, timeout=5)
+                if _sr.status_code == 200:
+                    _sd = _sr.json()
+                    if _sd.get("status") == "filled":
+                        _fill_price = float(_sd.get("filled_avg_price", 0) or 0)
+                        _filled = True
+                        break
+                    elif _sd.get("status") in ("canceled", "expired", "rejected"):
+                        break
+            except Exception:
+                pass
+
+        if _filled:
+            log.info("LIMIT-MID FILL: %s at $%.2f (mid was $%.2f, spread saved est $%.4f)",
+                     symbol, _fill_price, _mid, abs(_ask - _mid) if side == "buy" else abs(_mid - _bid))
+            return _oid, _fill_price, "limit"
+
+        # Not filled — cancel and retry with fresh mid
+        try:
+            _lreq.delete(f"{_orders_url}/{_oid}", headers=_hdr, timeout=5)
+            log.info("LIMIT-MID: %s attempt %d cancelled (unfilled after %ds)", symbol, attempt, timeout_sec)
+        except Exception:
+            pass
+
+    # --- Fallback to market order ---
+    log.info("LIMIT-MID FALLBACK: %s → market order after %d limit attempts", symbol, max_attempts)
+    _mbody = {"symbol": symbol, "side": side, "type": "market", "time_in_force": "day"}
+    if notional is not None:
+        _mbody["notional"] = str(round(notional, 2))
+    elif qty is not None:
+        _mbody["qty"] = str(qty)
+    try:
+        _mr = _lreq.post(_orders_url, json=_mbody, headers=_hdr, timeout=10)
+        if _mr.status_code in (200, 201):
+            _md = _mr.json()
+            _moid = _md.get("id", "unknown")
+            _mfp = float(_md.get("filled_avg_price", 0) or 0)
+            return _moid, _mfp, "market"
+        else:
+            log.warning("LIMIT-MID MARKET FALLBACK FAILED: %s HTTP %d: %s", symbol, _mr.status_code, _mr.text[:200])
+            return None, 0, "failed"
+    except Exception as _me:
+        log.warning("LIMIT-MID MARKET FALLBACK ERROR: %s %s", symbol, _me)
+        return None, 0, "failed"
+
+
 async def execute_alpaca_order(action, symbol, amount):
     """Place an order via Alpaca API. Returns (success, message)."""
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
@@ -9743,10 +9849,10 @@ def _get_spy_price():
 
 
 def _build_options_symbol(underlying, expiry_date, strike, option_type="P"):
-    """Build OCC options symbol. e.g. SPY   260328P00550000"""
+    """Build OCC options symbol. e.g. SPY260328P00550000"""
     date_str = expiry_date.strftime("%y%m%d")
     strike_int = int(strike * 1000)
-    return f"{underlying:<6s}{date_str}{option_type}{strike_int:08d}"
+    return f"{underlying}{date_str}{option_type}{strike_int:08d}"
 
 
 async def execute_spy_put_hedge(spy_price, portfolio_value):
@@ -10086,10 +10192,13 @@ async def run_exit_manager(channel=None):
             continue
         age_hours = (now - entry_time).total_seconds() / 3600
         strategy = pos.get("strategy", "prediction")
+        market = pos.get("market", "")
         # Fix: detect crypto by platform for legacy positions with wrong strategy label
         if pos.get("platform", "").lower() == "crypto" and strategy not in ("crypto", "momentum"):
             strategy = "crypto"
-        market = pos.get("market", "")
+        # Fix: detect hedge puts by market name for positions saved with wrong strategy label
+        if market.startswith("HEDGE:SPY PUT") and strategy != "crash_hedge_put":
+            strategy = "crash_hedge_put"
 
         # --- Fetch current price for strategies with live feeds ---
         current_price = None
@@ -10271,12 +10380,31 @@ async def run_exit_manager(channel=None):
                         _opnl = f" pnl=${current_price - pos.get('cost', 0):+.2f}"
                     log.info("ORACLE POS: %s age=%.0fh prob=%.2f%s", market[:25], age_hours, _current_prob, _opnl)
             elif strategy == "crash_hedge_put":
-                # Price-based exits: 100% gain (double) or 50% loss (stop)
+                # Trailing-stop exit: activates at +100% gain, trails at 80% of peak
                 _cost = pos.get("cost", 0)
                 if current_price is not None and _cost > 0:
                     _pct_change = (current_price - _cost) / _cost
-                    if _pct_change >= 1.0:
-                        exit_reason = f"HEDGE PUT TP: +{_pct_change*100:.0f}% (${current_price:.2f} vs ${_cost:.2f})"
+                    _peak = pos.get("peak_value", current_price)
+                    # Update peak watermark
+                    if current_price > _peak:
+                        _peak = current_price
+                        pos["peak_value"] = _peak
+                    elif "peak_value" not in pos:
+                        pos["peak_value"] = _peak
+                    _peak_gain = (_peak - _cost) / _cost  # peak gain as fraction
+
+                    if _peak_gain >= 1.0:
+                        # Trailing stop active: floor is 80% of peak gain
+                        _trail_floor = _cost * (1 + _peak_gain * 0.8)
+                        if current_price <= _trail_floor:
+                            _exit_pct = _pct_change * 100
+                            _peak_pct = _peak_gain * 100
+                            exit_reason = (f"HEDGE PUT TRAIL-TP: +{_exit_pct:.0f}% "
+                                           f"(peak +{_peak_pct:.0f}%, floor ${_trail_floor:.2f}, "
+                                           f"now ${current_price:.2f} vs cost ${_cost:.2f})")
+                        else:
+                            log.info("HEDGE PUT TRAILING: %s +%.0f%% (peak +%.0f%%, floor $%.2f)",
+                                     market[:30], _pct_change * 100, _peak_gain * 100, _trail_floor)
                     elif _pct_change <= -0.5:
                         exit_reason = f"HEDGE PUT SL: {_pct_change*100:.0f}% (${current_price:.2f} vs ${_cost:.2f})"
                 # TTL: expire at DTE
@@ -10365,6 +10493,9 @@ async def run_exit_manager(channel=None):
                 pass
             db_close_position(removed.get("market", ""), exit_value, reason, realized_pnl)
 
+            # Persist JSON immediately so closes survive restarts
+            save_all_state()
+
             closed += 1
             log.info("EXIT MANAGER: Closed %s | %s | Cost $%.2f → Exit $%.2f | PnL $%+.2f",
                      removed.get("market", "")[:40], reason, cost, exit_value, realized_pnl)
@@ -10380,7 +10511,7 @@ async def run_exit_manager(channel=None):
 
     if closed > 0:
         db_save_daily_state()
-        save_all_state()
+        save_all_state()  # Final save for good measure
         log.info("EXIT MANAGER: Closed %d positions", closed)
     return closed
 
@@ -11645,6 +11776,84 @@ def calculate_pair_zscore(ticker_a, ticker_b, lookback=252):
         log.warning("Pairs calc error %s/%s: %s", ticker_a, ticker_b, e)
         return None, None, None
 
+def _regime_weighted_half_kelly(portfolio_value, mc_prob, hist_stats):
+    """Regime-Weighted Half-Kelly sizing for pairs trades.
+    Returns (size_per_leg, details_dict) or (None, details_dict) if gates fail."""
+    details = {}
+
+    # --- Gate checks ---
+    mc_ok = mc_prob is not None and mc_prob > 0.60
+    hist_reversion = hist_stats.get("reversion_rate", 0) if hist_stats.get("available") else 0
+    hist_ok = hist_reversion > 0.55
+    details["mc_prob"] = mc_prob
+    details["hist_reversion"] = hist_reversion
+    details["gates_passed"] = mc_ok and hist_ok
+    if not (mc_ok and hist_ok):
+        return None, details
+
+    # --- Live win rate (p) and payoff ratio (b) from closed pairs trades ---
+    p = 0.55  # default if insufficient data
+    b = 1.0   # default payoff ratio
+    try:
+        import sqlite3 as _ksq
+        _kconn = _ksq.connect(DB_PATH)
+        _kc = _kconn.cursor()
+        rows = _kc.execute("""
+            SELECT realized_pnl, size_usd FROM positions
+            WHERE status='closed' AND strategy='pairs'
+            AND realized_pnl IS NOT NULL AND size_usd > 0
+            ORDER BY closed_at DESC LIMIT 50
+        """).fetchall()
+        _kconn.close()
+        if len(rows) >= 10:
+            wins = [r[0] for r in rows if r[0] > 0]
+            losses = [abs(r[0]) for r in rows if r[0] <= 0]
+            total = len(rows)
+            p = len(wins) / total
+            if wins and losses:
+                b = (sum(wins) / len(wins)) / (sum(losses) / len(losses))
+    except Exception:
+        pass
+    details["live_win_rate"] = p
+    details["payoff_ratio"] = b
+
+    # --- Half-Kelly: f = (p - q/b) / 2 ---
+    q = 1 - p
+    if b > 0:
+        kelly_full = (p - q / b)
+    else:
+        kelly_full = 0
+    kelly_half = max(kelly_full / 2, 0)
+    details["kelly_full"] = kelly_full
+    details["kelly_half"] = kelly_half
+
+    # --- Regime multiplier from Psychologist + VIX ---
+    fng = _PSYCH_STATE.get("last_fng", 50)
+    vix = get_regime("equities").get("vix") or 20
+    if fng < 20 or vix > 30:
+        regime_mult = 1.5  # Extreme fear / high vol — contrarian boost
+    elif fng > 80 or vix < 15:
+        regime_mult = 0.6  # Extreme greed / low vol — reduce
+    else:
+        regime_mult = 1.0
+    details["fng"] = fng
+    details["vix"] = vix
+    details["regime_mult"] = regime_mult
+
+    # --- Final size per leg ---
+    raw_pct = kelly_half * regime_mult
+    clamped_pct = max(0.005, min(raw_pct, 0.03))  # Floor 0.5%, cap 3%
+    size_per_leg = clamped_pct * portfolio_value
+    flat_size = portfolio_value * 0.015  # What flat sizing would have been
+
+    details["raw_pct"] = raw_pct
+    details["clamped_pct"] = clamped_pct
+    details["size_per_leg"] = size_per_leg
+    details["flat_size"] = flat_size
+
+    return size_per_leg, details
+
+
 def scan_pairs_opportunities():
     """Scan seed pairs for entry signals."""
     if not EQUITIES_ENABLED:
@@ -11694,8 +11903,21 @@ def scan_pairs_opportunities():
             except Exception:
                 pass
             if any(p.get("market","") == _pair_key for p in PAPER_PORTFOLIO.get("positions",[])):
-                log.info("PAIRS DEDUP: %s already open", _pair_key)
+                log.info("PAIRS DEDUP: %s already open (memory)", _pair_key)
                 continue
+            # Also check SQLite for zombie positions (open in DB but not in JSON)
+            try:
+                import sqlite3 as _dedup_sq
+                _dedup_conn = _dedup_sq.connect(DB_PATH)
+                _dedup_c = _dedup_conn.cursor()
+                _dedup_c.execute("SELECT COUNT(*) FROM positions WHERE market_id=? AND status='open'", (_pair_key,))
+                _dedup_db_open = _dedup_c.fetchone()[0] > 0
+                _dedup_conn.close()
+                if _dedup_db_open:
+                    log.info("PAIRS DEDUP: %s already open (db zombie)", _pair_key)
+                    continue
+            except Exception:
+                pass
             log.info("PAIRS SIGNAL: %s/%s corr=%.3f zscore=%.2f dir=%s", ticker_a, ticker_b, corr, zscore, direction)
             # Historian Agent: fetch reversion stats and adjust sizing
             _hist_stats = historian_analyze_pair(ticker_a, ticker_b)
@@ -11714,9 +11936,34 @@ def scan_pairs_opportunities():
             log.info("ARBITER: %s/%s approved %.2fx (%d checks)", ticker_a, ticker_b, _arb_mult, len(_arb_reasons))
             # Auto-execute pairs trade in paper mode
             if TRADING_MODE == "paper" and AUTO_PAPER_ENABLED:
-                _base_size = PAPER_PORTFOLIO.get("cash", 25000) * 0.015  # 1.5% per leg base
-                _kelly_mult = min((abs(zscore) / 2.0) * corr, 2.0)  # Half-Kelly scaling
-                _pair_size = _base_size * _kelly_mult * _hist_mult * _arb_mult
+                # --- Regime-Weighted Half-Kelly sizing ---
+                _portfolio_val = PAPER_PORTFOLIO.get("cash", 25000)
+                _mc_prob = None
+                try:
+                    _mc_res = montecarlo_simulate(ticker_a, ticker_b, entry_zscore=zscore, horizon_days=7)
+                    if _mc_res.get("available"):
+                        _mc_prob = _mc_res["prob_profit"]
+                except Exception:
+                    pass
+                _kelly_size, _kelly_details = _regime_weighted_half_kelly(_portfolio_val, _mc_prob, _hist_stats)
+                _flat_size_ref = _portfolio_val * 0.015  # Reference: what flat 1.5% would be
+                if _kelly_size is not None:
+                    _pair_size = _kelly_size * _hist_mult * _arb_mult
+                    log.info("KELLY SIZING: %s/%s kelly_half=%.3f regime=%.1fx → %.1f%% ($%.0f/leg) "
+                             "[flat would be $%.0f] p=%.0f%% b=%.2f fng=%d vix=%.0f",
+                             ticker_a, ticker_b, _kelly_details["kelly_half"],
+                             _kelly_details["regime_mult"], _kelly_details["clamped_pct"] * 100,
+                             _pair_size, _flat_size_ref,
+                             _kelly_details["live_win_rate"] * 100, _kelly_details["payoff_ratio"],
+                             _kelly_details["fng"], _kelly_details["vix"])
+                else:
+                    # Fallback to flat sizing when Kelly gates fail (MC<=60% or hist reversion<=55%)
+                    _base_size = _portfolio_val * 0.015
+                    _kelly_mult = min((abs(zscore) / 2.0) * corr, 2.0)
+                    _pair_size = _base_size * _kelly_mult * _hist_mult * _arb_mult
+                    log.info("FLAT SIZING: %s/%s $%.0f/leg (Kelly gates failed: MC=%.0f%% hist_rev=%.0f%%)",
+                             ticker_a, ticker_b, _pair_size,
+                             (_mc_prob or 0) * 100, _kelly_details.get("hist_reversion", 0) * 100)
                 if direction == "short_a_long_b":
                     _long_tk, _short_tk = ticker_b, ticker_a
                 else:
@@ -11728,7 +11975,7 @@ def scan_pairs_opportunities():
                 _short_order_id = None
                 _orders_ok = False
                 try:
-                    import requests as _ep_req
+                    import requests as _ep_req, math as _math
                     _ep_hdr = {
                         "APCA-API-KEY-ID": ALPACA_API_KEY,
                         "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
@@ -11736,25 +11983,17 @@ def scan_pairs_opportunities():
                     }
                     _alpaca_orders_url = f"{ALPACA_BASE_URL}/v2/orders"
 
-                    # Long leg — buy market order
-                    _long_body = {
-                        "symbol": _long_tk,
-                        "notional": str(round(_pair_size, 2)),
-                        "side": "buy",
-                        "type": "market",
-                        "time_in_force": "day",
-                    }
-                    _rl = _ep_req.post(_alpaca_orders_url, json=_long_body, headers=_ep_hdr, timeout=10)
-                    if _rl.status_code in (200, 201):
-                        _long_order_id = _rl.json().get("id", "unknown")
-                        _entry_long_price = float(_rl.json().get("filled_avg_price", 0) or 0)
-                        log.info("ALPACA LONG ORDER: %s id=%s", _long_tk, _long_order_id)
-                    else:
-                        log.warning("ALPACA LONG FAILED: %s HTTP %d: %s", _long_tk, _rl.status_code, _rl.text[:200])
-                        continue  # Skip this pair entirely
+                    # Long leg — limit at mid, 3 attempts, fallback to market
+                    _long_order_id, _entry_long_price, _long_fill_type = _alpaca_limit_at_mid(
+                        _long_tk, "buy", notional=_pair_size)
+                    if _long_order_id is None:
+                        log.warning("ALPACA LONG FAILED: %s — no fill", _long_tk)
+                        continue
 
-                    # Short leg — sell short market order (whole shares required)
-                    import math as _math
+                    log.info("ALPACA LONG ORDER: %s id=%s fill=$%.2f type=%s",
+                             _long_tk, _long_order_id, _entry_long_price, _long_fill_type)
+
+                    # Short leg — need whole shares, limit at mid
                     _short_price = 0
                     try:
                         _data_hdr_s = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
@@ -11772,31 +12011,23 @@ def scan_pairs_opportunities():
                         except Exception:
                             pass
                         continue
-                    _short_body = {
-                        "symbol": _short_tk,
-                        "qty": str(_short_shares),
-                        "side": "sell",
-                        "type": "market",
-                        "time_in_force": "day",
-                    }
-                    _rs = _ep_req.post(_alpaca_orders_url, json=_short_body, headers=_ep_hdr, timeout=10)
-                    if _rs.status_code in (200, 201):
-                        _short_order_id = _rs.json().get("id", "unknown")
-                        _entry_short_price = float(_rs.json().get("filled_avg_price", 0) or 0)
-                        log.info("ALPACA SHORT ORDER: %s id=%s", _short_tk, _short_order_id)
-                    else:
-                        log.warning("ALPACA SHORT FAILED: %s HTTP %d: %s — cancelling long", _short_tk, _rs.status_code, _rs.text[:200])
-                        # Cancel the long leg since short failed
+
+                    _short_order_id, _entry_short_price, _short_fill_type = _alpaca_limit_at_mid(
+                        _short_tk, "sell", qty=_short_shares)
+                    if _short_order_id is None:
+                        log.warning("ALPACA SHORT FAILED: %s — no fill, cancelling long", _short_tk)
                         try:
                             _ep_req.delete(f"{_alpaca_orders_url}/{_long_order_id}", headers=_ep_hdr, timeout=5)
-                            log.info("ALPACA CANCEL LONG: %s (short leg failed)", _long_order_id)
                         except Exception:
                             pass
-                        continue  # Skip this pair entirely
+                        continue
+
+                    log.info("ALPACA SHORT ORDER: %s id=%s fill=$%.2f type=%s",
+                             _short_tk, _short_order_id, _entry_short_price, _short_fill_type)
 
                     _orders_ok = True
 
-                    # Fetch fill prices if not returned inline (market orders may not fill instantly)
+                    # Fetch fill prices if not returned inline
                     if _entry_long_price <= 0 or _entry_short_price <= 0:
                         _data_hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
                         _ql = _ep_req.get(f"https://data.alpaca.markets/v2/stocks/{_long_tk}/quotes/latest", headers=_data_hdr, timeout=5)
@@ -11806,9 +12037,9 @@ def scan_pairs_opportunities():
                         if _qs.status_code == 200 and _entry_short_price <= 0:
                             _entry_short_price = float(_qs.json().get("quote", {}).get("bp", 0) or 0)
 
-                    log.info("PAIRS ENTRY PRICES: Long %s=$%.2f (order=%s) Short %s=$%.2f (order=%s)",
-                             _long_tk, _entry_long_price, _long_order_id,
-                             _short_tk, _entry_short_price, _short_order_id)
+                    log.info("PAIRS FILL QUALITY: Long %s=$%.2f (%s) Short %s=$%.2f (%s)",
+                             _long_tk, _entry_long_price, _long_fill_type,
+                             _short_tk, _entry_short_price, _short_fill_type)
                 except Exception as _ep_err:
                     log.warning("Alpaca pairs order failed: %s", _ep_err)
                     reconcile_alpaca_positions()
