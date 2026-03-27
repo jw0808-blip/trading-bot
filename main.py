@@ -9905,7 +9905,9 @@ async def scan_oracle_signals(channel=None):
             _size_pct = 0.005 if geo_elevated else ORACLE_CONFIG["base_size_pct"]
             base_size = portfolio_value * _size_pct
             # Scale by conviction: higher probability & larger delta = more size
-            kelly_mult = min(yes_price * (1 + abs(delta_1h) * 5), 2.0)
+            # For inverse signals, conviction grows as price drops (use 1-price)
+            _conv_price = (1 - yes_price) if _is_inverse else yes_price
+            kelly_mult = min(_conv_price * (1 + abs(delta_1h) * 5), 2.0)
             leg_size = base_size * kelly_mult * psychologist_size_multiplier() * meta_alloc_multiplier("oracle_trade")
 
             # Causal Memory: adjust size based on historical regime similarity
