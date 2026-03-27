@@ -9197,7 +9197,7 @@ ORACLE_SIGNALS = [
      "threshold": 0.65,  "long": "XLE",  "short": "UAL"},
     # Inverse signal: fires when ceasefire prob DROPS below threshold + geo confirms
     {"name": "iran_escalation", "keywords": ["iran", "ceasefire"],
-     "threshold": 0.35, "long": "XLE", "short": "UAL",
+     "threshold": 0.35, "long": "XLE", "short": "AAL",
      "inverse": True, "geo_required": "iran", "geo_min_headlines": 5},
     # Ukraine escalation: fires when Ukraine war market moves + geo confirms 5+ headlines
     {"name": "ukraine_escalation", "keywords": ["ukraine"],
