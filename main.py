@@ -9178,6 +9178,207 @@ ORACLE_SIGNALS = [
      "extra_long_side": "short"},  # extra_long_side=short means SHORT SMH, not long
 ]
 
+# ---------------------------------------------------------------------------
+# CASCADE ORACLE — Chain-reaction trades triggered by primary oracle signals
+# When a primary signal fires, cascade scans for echo effects in correlated
+# assets with a 15-minute lag. Each chain defines secondary trades.
+# ---------------------------------------------------------------------------
+CASCADE_CHAINS = {
+    # Iran attack/escalation chain: CL spike → energy + airlines + gold
+    "iran_attack": [
+        {"name": "iran_cascade_energy", "long": "XLE", "short": "UAL", "delay_min": 15,
+         "description": "CL futures spike → energy long, airlines short"},
+        {"name": "iran_cascade_gold", "long": "GLD", "short": "SPY", "delay_min": 15,
+         "description": "Flight to safety → gold long, equities short"},
+    ],
+    "iran_escalation": [
+        {"name": "iran_esc_cascade_gold", "long": "GLD", "short": "SPY", "delay_min": 15,
+         "description": "Iran escalation → gold safe haven"},
+    ],
+    # Ukraine chain: European energy disruption → defense + airlines + gold
+    "ukraine_escalation": [
+        {"name": "ukraine_cascade_defense", "long": "RTX", "short": "UAL", "delay_min": 15,
+         "description": "European energy disruption → RTX defense long"},
+        {"name": "ukraine_cascade_gold", "long": "GLD", "short": "EFA", "delay_min": 15,
+         "description": "EU risk → gold long, European equities short"},
+    ],
+    # Taiwan chain: Semiconductor supply disruption
+    "taiwan_escalation": [
+        {"name": "taiwan_cascade_semi", "long": "NVDA", "short": "TSM", "delay_min": 15,
+         "description": "Semi supply disruption → US semis up, Taiwan semis down"},
+        {"name": "taiwan_cascade_onshore", "long": "INTC", "short": "SMH", "delay_min": 15,
+         "description": "Onshoring premium → INTC up, broad semis down"},
+    ],
+}
+
+# Pending cascade queue: [(fire_at_utc, primary_signal, chain_entry, leg_size, geo_elevated)]
+_CASCADE_PENDING = []
+
+def cascade_queue_add(primary_signal, leg_size, geo_elevated):
+    """Queue cascade trades for a primary signal with 15-min delay."""
+    chains = CASCADE_CHAINS.get(primary_signal, [])
+    if not chains:
+        return
+    now = datetime.now(timezone.utc)
+    import datetime as _dt_cas
+    for chain in chains:
+        fire_at = now + _dt_cas.timedelta(minutes=chain["delay_min"])
+        _CASCADE_PENDING.append((fire_at, primary_signal, chain, leg_size, geo_elevated))
+        log.info("CASCADE QUEUED: %s → %s (fires at %s, %dmin delay)",
+                 primary_signal, chain["name"], fire_at.strftime("%H:%M UTC"), chain["delay_min"])
+
+
+async def cascade_execute_pending(channel=None):
+    """Execute any cascade trades whose delay has elapsed. Called each scan cycle."""
+    if not _CASCADE_PENDING:
+        return 0
+    now = datetime.now(timezone.utc)
+    fired = 0
+    remaining = []
+    for entry in _CASCADE_PENDING:
+        fire_at, primary_signal, chain, leg_size, geo_elevated = entry
+        if now < fire_at:
+            remaining.append(entry)
+            continue
+
+        cascade_name = chain["name"]
+        market_id = f"CASCADE:{cascade_name}"
+        long_tk = chain["long"]
+        short_tk = chain["short"]
+
+        # Dedup: already open?
+        if any(p.get("market", "") == market_id for p in PAPER_PORTFOLIO.get("positions", [])):
+            log.info("CASCADE DEDUP: %s already open", cascade_name)
+            continue
+
+        # Overlap check with existing oracle/cascade positions
+        _existing_tickers = set()
+        for _ep in PAPER_PORTFOLIO.get("positions", []):
+            if _ep.get("strategy") in ("oracle_trade", "cascade_trade"):
+                _existing_tickers.update(filter(None, [_ep.get("long_leg"), _ep.get("short_leg"), _ep.get("extra_long_leg")]))
+        if {long_tk, short_tk} & _existing_tickers:
+            log.info("CASCADE OVERLAP: %s skipped — %s already held",
+                     cascade_name, {long_tk, short_tk} & _existing_tickers)
+            continue
+
+        # Position limit (cascades share oracle max)
+        oracle_count = sum(1 for p in PAPER_PORTFOLIO.get("positions", [])
+                           if p.get("strategy") in ("oracle_trade", "cascade_trade"))
+        if oracle_count >= ORACLE_CONFIG["max_oracle_positions"] + 2:  # Allow 2 extra for cascades
+            log.info("CASCADE: position limit reached (%d)", oracle_count)
+            remaining.append(entry)
+            continue
+
+        # Scale cascade size: 60% of primary signal size
+        cascade_leg = leg_size * 0.6
+
+        log.info("CASCADE FIRE: %s → Long %s / Short %s | $%.0f/leg (from %s, %dmin lag)",
+                 cascade_name, long_tk, short_tk, cascade_leg, primary_signal, chain["delay_min"])
+
+        # Execute via Alpaca
+        _alp_hdr = {
+            "APCA-API-KEY-ID": ALPACA_API_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+            "Content-Type": "application/json",
+        }
+        _alp_url = f"{ALPACA_BASE_URL}/v2/orders"
+        _data_hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+        import math as _cmath
+
+        try:
+            # Long leg
+            _rl = requests.post(_alp_url, json={
+                "symbol": long_tk, "notional": str(round(cascade_leg, 2)),
+                "side": "buy", "type": "market", "time_in_force": "day",
+            }, headers=_alp_hdr, timeout=10)
+            if _rl.status_code not in (200, 201):
+                log.warning("CASCADE LONG FAILED: %s HTTP %d", long_tk, _rl.status_code)
+                continue
+            _long_oid = _rl.json().get("id", "unknown")
+
+            # Short leg
+            _short_price = 0
+            try:
+                _sq = requests.get(f"https://data.alpaca.markets/v2/stocks/{short_tk}/quotes/latest",
+                                   headers=_data_hdr, timeout=5)
+                if _sq.status_code == 200:
+                    _short_price = float(_sq.json().get("quote", {}).get("ap", 0) or 0)
+            except Exception:
+                pass
+            _short_shares = _cmath.floor(cascade_leg / _short_price) if _short_price > 0 else 0
+            if _short_shares < 1:
+                log.warning("CASCADE SHORT SKIP: %s — 0 shares", short_tk)
+                try:
+                    requests.delete(f"{_alp_url}/{_long_oid}", headers=_alp_hdr, timeout=5)
+                except Exception:
+                    pass
+                continue
+            _rs = requests.post(_alp_url, json={
+                "symbol": short_tk, "qty": str(_short_shares),
+                "side": "sell", "type": "market", "time_in_force": "day",
+            }, headers=_alp_hdr, timeout=10)
+            if _rs.status_code not in (200, 201):
+                log.warning("CASCADE SHORT FAILED: %s HTTP %d — cancelling long", short_tk, _rs.status_code)
+                try:
+                    requests.delete(f"{_alp_url}/{_long_oid}", headers=_alp_hdr, timeout=5)
+                except Exception:
+                    pass
+                continue
+            _short_oid = _rs.json().get("id", "unknown")
+
+            total_cost = cascade_leg * 2
+            if total_cost > PAPER_PORTFOLIO.get("cash", 0):
+                log.warning("CASCADE: insufficient cash for %s", cascade_name)
+                continue
+
+            PAPER_PORTFOLIO["cash"] -= total_cost
+            _cas_pos = {
+                "market": market_id,
+                "side": f"Long {long_tk} / Short {short_tk}",
+                "shares": 1, "entry_price": 0, "cost": total_cost, "value": total_cost,
+                "timestamp": now.strftime("%Y-%m-%d %H:%M UTC"),
+                "platform": "Alpaca", "ev": 0,
+                "strategy": "cascade_trade",
+                "long_leg": long_tk, "short_leg": short_tk,
+                "entry_long_price": 0, "entry_short_price": _short_price,
+                "source_market": f"CASCADE from {primary_signal}",
+                "long_order_id": _long_oid, "short_order_id": _short_oid,
+            }
+            PAPER_PORTFOLIO["positions"].append(_cas_pos)
+            db_log_paper_trade(_cas_pos)
+            db_open_position(
+                market_id=market_id, platform="Alpaca", strategy="cascade_trade",
+                direction=f"Long {long_tk} / Short {short_tk}",
+                size_usd=total_cost, shares=1, entry_price=0,
+                long_leg=long_tk, short_leg=short_tk,
+                metadata={"primary_signal": primary_signal, "cascade": cascade_name,
+                          "description": chain["description"], "delay_min": chain["delay_min"],
+                          "long_order_id": _long_oid, "short_order_id": _short_oid},
+            )
+            fired += 1
+            log.info("CASCADE TRADE: %s | Long %s / Short %s | $%.0f (from %s)",
+                     cascade_name, long_tk, short_tk, total_cost, primary_signal)
+            echo_memory_store("cascade_trade", primary_signal, cascade_name, 0,
+                              "elevated" if geo_elevated else "normal",
+                              chain["description"], "", 0,
+                              f"long={long_tk} short={short_tk} size=${total_cost:.0f} lag={chain['delay_min']}min")
+            if channel:
+                try:
+                    await channel.send(
+                        f"**CASCADE TRADE** — {cascade_name}\n"
+                        f"Triggered by: {primary_signal} ({chain['delay_min']}min lag)\n"
+                        f"Long {long_tk} / Short {short_tk} | ${total_cost:.0f}\n"
+                        f"Chain: {chain['description']}")
+                except Exception:
+                    pass
+        except Exception as _ce:
+            log.warning("CASCADE execution error for %s: %s", cascade_name, _ce)
+
+    _CASCADE_PENDING.clear()
+    _CASCADE_PENDING.extend(remaining)
+    return fired
+
+
 # Price history: {market_title_lower: [(timestamp, yes_price), ...]}
 _ORACLE_PRICE_HISTORY = {}
 
@@ -9736,6 +9937,9 @@ async def scan_oracle_signals(channel=None):
                 fired += 1
                 log.info("ORACLE TRADE: %s | YES=$%.2f | %s | $%.0f",
                          signal_name, yes_price, _legs_str, total_cost)
+                # Queue cascade chain-reaction trades (15-min delayed)
+                cascade_queue_add(signal_name, leg_size, geo_elevated)
+
                 # Store in echo memory
                 _geo_st = _intel_get_geo_state()
                 _hl = _intel_get_relevant_headlines(signal_name, limit=1)
@@ -9942,6 +10146,7 @@ async def scan_oracle_signals(channel=None):
                           "extra_long": extra_long_tk, "extra_long_order_id": _extra_long_oid or ""},
             )
             fired += 1
+            cascade_queue_add(signal_name, leg_size, geo_elevated)
             log.info("GEO-ONLY TRADE: %s | %d headlines | %s | $%.0f",
                      signal_name, _theme_count, _legs_str, total_cost)
             if channel:
@@ -9960,6 +10165,15 @@ async def scan_oracle_signals(channel=None):
                     pass
         except Exception as _goe:
             log.warning("GEO-ONLY execution error for %s: %s", signal_name, _goe)
+
+    # Execute any pending cascade trades whose delay has elapsed
+    try:
+        cascade_fired = await cascade_execute_pending(channel)
+        if cascade_fired > 0:
+            fired += cascade_fired
+            log.info("CASCADE: %d chain-reaction trades executed this cycle", cascade_fired)
+    except Exception as _cex:
+        log.warning("CASCADE execution error: %s", _cex)
 
     return fired
 
