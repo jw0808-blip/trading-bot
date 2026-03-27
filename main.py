@@ -10137,58 +10137,104 @@ def _build_options_symbol(underlying, expiry_date, strike, option_type="P"):
 
 def _fetch_spy_options_chain(spy_price, hdrs):
     """Fetch real SPY options chain from Alpaca and find the best put contract.
+    Tries the trading API /v2/options/contracts first, then the data API
+    snapshots endpoint as fallback.
     Returns (symbol, strike, expiry_str) or (None, None, None) on failure."""
     import datetime as _dt
     now = datetime.now(timezone.utc)
     target_strike = round(spy_price * 0.98, 0)  # 2% below current price
+    # Snap to nearest $5 increment (SPY options use $1 strikes but $5 is safer)
+    target_strike = round(target_strike / 5) * 5
     min_dte = 5
-    max_dte = 10
+    max_dte = 14
     min_exp = (now + _dt.timedelta(days=min_dte)).strftime("%Y-%m-%d")
     max_exp = (now + _dt.timedelta(days=max_dte)).strftime("%Y-%m-%d")
 
-    # Alpaca snapshots/chain endpoint — fetch puts near target strike
+    # --- Method 1: Alpaca trading API /v2/options/contracts ---
     try:
         params = {
-            "symbols": "SPY",
+            "underlying_symbols": "SPY",
             "type": "put",
-            "strike_price_gte": str(target_strike - 10),
-            "strike_price_lte": str(target_strike + 10),
+            "strike_price_gte": str(target_strike - 15),
+            "strike_price_lte": str(target_strike + 15),
             "expiration_date_gte": min_exp,
             "expiration_date_lte": max_exp,
-            "limit": "50",
-            "feed": "indicative",
+            "limit": "100",
+            "status": "active",
         }
         r = requests.get(f"{ALPACA_BASE_URL}/v2/options/contracts",
                          params=params, headers=hdrs, timeout=15)
-        if r.status_code != 200:
-            log.warning("CRASH-HEDGE chain fetch failed: %d %s", r.status_code, r.text[:200])
-            return None, None, None
-        contracts = r.json().get("option_contracts", r.json() if isinstance(r.json(), list) else [])
-        if not contracts:
-            log.warning("CRASH-HEDGE no contracts found: strike~$%.0f exp %s–%s", target_strike, min_exp, max_exp)
-            return None, None, None
-
-        # Find nearest strike to target among available contracts
-        best = None
-        best_dist = float("inf")
-        for c in contracts:
-            c_strike = float(c.get("strike_price", 0))
-            c_exp = c.get("expiration_date", "")
-            c_sym = c.get("symbol", "")
-            c_status = c.get("status", "active")
-            if c_status != "active" or not c_sym:
-                continue
-            dist = abs(c_strike - target_strike)
-            if dist < best_dist:
-                best_dist = dist
-                best = (c_sym, c_strike, c_exp)
-        if best:
-            log.info("CRASH-HEDGE chain: picked %s strike=$%.0f exp=%s (target=$%.0f)",
-                     best[0], best[1], best[2], target_strike)
-        return best or (None, None, None)
+        log.info("CRASH-HEDGE chain request: %s params=%s → %d",
+                 f"{ALPACA_BASE_URL}/v2/options/contracts", params, r.status_code)
+        if r.status_code == 200:
+            contracts = r.json().get("option_contracts", r.json() if isinstance(r.json(), list) else [])
+            if contracts:
+                best = None
+                best_dist = float("inf")
+                for c in contracts:
+                    c_strike = float(c.get("strike_price", 0))
+                    c_exp = c.get("expiration_date", "")
+                    c_sym = c.get("symbol", "")
+                    c_status = c.get("status", "active")
+                    if c_status != "active" or not c_sym:
+                        continue
+                    dist = abs(c_strike - target_strike)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best = (c_sym, c_strike, c_exp)
+                if best:
+                    log.info("CRASH-HEDGE chain: picked %s strike=$%.0f exp=%s (target=$%.0f)",
+                             best[0], best[1], best[2], target_strike)
+                    return best
+        else:
+            log.warning("CRASH-HEDGE trading API: %d %s", r.status_code, r.text[:300])
     except Exception as exc:
-        log.warning("CRASH-HEDGE chain error: %s", exc)
-        return None, None, None
+        log.warning("CRASH-HEDGE trading API error: %s", exc)
+
+    # --- Method 2: Alpaca data API snapshots (like theta harvest uses) ---
+    data_hdr = {"APCA-API-KEY-ID": hdrs.get("APCA-API-KEY-ID", ""),
+                "APCA-API-SECRET-KEY": hdrs.get("APCA-API-SECRET-KEY", "")}
+    try:
+        # Try each Friday in the 5-14 day window
+        for days_out in range(min_dte, max_dte + 1):
+            exp_date = now + _dt.timedelta(days=days_out)
+            if exp_date.weekday() != 4:  # Only Fridays
+                continue
+            exp_str = exp_date.strftime("%Y-%m-%d")
+            r2 = requests.get(
+                f"https://data.alpaca.markets/v1beta1/options/snapshots/SPY",
+                headers=data_hdr,
+                params={"feed": "indicative", "expiration_date": exp_str, "type": "put"},
+                timeout=10)
+            if r2.status_code != 200:
+                log.info("CRASH-HEDGE data API exp=%s: %d", exp_str, r2.status_code)
+                continue
+            snapshots = r2.json().get("snapshots", {})
+            if not snapshots:
+                continue
+            # Parse OCC symbols from snapshot keys, find nearest strike
+            best = None
+            best_dist = float("inf")
+            for sym_key in snapshots:
+                # OCC format: SPY260404P00625000 — strike is last 8 digits / 1000
+                try:
+                    _strike_raw = int(sym_key[-8:]) / 1000.0
+                    if "P" in sym_key[6:]:
+                        dist = abs(_strike_raw - target_strike)
+                        if dist < best_dist:
+                            best_dist = dist
+                            best = (sym_key, _strike_raw, exp_str)
+                except (ValueError, IndexError):
+                    continue
+            if best:
+                log.info("CRASH-HEDGE data API: picked %s strike=$%.0f exp=%s (target=$%.0f)",
+                         best[0], best[1], best[2], target_strike)
+                return best
+    except Exception as exc:
+        log.warning("CRASH-HEDGE data API error: %s", exc)
+
+    log.warning("CRASH-HEDGE: both API methods failed, falling back to constructed symbol")
+    return None, None, None
 
 
 async def execute_spy_put_hedge(spy_price, portfolio_value):
@@ -10207,17 +10253,21 @@ async def execute_spy_put_hedge(spy_price, portfolio_value):
     # Fetch real options chain — find nearest listed put
     symbol, strike, expiry_str = _fetch_spy_options_chain(spy_price, hdrs)
     if symbol is None:
-        # Fallback: construct symbol from rounded strike and nearest Friday
+        # Fallback: construct symbol using $5 strike increments and valid Friday expiry
         import datetime as _dt
-        strike = round(spy_price * (1 - cfg["put_strike_offset"]), 0)
-        expiry = datetime.now(timezone.utc) + _dt.timedelta(days=cfg["put_dte"])
-        days_to_friday = (4 - expiry.weekday()) % 7
-        if days_to_friday == 0 and expiry.hour > 16:
-            days_to_friday = 7
-        expiry = expiry + _dt.timedelta(days=days_to_friday)
+        strike = round(spy_price * (1 - cfg["put_strike_offset"]) / 5) * 5  # Snap to $5 increment
+        # Find the nearest Friday that is 5-10 days out
+        expiry = None
+        for days_out in range(5, 15):
+            candidate = datetime.now(timezone.utc) + _dt.timedelta(days=days_out)
+            if candidate.weekday() == 4:  # Friday
+                expiry = candidate
+                break
+        if expiry is None:
+            expiry = datetime.now(timezone.utc) + _dt.timedelta(days=cfg["put_dte"])
         symbol = _build_options_symbol("SPY", expiry, strike, "P")
         expiry_str = expiry.strftime("%Y-%m-%d")
-        log.warning("CRASH-HEDGE fallback to constructed symbol: %s", symbol)
+        log.warning("CRASH-HEDGE fallback to constructed symbol: %s (strike=$%.0f exp=%s)", symbol, strike, expiry_str)
 
     size_usd = portfolio_value * cfg["put_size_pct"]
     # Estimate ~$3-8 per contract for OTM weeklies, buy as many as budget allows
