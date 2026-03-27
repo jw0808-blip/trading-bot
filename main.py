@@ -64,6 +64,36 @@ log = logging.getLogger("traderjoes")
 intents = discord.Intents.default()
 intents.message_content = True
 
+def db_flush_legacy_pairs(cutoff_date="2026-03-27"):
+    """Archive contaminated pairs trades from before cutoff_date.
+    Renames strategy from 'pairs' to 'pairs_legacy' so Kelly win-rate
+    calculation excludes them. Returns count of archived trades."""
+    try:
+        import sqlite3 as _fsq
+        conn = _fsq.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""UPDATE positions SET strategy='pairs_legacy'
+            WHERE strategy='pairs' AND created_at < ? AND status='closed'""",
+            (cutoff_date,))
+        closed_count = c.rowcount
+        c.execute("""UPDATE positions SET strategy='pairs_legacy'
+            WHERE strategy='pairs' AND created_at < ? AND status='open'""",
+            (cutoff_date,))
+        open_count = c.rowcount
+        conn.commit()
+        conn.close()
+        total = closed_count + open_count
+        if total > 0:
+            log.info("PAIRS FLUSH: archived %d trades to pairs_legacy (cutoff=%s) — %d closed, %d open",
+                     total, cutoff_date, closed_count, open_count)
+        else:
+            log.info("PAIRS FLUSH: no trades to archive before %s", cutoff_date)
+        return total
+    except Exception as e:
+        log.warning("PAIRS FLUSH error: %s", e)
+        return 0
+
+
 def db_open_position(market_id, platform, strategy, direction,
                      size_usd, shares, entry_price,
                      stop_price=0, target_price=0,
@@ -1428,6 +1458,8 @@ def suggest_position_size(ev, portfolio_value=88000, max_pct=None, edge_score=0)
 async def on_ready():
     init_redis()
     init_db()
+    # Flush contaminated pairs trades from March 19-26 to pairs_legacy
+    db_flush_legacy_pairs("2026-03-27")
     load_all_state()  # Restore paper_portfolio.json, analytics, signals, etc.
     db_load_daily_state()
     # Backfill positions from SQLite only if JSON had none (fresh deploy)
