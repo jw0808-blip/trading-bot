@@ -153,8 +153,8 @@ function OracleSignals({oracle}) {
         return (
           <div key={i} className="signal-row">
             <div className="signal-name">
-              <span>{s.name} {s.active && '🔴'}</span>
-              <span>{s.long}/{s.short} — ${s.yes_price.toFixed(2)} / {s.threshold.toFixed(2)}</span>
+              <span>{s.name} {s.inverse && '↓'} {s.active && '🔴'} {s.inverse && s.geo_ok === false && '⚠️geo'}</span>
+              <span>{s.long}/{s.short} — ${s.yes_price.toFixed(2)} / {s.inverse ? '<' : ''}{s.threshold.toFixed(2)}</span>
             </div>
             <div className="signal-bar-bg"><div className={`signal-bar ${cls}`} style={{width: `${pct}%`}} /></div>
           </div>

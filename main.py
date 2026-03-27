@@ -8094,14 +8094,14 @@ def _build_api_oracle():
                 if _is_inv:
                     # Inverse signal: fires when price drops BELOW threshold
                     pct = (1 - yes_price) / (1 - sig["threshold"]) * 100 if sig["threshold"] < 1 else 0
-                    # Check geo requirement for active status
+                    # Check geo requirement — count theme headlines directly,
+                    # don't require the theme to be the primary geo alert
                     _geo_req = sig.get("geo_required", "")
                     _geo_min = sig.get("geo_min_headlines", 0)
                     _geo_ok = False
                     if _geo_req:
-                        _gs = _intel_get_geo_state()
-                        _geo_ok = (_gs.get("active") and _gs.get("theme", "") == _geo_req
-                                   and _gs.get("count", 0) >= _geo_min)
+                        _theme_esc_count = _intel_theme_escalation_count(_geo_req)
+                        _geo_ok = _theme_esc_count >= _geo_min
                     is_active = yes_price <= sig["threshold"] and (_geo_ok if _geo_req else True)
                     signals.append({
                         "name": sig["name"], "market": title[:60],
@@ -9086,6 +9086,10 @@ ORACLE_SIGNALS = [
     {"name": "iran_escalation", "keywords": ["iran", "ceasefire"],
      "threshold": 0.35, "long": "XLE", "short": "UAL",
      "inverse": True, "geo_required": "iran", "geo_min_headlines": 5},
+    # Ukraine escalation: fires when Ukraine war market moves + geo confirms 5+ headlines
+    {"name": "ukraine_escalation", "keywords": ["ukraine"],
+     "threshold": 0.35, "long": "LMT", "short": "UAL", "extra_long": "GLD",
+     "inverse": True, "geo_required": "ukraine", "geo_min_headlines": 5},
 ]
 
 # Price history: {market_title_lower: [(timestamp, yes_price), ...]}
@@ -9162,6 +9166,7 @@ def _intel_get_relevant_headlines(signal_name, limit=3):
     theme_map = {
         "fed_hike": "fed", "fed_cut": "fed",
         "iran_ceasefire": "iran", "iran_attack": "iran", "iran_escalation": "iran",
+        "ukraine_escalation": "ukraine",
         "tariff": "tariff", "recession": "recession",
     }
     theme = theme_map.get(signal_name, "")
@@ -9225,6 +9230,21 @@ def _intel_geo_monitor(channel_notify=None):
 def _intel_get_geo_state():
     """Return current geopolitical alert state for display."""
     return _INTEL_GEO_STATE.copy()
+
+
+def _intel_theme_escalation_count(theme):
+    """Count escalation headlines for a specific theme in the last hour,
+    regardless of which theme is the primary geo alert."""
+    now = datetime.now(timezone.utc)
+    one_hour_ago = now - __import__("datetime").timedelta(hours=1)
+    entries = _INTEL_HEADLINE_MEMORY.get(theme, [])
+    recent = [(t, h) for t, h in entries if t > one_hour_ago]
+    esc_count = 0
+    for _, headline in recent:
+        hl = headline.lower()
+        if sum(1 for kw in _GEO_ESCALATION_KEYWORDS if kw in hl) >= 1:
+            esc_count += 1
+    return esc_count
 
 
 def _oracle_match_signal(market_title):
@@ -9349,13 +9369,14 @@ async def scan_oracle_signals(channel=None):
             if _is_inverse:
                 if yes_price > sig["threshold"]:
                     continue  # Inverse: only fire when prob DROPS below threshold
-                # Check geo requirement
+                # Check geo requirement — count theme headlines directly,
+                # don't require the theme to be the primary geo alert
                 _geo_req = sig.get("geo_required", "")
                 _geo_min = sig.get("geo_min_headlines", 0)
                 if _geo_req:
-                    _gs = _intel_get_geo_state()
-                    if not _gs.get("active") or _gs.get("theme", "") != _geo_req or _gs.get("count", 0) < _geo_min:
-                        continue  # Geo not escalated enough
+                    _theme_esc_count = _intel_theme_escalation_count(_geo_req)
+                    if _theme_esc_count < _geo_min:
+                        continue  # Not enough escalation headlines for this theme
             else:
                 if yes_price < sig["threshold"]:
                     continue
@@ -9451,9 +9472,11 @@ async def scan_oracle_signals(channel=None):
 
             long_tk = sig["long"]
             short_tk = sig["short"]
+            extra_long_tk = sig.get("extra_long", "")
 
-            log.info("ORACLE SIGNAL: %s YES=$%.2f (Δ1h=%+.3f) → Long %s / Short %s | $%.0f/leg",
-                     signal_name, yes_price, delta_1h, long_tk, short_tk, leg_size)
+            _legs_str = f"Long {long_tk} / Short {short_tk}" + (f" / Long {extra_long_tk}" if extra_long_tk else "")
+            log.info("ORACLE SIGNAL: %s YES=$%.2f (Δ1h=%+.3f) → %s | $%.0f/leg",
+                     signal_name, yes_price, delta_1h, _legs_str, leg_size)
 
             # Execute both legs via Alpaca
             import math as _omath
@@ -9511,6 +9534,21 @@ async def scan_oracle_signals(channel=None):
                 _short_oid = _rs.json().get("id", "unknown")
                 log.info("ORACLE SHORT ORDER: %s id=%s", short_tk, _short_oid)
 
+                # Extra long leg (e.g. GLD for ukraine_escalation)
+                _extra_long_oid = None
+                if extra_long_tk:
+                    _extra_body = {
+                        "symbol": extra_long_tk, "notional": str(round(leg_size, 2)),
+                        "side": "buy", "type": "market", "time_in_force": "day",
+                    }
+                    _re = requests.post(_alp_url, json=_extra_body, headers=_alp_hdr, timeout=10)
+                    if _re.status_code in (200, 201):
+                        _extra_long_oid = _re.json().get("id", "unknown")
+                        log.info("ORACLE EXTRA LONG ORDER: %s id=%s", extra_long_tk, _extra_long_oid)
+                    else:
+                        log.warning("ORACLE EXTRA LONG FAILED: %s HTTP %d: %s (continuing with 2 legs)",
+                                    extra_long_tk, _re.status_code, _re.text[:200])
+
                 # Get fill prices
                 _entry_long_price = 0
                 _entry_short_price = 0
@@ -9522,7 +9560,8 @@ async def scan_oracle_signals(channel=None):
                 except Exception:
                     pass
 
-                total_cost = leg_size * 2
+                _num_legs = 3 if extra_long_tk else 2
+                total_cost = leg_size * _num_legs
                 if total_cost > PAPER_PORTFOLIO.get("cash", 0):
                     log.warning("ORACLE: insufficient cash $%.0f for $%.0f trade", PAPER_PORTFOLIO.get("cash", 0), total_cost)
                     continue
@@ -9530,38 +9569,44 @@ async def scan_oracle_signals(channel=None):
                 PAPER_PORTFOLIO["cash"] -= total_cost
                 _oracle_pos = {
                     "market": market_id,
-                    "side": f"Long {long_tk} / Short {short_tk}",
+                    "side": _legs_str,
                     "shares": 1, "entry_price": yes_price, "cost": total_cost,
                     "value": total_cost,
                     "timestamp": now.strftime("%Y-%m-%d %H:%M UTC"),
                     "platform": "Alpaca", "ev": delta_1h,
                     "strategy": "oracle_trade",
                     "long_leg": long_tk, "short_leg": short_tk,
+                    "extra_long_leg": extra_long_tk or "",
                     "entry_long_price": _entry_long_price,
                     "entry_short_price": _entry_short_price,
                     "signal_threshold": sig["threshold"],
                     "source_market": title[:60],
                     "long_order_id": _long_oid,
                     "short_order_id": _short_oid,
+                    "extra_long_order_id": _extra_long_oid or "",
                 }
                 PAPER_PORTFOLIO["positions"].append(_oracle_pos)
                 db_log_paper_trade(_oracle_pos)
+                _meta = {"signal": signal_name, "threshold": sig["threshold"],
+                         "yes_price": yes_price, "delta_1h": delta_1h,
+                         "source_market": title[:60],
+                         "long_order_id": _long_oid, "short_order_id": _short_oid,
+                         "entry_long_price": _entry_long_price,
+                         "entry_short_price": _entry_short_price}
+                if extra_long_tk:
+                    _meta["extra_long"] = extra_long_tk
+                    _meta["extra_long_order_id"] = _extra_long_oid or ""
                 db_open_position(
                     market_id=market_id, platform="Alpaca", strategy="oracle_trade",
-                    direction=f"Long {long_tk} / Short {short_tk}",
+                    direction=_legs_str,
                     size_usd=total_cost, shares=1, entry_price=yes_price,
                     long_leg=long_tk, short_leg=short_tk,
-                    metadata={"signal": signal_name, "threshold": sig["threshold"],
-                              "yes_price": yes_price, "delta_1h": delta_1h,
-                              "source_market": title[:60],
-                              "long_order_id": _long_oid, "short_order_id": _short_oid,
-                              "entry_long_price": _entry_long_price,
-                              "entry_short_price": _entry_short_price},
+                    metadata=_meta,
                 )
 
                 fired += 1
-                log.info("ORACLE TRADE: %s | YES=$%.2f | Long %s / Short %s | $%.0f",
-                         signal_name, yes_price, long_tk, short_tk, total_cost)
+                log.info("ORACLE TRADE: %s | YES=$%.2f | %s | $%.0f",
+                         signal_name, yes_price, _legs_str, total_cost)
                 # Store in echo memory
                 _geo_st = _intel_get_geo_state()
                 _hl = _intel_get_relevant_headlines(signal_name, limit=1)
