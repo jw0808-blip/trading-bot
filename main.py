@@ -3545,6 +3545,51 @@ async def status_cmd(ctx):
         await ctx.send(m2)
 
 
+@bot.command(name="hedge-status")
+async def hedge_status_cmd(ctx):
+    """Show VRP regime, crash hedge positions, and options status."""
+    regime = get_regime("equities")
+    vix = regime.get("vix") or 0
+    cfg = CRASH_HEDGE_CONFIG
+    vrp = _VRP_REGIME_STATE
+
+    # Determine current VRP regime
+    if vix >= cfg["vrp_vix_threshold"]:
+        vrp_label = "SELL PREMIUM (call credit spreads)"
+    elif vix >= cfg["put_vix_threshold"]:
+        vrp_label = "BUY PUTS (cheap OTM protection)"
+    else:
+        vrp_label = "IDLE (VIX too low)"
+
+    # Collect hedge positions
+    hedge_positions = [p for p in PAPER_PORTFOLIO.get("positions", [])
+                       if p.get("strategy") in ("crash_hedge_put", "crash_hedge_short", "crash_hedge_call_spread")]
+
+    lines = [
+        f"**HEDGE STATUS — VRP Regime Monitor**",
+        f"VIX: {vix:.1f} | Market Regime: {regime.get('regime', 'normal').upper()}",
+        f"VRP Regime: **{vrp_label}**",
+        f"Last Switch: {vrp.get('last_switch', 'N/A')} | Cycles: {vrp.get('cycle_count', 0)}",
+        f"",
+        f"**Thresholds:**",
+        f"  VIX < 25 → Idle | 25-27 → Buy puts | >= 28 → Sell call spreads | >= 35 → Short SPY",
+        f"",
+        f"**Open Hedge Positions ({len(hedge_positions)}/{cfg['max_hedges']}):**",
+    ]
+    if hedge_positions:
+        for p in hedge_positions:
+            strat = p.get("strategy", "?")
+            mkt = p.get("market", "?")
+            cost = p.get("cost", 0)
+            ts = p.get("timestamp", "?")
+            vrp_r = p.get("vrp_regime", "")
+            lines.append(f"  {mkt} | ${cost:.0f} | {strat} | {ts}" + (f" [{vrp_r}]" if vrp_r else ""))
+    else:
+        lines.append("  No active hedges")
+
+    await ctx.send("\n".join(lines))
+
+
 @bot.command(name="oracle-status")
 async def oracle_status_cmd(ctx):
     """Show Oracle Engine status: active signals, probabilities, and P&L."""
@@ -9079,7 +9124,17 @@ CRASH_HEDGE_CONFIG = {
     "short_size_pct": 0.01,         # 1% of portfolio
     "max_hedges": 2,                # Max concurrent hedge positions
     "cooldown_hours": 12,           # Min hours between hedge entries
+    # VRP call credit spread regime (VIX >= 28)
+    "vrp_vix_threshold": 28,        # Switch to selling premium when VIX >= 28
+    "vrp_spread_size_pct": 0.008,   # 0.8% of portfolio per spread
+    "vrp_dte": 2,                   # 2 DTE for theta decay
+    "vrp_short_delta": 0.20,        # Sell 20-delta call
+    "vrp_long_delta": 0.10,         # Buy 10-delta call
+    "vrp_max_spreads": 2,           # Max concurrent call spreads
 }
+
+# VRP regime state tracking
+_VRP_REGIME_STATE = {"current": "none", "last_switch": None, "cycle_count": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -10339,7 +10394,8 @@ async def execute_spy_short_hedge(spy_price, portfolio_value):
 
 
 async def check_crash_hedges(channel):
-    """Check regime and deploy crash hedges if needed. Runs during market hours."""
+    """Regime-aware crash hedge: VIX < 25 idle, 25-27 buy puts, >= 28 sell call spreads.
+    Runs during market hours."""
     cfg = CRASH_HEDGE_CONFIG
     if not cfg["enabled"]:
         return
@@ -10348,12 +10404,32 @@ async def check_crash_hedges(channel):
     vix = regime.get("vix")
     regime_name = regime.get("regime", "normal")
 
-    if not vix or vix < cfg["put_vix_threshold"]:
-        return  # No hedge needed
+    if not vix:
+        return
+
+    # --- Determine VRP regime ---
+    if vix >= cfg["vrp_vix_threshold"]:
+        vrp_regime = "sell_premium"
+    elif vix >= cfg["put_vix_threshold"]:
+        vrp_regime = "buy_puts"
+    else:
+        vrp_regime = "idle"
+
+    prev_regime = _VRP_REGIME_STATE["current"]
+    _VRP_REGIME_STATE["cycle_count"] += 1
+    if vrp_regime != prev_regime:
+        _VRP_REGIME_STATE["current"] = vrp_regime
+        _VRP_REGIME_STATE["last_switch"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        log.info("VRP REGIME SWITCH: %s → %s (VIX=%.1f)", prev_regime, vrp_regime, vix)
+    else:
+        log.info("VRP REGIME: %s (VIX=%.1f, cycle #%d)", vrp_regime, vix, _VRP_REGIME_STATE["cycle_count"])
+
+    if vrp_regime == "idle":
+        return
 
     # Count existing hedge positions
     hedge_count = sum(1 for p in PAPER_PORTFOLIO.get("positions", [])
-                      if p.get("strategy") in ("crash_hedge_put", "crash_hedge_short"))
+                      if p.get("strategy") in ("crash_hedge_put", "crash_hedge_short", "crash_hedge_call_spread"))
 
     if hedge_count >= cfg["max_hedges"]:
         log.info("CRASH-HEDGE: %d hedges already open (max %d)", hedge_count, cfg["max_hedges"])
@@ -10364,9 +10440,9 @@ async def check_crash_hedges(channel):
         import sqlite3 as _chsq
         _chconn = _chsq.connect(DB_PATH)
         _chc = _chconn.cursor()
-        _chc.execute("SELECT closed_at FROM positions WHERE strategy IN ('crash_hedge_put','crash_hedge_short') ORDER BY created_at DESC LIMIT 1")
+        _chc.execute("SELECT closed_at FROM positions WHERE strategy IN ('crash_hedge_put','crash_hedge_short','crash_hedge_call_spread') ORDER BY created_at DESC LIMIT 1")
         _chrow = _chc.fetchone()
-        _chc.execute("SELECT created_at FROM positions WHERE strategy IN ('crash_hedge_put','crash_hedge_short') AND status='open' ORDER BY created_at DESC LIMIT 1")
+        _chc.execute("SELECT created_at FROM positions WHERE strategy IN ('crash_hedge_put','crash_hedge_short','crash_hedge_call_spread') AND status='open' ORDER BY created_at DESC LIMIT 1")
         _chrow2 = _chc.fetchone()
         _chconn.close()
         _last_ts = (_chrow2 and _chrow2[0]) or (_chrow and _chrow[0])
@@ -10388,17 +10464,85 @@ async def check_crash_hedges(channel):
     portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
         p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
 
-    # --- SPY PUT: VIX > 25, regime elevated or extreme ---
-    if vix > cfg["put_vix_threshold"] and regime_name in ("elevated", "extreme"):
+    # === VRP REGIME: SELL PREMIUM (VIX >= 28) — Simulate call credit spread ===
+    if vrp_regime == "sell_premium":
+        spread_count = sum(1 for p in PAPER_PORTFOLIO.get("positions", [])
+                          if p.get("strategy") == "crash_hedge_call_spread")
+        if spread_count >= cfg["vrp_max_spreads"]:
+            log.info("VRP: %d call spreads open (max %d)", spread_count, cfg["vrp_max_spreads"])
+            return
+
+        # Simulate: sell 20-delta call, buy 10-delta call, 2 DTE
+        # In high VIX, OTM call premium is inflated — we collect the spread
+        short_strike = round(spy_price * (1 + cfg["vrp_short_delta"]) / 5) * 5  # ~20% OTM, $5 increments
+        long_strike = short_strike + 5  # $5 wide spread
+        import datetime as _dt_vrp
+        expiry = datetime.now(timezone.utc) + _dt_vrp.timedelta(days=cfg["vrp_dte"])
+        while expiry.weekday() >= 5:
+            expiry += _dt_vrp.timedelta(days=1)
+
+        # Estimate credit received: spread width * delta difference * VIX factor
+        est_credit_per_contract = (vix / 20) * 0.50  # ~$0.50 credit at VIX 20, scales up
+        size_usd = portfolio_value * cfg["vrp_spread_size_pct"]
+        contracts = max(1, int(size_usd / (5 * 100)))  # $5-wide spread = $500 max risk per contract
+        net_credit = est_credit_per_contract * contracts * 100
+
+        short_sym = _build_options_symbol("SPY", expiry, short_strike, "C")
+        long_sym = _build_options_symbol("SPY", expiry, long_strike, "C")
+
+        _spread_pos = {
+            "market": f"VRP:CALL SPREAD ${short_strike}/{long_strike}",
+            "side": "SELL SPREAD", "shares": contracts,
+            "entry_price": spy_price, "cost": net_credit, "value": net_credit,
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            "platform": "Simulated", "ev": net_credit,
+            "strategy": "crash_hedge_call_spread",
+            "stop_price": 0, "target_price": 0,
+            "short_strike": short_strike, "long_strike": long_strike,
+            "short_symbol": short_sym, "long_symbol": long_sym,
+            "contracts": contracts, "est_credit": net_credit,
+            "vrp_regime": "sell_premium",
+        }
+        PAPER_PORTFOLIO["positions"].append(_spread_pos)
+        # Credit received goes into cash (premium collected)
+        PAPER_PORTFOLIO["cash"] += net_credit
+        db_log_paper_trade(_spread_pos)
+        db_open_position(
+            market_id=f"VRP:CALL SPREAD ${short_strike}/{long_strike}",
+            platform="Simulated", strategy="crash_hedge_call_spread",
+            direction="SELL SPREAD", size_usd=net_credit, shares=contracts,
+            entry_price=spy_price,
+            metadata={"vix": vix, "regime": regime_name, "vrp_regime": "sell_premium",
+                      "short_strike": short_strike, "long_strike": long_strike,
+                      "est_credit": net_credit, "contracts": contracts,
+                      "spy_price": spy_price},
+        )
+        log.info("VRP CALL SPREAD: VIX=%.1f SPY=$%.2f sell $%d/buy $%d x%d credit=$%.0f",
+                 vix, spy_price, short_strike, long_strike, contracts, net_credit)
+        if channel:
+            try:
+                await channel.send(
+                    f"**VRP CALL CREDIT SPREAD** (simulated)\n"
+                    f"VIX: {vix:.1f} | Regime: SELL PREMIUM\n"
+                    f"SPY: ${spy_price:.2f} | Sell ${short_strike}C / Buy ${long_strike}C\n"
+                    f"Contracts: {contracts} | Credit: ${net_credit:.0f}\n"
+                    f"Expiry: {expiry.strftime('%m/%d')} ({cfg['vrp_dte']}DTE)")
+            except Exception:
+                pass
+        return
+
+    # === VRP REGIME: BUY PUTS (VIX 25-27) ===
+    if vrp_regime == "buy_puts" and regime_name in ("elevated", "extreme"):
         success, msg = await execute_spy_put_hedge(spy_price, portfolio_value)
         if success:
-            strike = round(spy_price * (1 - cfg["put_strike_offset"]), 0)
+            strike = round(spy_price * (1 - cfg["put_strike_offset"]) / 5) * 5
             size_usd = portfolio_value * cfg["put_size_pct"]
-            _expiry = datetime.now(timezone.utc) + __import__("datetime").timedelta(days=cfg["put_dte"])
+            import datetime as _dt_put
+            _expiry = datetime.now(timezone.utc) + _dt_put.timedelta(days=cfg["put_dte"])
             _dtf = (4 - _expiry.weekday()) % 7
             if _dtf == 0 and _expiry.hour > 16:
                 _dtf = 7
-            _expiry = _expiry + __import__("datetime").timedelta(days=_dtf)
+            _expiry = _expiry + _dt_put.timedelta(days=_dtf)
             _occ_symbol = _build_options_symbol("SPY", _expiry, strike, "P")
             _put_pos = {
                 "market": f"HEDGE:SPY PUT ${strike:.0f}",
@@ -10411,6 +10555,7 @@ async def check_crash_hedges(channel):
                 "option_symbol": _occ_symbol,
                 "contracts": max(1, int(size_usd / (spy_price * 0.005 * 100))),
                 "entry_premium": size_usd / max(1, int(size_usd / (spy_price * 0.005 * 100))) / 100,
+                "vrp_regime": "buy_puts",
             }
             PAPER_PORTFOLIO["positions"].append(_put_pos)
             PAPER_PORTFOLIO["cash"] -= size_usd
@@ -10420,15 +10565,15 @@ async def check_crash_hedges(channel):
                 platform="Alpaca", strategy="crash_hedge_put",
                 direction="BUY", size_usd=size_usd, shares=1,
                 entry_price=spy_price,
-                metadata={"vix": vix, "regime": regime_name, "strike": strike,
-                          "spy_price": spy_price, "order_msg": msg},
+                metadata={"vix": vix, "regime": regime_name, "vrp_regime": "buy_puts",
+                          "strike": strike, "spy_price": spy_price, "order_msg": msg},
             )
-            log.info("CRASH-HEDGE PUT: VIX=%.1f SPY=$%.2f strike=$%.0f size=$%.0f",
+            log.info("CRASH-HEDGE PUT: VIX=%.1f SPY=$%.2f strike=$%.0f size=$%.0f (VRP=buy_puts)",
                      vix, spy_price, strike, size_usd)
             if channel:
                 try:
                     await channel.send(
-                        f"**CRASH HEDGE — SPY PUT**\n"
+                        f"**CRASH HEDGE — SPY PUT** (VRP: buy puts)\n"
                         f"VIX: {vix:.1f} | Regime: {regime_name.upper()}\n"
                         f"SPY: ${spy_price:.2f} | Strike: ${strike:.0f}\n"
                         f"Size: ${size_usd:.0f} | {msg}")
@@ -10437,9 +10582,8 @@ async def check_crash_hedges(channel):
         else:
             log.warning("CRASH-HEDGE PUT FAILED: %s", msg[:100])
 
-    # --- SPY SHORT: VIX > 35, regime extreme only ---
+    # --- SPY SHORT: VIX > 35, regime extreme only (unchanged) ---
     if vix > cfg["short_vix_threshold"] and regime_name == "extreme":
-        # Check we don't already have a short open
         has_short = any(p.get("strategy") == "crash_hedge_short"
                         for p in PAPER_PORTFOLIO.get("positions", []))
         if has_short:
@@ -10456,8 +10600,8 @@ async def check_crash_hedges(channel):
                 "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
                 "platform": "Alpaca", "ev": 0,
                 "strategy": "crash_hedge_short",
-                "stop_price": round(spy_price * 1.03, 2),  # 3% stop-loss on shorts
-                "target_price": round(spy_price * 0.90, 2),  # 10% target
+                "stop_price": round(spy_price * 1.03, 2),
+                "target_price": round(spy_price * 0.90, 2),
             }
             PAPER_PORTFOLIO["positions"].append(_short_pos)
             PAPER_PORTFOLIO["cash"] -= size_usd
