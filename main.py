@@ -9686,13 +9686,14 @@ def _intel_get_geo_state():
     return _INTEL_GEO_STATE.copy()
 
 
-def _intel_theme_escalation_count(theme):
-    """Count escalation headlines for a specific theme in the last hour,
-    regardless of which theme is the primary geo alert."""
+def _intel_theme_escalation_count(theme, hours=2):
+    """Count escalation headlines for a specific theme in the last N hours,
+    regardless of which theme is the primary geo alert.
+    Uses 2h window (not 1h) to avoid headline expiry gaps between scan cycles."""
     now = datetime.now(timezone.utc)
-    one_hour_ago = now - __import__("datetime").timedelta(hours=1)
+    cutoff = now - __import__("datetime").timedelta(hours=hours)
     entries = _INTEL_HEADLINE_MEMORY.get(theme, [])
-    recent = [(t, h) for t, h in entries if t > one_hour_ago]
+    recent = [(t, h) for t, h in entries if t > cutoff]
     esc_count = 0
     for _, headline in recent:
         hl = headline.lower()
@@ -9832,7 +9833,12 @@ async def scan_oracle_signals(channel=None):
                 if _geo_req:
                     _theme_esc_count = _intel_theme_escalation_count(_geo_req)
                     if _theme_esc_count < _geo_min:
+                        log.info("ORACLE GEO SKIP: %s — %s headlines=%d < %d required",
+                                 sig["name"], _geo_req, _theme_esc_count, _geo_min)
                         continue  # Not enough escalation headlines for this theme
+                    else:
+                        log.info("ORACLE GEO PASS: %s — %s headlines=%d >= %d",
+                                 sig["name"], _geo_req, _theme_esc_count, _geo_min)
             else:
                 if yes_price < sig["threshold"]:
                     continue
@@ -9840,8 +9846,9 @@ async def scan_oracle_signals(channel=None):
             signal_name = sig["name"]
             market_id = f"ORACLE:{signal_name}"
 
-            # Dedup: already open?
+            # Dedup: already open? Only check ORACLE: positions, not prediction trades
             if any(p.get("market", "") == market_id for p in PAPER_PORTFOLIO.get("positions", [])):
+                log.info("ORACLE DEDUP: %s already open in portfolio", signal_name)
                 continue
 
             # Overlap check: don't open positions with tickers already held by other oracle signals
