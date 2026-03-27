@@ -8088,15 +8088,38 @@ def _build_api_oracle():
     try:
         prices = _oracle_get_all_prices()
         for title, yes_price in prices.items():
-            sig = _oracle_match_signal(title)
-            if sig:
-                signals.append({
-                    "name": sig["name"], "market": title[:60],
-                    "yes_price": yes_price, "threshold": sig["threshold"],
-                    "pct_to_threshold": yes_price / sig["threshold"] * 100 if sig["threshold"] > 0 else 0,
-                    "long": sig["long"], "short": sig["short"],
-                    "active": yes_price >= sig["threshold"],
-                })
+            matched = _oracle_match_all_signals(title)
+            for sig in matched:
+                _is_inv = sig.get("inverse", False)
+                if _is_inv:
+                    # Inverse signal: fires when price drops BELOW threshold
+                    pct = (1 - yes_price) / (1 - sig["threshold"]) * 100 if sig["threshold"] < 1 else 0
+                    # Check geo requirement for active status
+                    _geo_req = sig.get("geo_required", "")
+                    _geo_min = sig.get("geo_min_headlines", 0)
+                    _geo_ok = False
+                    if _geo_req:
+                        _gs = _intel_get_geo_state()
+                        _geo_ok = (_gs.get("active") and _gs.get("theme", "") == _geo_req
+                                   and _gs.get("count", 0) >= _geo_min)
+                    is_active = yes_price <= sig["threshold"] and (_geo_ok if _geo_req else True)
+                    signals.append({
+                        "name": sig["name"], "market": title[:60],
+                        "yes_price": yes_price, "threshold": sig["threshold"],
+                        "pct_to_threshold": min(pct, 100),
+                        "long": sig["long"], "short": sig["short"],
+                        "active": is_active,
+                        "inverse": True,
+                        "geo_ok": _geo_ok if _geo_req else None,
+                    })
+                else:
+                    signals.append({
+                        "name": sig["name"], "market": title[:60],
+                        "yes_price": yes_price, "threshold": sig["threshold"],
+                        "pct_to_threshold": yes_price / sig["threshold"] * 100 if sig["threshold"] > 0 else 0,
+                        "long": sig["long"], "short": sig["short"],
+                        "active": yes_price >= sig["threshold"],
+                    })
     except Exception:
         pass
     # Headlines
@@ -9401,7 +9424,7 @@ async def scan_oracle_signals(channel=None):
                 pass
 
             # Minimum leg size floor — too many reductions can compound to dust
-            _MIN_ORACLE_LEG = 50
+            _MIN_ORACLE_LEG = 25
             if leg_size < _MIN_ORACLE_LEG:
                 log.info("ORACLE SIZE FLOOR: %s $%.0f < $%d min — skipping",
                          signal_name, leg_size, _MIN_ORACLE_LEG)
@@ -9855,31 +9878,94 @@ def _build_options_symbol(underlying, expiry_date, strike, option_type="P"):
     return f"{underlying}{date_str}{option_type}{strike_int:08d}"
 
 
+def _fetch_spy_options_chain(spy_price, hdrs):
+    """Fetch real SPY options chain from Alpaca and find the best put contract.
+    Returns (symbol, strike, expiry_str) or (None, None, None) on failure."""
+    import datetime as _dt
+    now = datetime.now(timezone.utc)
+    target_strike = round(spy_price * 0.98, 0)  # 2% below current price
+    min_dte = 5
+    max_dte = 10
+    min_exp = (now + _dt.timedelta(days=min_dte)).strftime("%Y-%m-%d")
+    max_exp = (now + _dt.timedelta(days=max_dte)).strftime("%Y-%m-%d")
+
+    # Alpaca snapshots/chain endpoint — fetch puts near target strike
+    try:
+        params = {
+            "symbols": "SPY",
+            "type": "put",
+            "strike_price_gte": str(target_strike - 10),
+            "strike_price_lte": str(target_strike + 10),
+            "expiration_date_gte": min_exp,
+            "expiration_date_lte": max_exp,
+            "limit": "50",
+            "feed": "indicative",
+        }
+        r = requests.get(f"{ALPACA_BASE_URL}/v2/options/contracts",
+                         params=params, headers=hdrs, timeout=15)
+        if r.status_code != 200:
+            log.warning("CRASH-HEDGE chain fetch failed: %d %s", r.status_code, r.text[:200])
+            return None, None, None
+        contracts = r.json().get("option_contracts", r.json() if isinstance(r.json(), list) else [])
+        if not contracts:
+            log.warning("CRASH-HEDGE no contracts found: strike~$%.0f exp %s–%s", target_strike, min_exp, max_exp)
+            return None, None, None
+
+        # Find nearest strike to target among available contracts
+        best = None
+        best_dist = float("inf")
+        for c in contracts:
+            c_strike = float(c.get("strike_price", 0))
+            c_exp = c.get("expiration_date", "")
+            c_sym = c.get("symbol", "")
+            c_status = c.get("status", "active")
+            if c_status != "active" or not c_sym:
+                continue
+            dist = abs(c_strike - target_strike)
+            if dist < best_dist:
+                best_dist = dist
+                best = (c_sym, c_strike, c_exp)
+        if best:
+            log.info("CRASH-HEDGE chain: picked %s strike=$%.0f exp=%s (target=$%.0f)",
+                     best[0], best[1], best[2], target_strike)
+        return best or (None, None, None)
+    except Exception as exc:
+        log.warning("CRASH-HEDGE chain error: %s", exc)
+        return None, None, None
+
+
 async def execute_spy_put_hedge(spy_price, portfolio_value):
-    """Buy SPY put option via Alpaca options API."""
+    """Buy SPY put option via Alpaca options API.
+    Fetches the real options chain to find a valid listed contract."""
     cfg = CRASH_HEDGE_CONFIG
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
         return False, "Alpaca not configured"
-
-    strike = round(spy_price * (1 - cfg["put_strike_offset"]), 0)
-    expiry = datetime.now(timezone.utc) + __import__("datetime").timedelta(days=cfg["put_dte"])
-    # Round to next Friday for weekly options
-    days_to_friday = (4 - expiry.weekday()) % 7
-    if days_to_friday == 0 and expiry.hour > 16:
-        days_to_friday = 7
-    expiry = expiry + __import__("datetime").timedelta(days=days_to_friday)
-
-    symbol = _build_options_symbol("SPY", expiry, strike, "P")
-    size_usd = portfolio_value * cfg["put_size_pct"]
-    # Estimate ~$3-8 per contract for OTM weeklies, buy as many as budget allows
-    est_premium = max(spy_price * 0.005, 1.0)  # Rough estimate
-    qty = max(1, int(size_usd / (est_premium * 100)))  # Options are 100 shares per contract
 
     hdrs = {
         "APCA-API-KEY-ID": ALPACA_API_KEY,
         "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
         "Content-Type": "application/json",
     }
+
+    # Fetch real options chain — find nearest listed put
+    symbol, strike, expiry_str = _fetch_spy_options_chain(spy_price, hdrs)
+    if symbol is None:
+        # Fallback: construct symbol from rounded strike and nearest Friday
+        import datetime as _dt
+        strike = round(spy_price * (1 - cfg["put_strike_offset"]), 0)
+        expiry = datetime.now(timezone.utc) + _dt.timedelta(days=cfg["put_dte"])
+        days_to_friday = (4 - expiry.weekday()) % 7
+        if days_to_friday == 0 and expiry.hour > 16:
+            days_to_friday = 7
+        expiry = expiry + _dt.timedelta(days=days_to_friday)
+        symbol = _build_options_symbol("SPY", expiry, strike, "P")
+        expiry_str = expiry.strftime("%Y-%m-%d")
+        log.warning("CRASH-HEDGE fallback to constructed symbol: %s", symbol)
+
+    size_usd = portfolio_value * cfg["put_size_pct"]
+    # Estimate ~$3-8 per contract for OTM weeklies, buy as many as budget allows
+    est_premium = max(spy_price * 0.005, 1.0)  # Rough estimate
+    qty = max(1, int(size_usd / (est_premium * 100)))  # Options are 100 shares per contract
 
     order_body = {
         "symbol": symbol,
@@ -9891,8 +9977,8 @@ async def execute_spy_put_hedge(spy_price, portfolio_value):
 
     if DRY_RUN_MODE:
         log.info("DRY RUN: SPY PUT %s qty=%d strike=$%.0f exp=%s size=$%.0f",
-                 symbol, qty, strike, expiry.strftime("%Y-%m-%d"), size_usd)
-        return True, f"DRY RUN: BUY {qty}x {symbol} (strike ${strike:.0f}, exp {expiry.strftime('%m/%d')})"
+                 symbol, qty, strike, expiry_str, size_usd)
+        return True, f"DRY RUN: BUY {qty}x {symbol} (strike ${strike:.0f}, exp {expiry_str})"
 
     try:
         r = requests.post(f"{ALPACA_BASE_URL}/v2/orders", json=order_body,
@@ -11842,7 +11928,7 @@ def _regime_weighted_half_kelly(portfolio_value, mc_prob, hist_stats):
 
     # --- Final size per leg ---
     raw_pct = kelly_half * regime_mult
-    clamped_pct = max(0.005, min(raw_pct, 0.03))  # Floor 0.5%, cap 3%
+    clamped_pct = max(0.01, min(raw_pct, 0.03))  # Floor 1.0%, cap 3%
     size_per_leg = clamped_pct * portfolio_value
     flat_size = portfolio_value * 0.015  # What flat sizing would have been
 
@@ -11959,7 +12045,7 @@ def scan_pairs_opportunities():
                 else:
                     # Fallback to flat sizing when Kelly gates fail (MC<=60% or hist reversion<=55%)
                     _base_size = _portfolio_val * 0.015
-                    _kelly_mult = min((abs(zscore) / 2.0) * corr, 2.0)
+                    _kelly_mult = max(0.75, min((abs(zscore) / 2.0) * corr, 2.0))
                     _pair_size = _base_size * _kelly_mult * _hist_mult * _arb_mult
                     log.info("FLAT SIZING: %s/%s $%.0f/leg (Kelly gates failed: MC=%.0f%% hist_rev=%.0f%%)",
                              ticker_a, ticker_b, _pair_size,
