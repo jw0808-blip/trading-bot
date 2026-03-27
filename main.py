@@ -3569,13 +3569,16 @@ async def oracle_status_cmd(ctx):
         for sig in _all_sigs:
             _inv = sig.get("inverse", False)
             if _inv:
-                _geo_gs = _intel_get_geo_state()
-                _geo_ok = _geo_gs.get("active") and _geo_gs.get("theme") == sig.get("geo_required", "")
+                _geo_req = sig.get("geo_required", "")
+                _geo_min = sig.get("geo_min_headlines", 0)
+                _theme_count = _intel_theme_escalation_count(_geo_req) if _geo_req else 0
+                _geo_ok = _theme_count >= _geo_min if _geo_req else True
                 status = "ACTIVE" if yes_price <= sig["threshold"] and _geo_ok else "watch"
+                _extra = f" +{sig.get('extra_long', '')}" if sig.get("extra_long") else ""
                 signal_lines.append(
                     f"  {sig['name']:16s} YES=${yes_price:.2f} Δ1h={delta:+.3f} "
-                    f"inv<{sig['threshold']:.2f} {status:6s} → {sig['long']}/{sig['short']}"
-                    f"{' +GEO' if _geo_ok else ''}")
+                    f"inv<{sig['threshold']:.2f} {status:6s} → {sig['long']}/{sig['short']}{_extra}"
+                    f"{f' +GEO({_theme_count})' if _geo_ok else f' geo({_theme_count}/{_geo_min})'}")
             else:
                 status = "ACTIVE" if yes_price >= sig["threshold"] else "below"
                 signal_lines.append(
@@ -8122,6 +8125,29 @@ def _build_api_oracle():
                     })
     except Exception:
         pass
+    # Geo-only fallback: show inverse signals that have no matching market
+    _matched_names = {s["name"] for s in signals}
+    for sig in ORACLE_SIGNALS:
+        if not sig.get("inverse") or sig["name"] in _matched_names:
+            continue
+        _geo_req = sig.get("geo_required", "")
+        if not _geo_req:
+            continue
+        _theme_count = _intel_theme_escalation_count(_geo_req)
+        _geo_ok = _theme_count >= 8  # Geo-only bar
+        _extra = sig.get("extra_long", "")
+        signals.append({
+            "name": sig["name"], "market": f"GEO-ONLY:{_geo_req}({_theme_count} headlines)",
+            "yes_price": 0.20 if _geo_ok else 0.50,
+            "threshold": sig["threshold"],
+            "pct_to_threshold": min(100, (1 - (0.20 if _geo_ok else 0.50)) / (1 - sig["threshold"]) * 100),
+            "long": sig["long"], "short": sig["short"],
+            "active": _geo_ok,
+            "inverse": True,
+            "geo_ok": _geo_ok,
+            "geo_only": True,
+            "extra_long": _extra or None,
+        })
     # Headlines
     headlines = {}
     for theme, entries in _INTEL_HEADLINE_MEMORY.items():
@@ -9359,6 +9385,7 @@ async def scan_oracle_signals(channel=None):
         return 0
 
     fired = 0
+    _matched_inverse_signals = set()  # Track which inverse signals had a matching market
     for title, yes_price in prices.items():
         _all_sigs = _oracle_match_all_signals(title)
         if not _all_sigs:
@@ -9367,6 +9394,7 @@ async def scan_oracle_signals(channel=None):
             # Threshold check: normal signals fire above threshold, inverse fire below
             _is_inverse = sig.get("inverse", False)
             if _is_inverse:
+                _matched_inverse_signals.add(sig["name"])
                 if yes_price > sig["threshold"]:
                     continue  # Inverse: only fire when prob DROPS below threshold
                 # Check geo requirement — count theme headlines directly,
@@ -9633,6 +9661,190 @@ async def scan_oracle_signals(channel=None):
                         pass
             except Exception as _oe:
                 log.warning("Oracle execution error for %s: %s", signal_name, _oe)
+
+    # Geo-only fallback for inverse signals with no matching Polymarket market.
+    # If headline count alone exceeds a higher bar (8+), synthesize a virtual price
+    # and fire the signal without needing a dedicated prediction market.
+    _GEO_ONLY_HEADLINE_BAR = 8
+    _GEO_ONLY_VIRTUAL_PRICE = 0.20  # Synthetic YES price (well below 0.35 threshold)
+    for sig in ORACLE_SIGNALS:
+        if not sig.get("inverse"):
+            continue
+        if sig["name"] in _matched_inverse_signals:
+            continue  # Already had a real market match
+        _geo_req = sig.get("geo_required", "")
+        if not _geo_req:
+            continue
+        _theme_count = _intel_theme_escalation_count(_geo_req)
+        if _theme_count < _GEO_ONLY_HEADLINE_BAR:
+            continue
+        signal_name = sig["name"]
+        market_id = f"ORACLE:{signal_name}"
+        # Dedup: already open?
+        if any(p.get("market", "") == market_id for p in PAPER_PORTFOLIO.get("positions", [])):
+            continue
+        # Cooldown check
+        _skip_cooldown = False
+        try:
+            import sqlite3 as _fcsq
+            _fcconn = _fcsq.connect(DB_PATH)
+            _fcc = _fcconn.cursor()
+            _fc_row = _fcc.execute(
+                "SELECT closed_at FROM positions WHERE market_id=? AND status='closed' ORDER BY closed_at DESC LIMIT 1",
+                (market_id,)).fetchone()
+            _fcconn.close()
+            if _fc_row and _fc_row[0]:
+                _fc_closed = datetime.fromisoformat(_fc_row[0].replace(" UTC", "+00:00"))
+                if (now - _fc_closed).total_seconds() < ORACLE_CONFIG["cooldown_hours"] * 3600:
+                    _skip_cooldown = True
+        except Exception:
+            pass
+        if _skip_cooldown:
+            continue
+        # Position limit
+        oracle_count = sum(1 for p in PAPER_PORTFOLIO.get("positions", [])
+                           if p.get("strategy") == "oracle_trade")
+        if oracle_count >= ORACLE_CONFIG["max_oracle_positions"]:
+            continue
+
+        log.info("GEO-ONLY FALLBACK: %s — %d %s escalation headlines (no market found), virtual YES=$%.2f",
+                 signal_name, _theme_count, _geo_req, _GEO_ONLY_VIRTUAL_PRICE)
+
+        # Reuse the same execution path with synthetic price
+        yes_price = _GEO_ONLY_VIRTUAL_PRICE
+        delta_1h = 0.0
+        long_tk = sig["long"]
+        short_tk = sig["short"]
+        extra_long_tk = sig.get("extra_long", "")
+        _legs_str = f"Long {long_tk} / Short {short_tk}" + (f" / Long {extra_long_tk}" if extra_long_tk else "")
+
+        portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
+            p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+        _size_pct = 0.005 if geo_elevated else ORACLE_CONFIG["base_size_pct"]
+        leg_size = portfolio_value * _size_pct * psychologist_size_multiplier() * meta_alloc_multiplier("oracle_trade")
+        if leg_size < 25:
+            continue
+
+        log.info("GEO-ONLY SIGNAL: %s → %s | $%.0f/leg", signal_name, _legs_str, leg_size)
+
+        import math as _omath
+        _alp_hdr = {
+            "APCA-API-KEY-ID": ALPACA_API_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+            "Content-Type": "application/json",
+        }
+        _alp_url = f"{ALPACA_BASE_URL}/v2/orders"
+        _data_hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+
+        try:
+            # Long leg
+            _long_body = {
+                "symbol": long_tk, "notional": str(round(leg_size, 2)),
+                "side": "buy", "type": "market", "time_in_force": "day",
+            }
+            _rl = requests.post(_alp_url, json=_long_body, headers=_alp_hdr, timeout=10)
+            if _rl.status_code not in (200, 201):
+                log.warning("GEO-ONLY LONG FAILED: %s HTTP %d: %s", long_tk, _rl.status_code, _rl.text[:200])
+                continue
+            _long_oid = _rl.json().get("id", "unknown")
+
+            # Short leg
+            _short_price = 0
+            try:
+                _sq = requests.get(f"https://data.alpaca.markets/v2/stocks/{short_tk}/quotes/latest",
+                                   headers=_data_hdr, timeout=5)
+                if _sq.status_code == 200:
+                    _short_price = float(_sq.json().get("quote", {}).get("ap", 0) or 0)
+            except Exception:
+                pass
+            _short_shares = _omath.floor(leg_size / _short_price) if _short_price > 0 else 0
+            if _short_shares < 1:
+                log.warning("GEO-ONLY SHORT SKIP: %s — 0 shares at $%.2f", short_tk, _short_price)
+                try:
+                    requests.delete(f"{_alp_url}/{_long_oid}", headers=_alp_hdr, timeout=5)
+                except Exception:
+                    pass
+                continue
+            _short_body = {
+                "symbol": short_tk, "qty": str(_short_shares),
+                "side": "sell", "type": "market", "time_in_force": "day",
+            }
+            _rs = requests.post(_alp_url, json=_short_body, headers=_alp_hdr, timeout=10)
+            if _rs.status_code not in (200, 201):
+                log.warning("GEO-ONLY SHORT FAILED: %s HTTP %d", short_tk, _rs.status_code)
+                try:
+                    requests.delete(f"{_alp_url}/{_long_oid}", headers=_alp_hdr, timeout=5)
+                except Exception:
+                    pass
+                continue
+            _short_oid = _rs.json().get("id", "unknown")
+
+            # Extra long leg
+            _extra_long_oid = None
+            if extra_long_tk:
+                _extra_body = {
+                    "symbol": extra_long_tk, "notional": str(round(leg_size, 2)),
+                    "side": "buy", "type": "market", "time_in_force": "day",
+                }
+                _re = requests.post(_alp_url, json=_extra_body, headers=_alp_hdr, timeout=10)
+                if _re.status_code in (200, 201):
+                    _extra_long_oid = _re.json().get("id", "unknown")
+                    log.info("GEO-ONLY EXTRA LONG: %s id=%s", extra_long_tk, _extra_long_oid)
+                else:
+                    log.warning("GEO-ONLY EXTRA LONG FAILED: %s (continuing with 2 legs)", extra_long_tk)
+
+            _num_legs = 3 if extra_long_tk else 2
+            total_cost = leg_size * _num_legs
+            if total_cost > PAPER_PORTFOLIO.get("cash", 0):
+                log.warning("GEO-ONLY: insufficient cash for %s", signal_name)
+                continue
+
+            PAPER_PORTFOLIO["cash"] -= total_cost
+            _oracle_pos = {
+                "market": market_id,
+                "side": _legs_str,
+                "shares": 1, "entry_price": yes_price, "cost": total_cost,
+                "value": total_cost,
+                "timestamp": now.strftime("%Y-%m-%d %H:%M UTC"),
+                "platform": "Alpaca", "ev": 0,
+                "strategy": "oracle_trade",
+                "long_leg": long_tk, "short_leg": short_tk,
+                "extra_long_leg": extra_long_tk or "",
+                "entry_long_price": 0, "entry_short_price": _short_price,
+                "signal_threshold": sig["threshold"],
+                "source_market": f"GEO-ONLY:{_geo_req}({_theme_count} headlines)",
+                "long_order_id": _long_oid, "short_order_id": _short_oid,
+                "extra_long_order_id": _extra_long_oid or "",
+            }
+            PAPER_PORTFOLIO["positions"].append(_oracle_pos)
+            db_log_paper_trade(_oracle_pos)
+            db_open_position(
+                market_id=market_id, platform="Alpaca", strategy="oracle_trade",
+                direction=_legs_str, size_usd=total_cost, shares=1, entry_price=yes_price,
+                long_leg=long_tk, short_leg=short_tk,
+                metadata={"signal": signal_name, "geo_only": True,
+                          "theme_count": _theme_count, "geo_theme": _geo_req,
+                          "extra_long": extra_long_tk, "extra_long_order_id": _extra_long_oid or ""},
+            )
+            fired += 1
+            log.info("GEO-ONLY TRADE: %s | %d headlines | %s | $%.0f",
+                     signal_name, _theme_count, _legs_str, total_cost)
+            if channel:
+                try:
+                    _rel_hl = _intel_get_relevant_headlines(signal_name, limit=3)
+                    _trade_msg = (
+                        f"**GEO-ONLY ORACLE** — {signal_name}\n"
+                        f"{_theme_count} {_geo_req} escalation headlines (no prediction market)\n"
+                        f"{_legs_str} | ${total_cost:.0f}")
+                    if _rel_hl:
+                        _trade_msg += "\n**Headlines:**"
+                        for _h in _rel_hl:
+                            _trade_msg += f"\n  • {_h[:80]}"
+                    await channel.send(_trade_msg)
+                except Exception:
+                    pass
+        except Exception as _goe:
+            log.warning("GEO-ONLY execution error for %s: %s", signal_name, _goe)
 
     return fired
 
