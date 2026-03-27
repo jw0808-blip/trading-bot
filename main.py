@@ -1499,6 +1499,10 @@ async def on_ready():
         morning_briefing_task.start()
     if not evening_briefing_task.is_running():
         evening_briefing_task.start()
+    if not regime_snapshot_task.is_running():
+        regime_snapshot_task.start()
+    # Initialize ChromaDB causal memory
+    _init_chromadb()
 
 
 @bot.command()
@@ -2366,6 +2370,40 @@ async def before_evening():
         target += __import__("datetime").timedelta(days=1)
     wait_secs = (target - now_et).total_seconds()
     log.info("Evening briefing scheduled in %.0f minutes", wait_secs / 60)
+    await asyncio.sleep(wait_secs)
+
+
+@tasks.loop(hours=24)
+async def regime_snapshot_task():
+    """Store daily regime snapshot in ChromaDB at 4:00 PM ET."""
+    try:
+        causal_memory_store_snapshot()
+        if DISCORD_CHANNEL_ID:
+            ch = bot.get_channel(int(DISCORD_CHANNEL_ID))
+            if ch:
+                vector, meta = _build_regime_vector()
+                if meta:
+                    await ch.send(
+                        f"**CAUSAL MEMORY** — Daily regime snapshot stored\n"
+                        f"VIX: {meta['vix']} | F&G: {meta['fng']} | SPY: ${meta['spy_price']:.0f} | "
+                        f"Trend: {meta['spy_trend_5d']:+.1f}% | Regime: {meta['regime'].upper()}\n"
+                        f"Geo: Iran={meta['iran_esc']} Ukraine={meta['ukraine_esc']} Taiwan={meta['taiwan_esc']}")
+    except Exception as e:
+        log.warning("Regime snapshot task error: %s", e)
+
+@regime_snapshot_task.before_loop
+async def before_regime_snapshot():
+    await bot.wait_until_ready()
+    import asyncio
+    from zoneinfo import ZoneInfo
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    target = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    if now_et >= target:
+        target += __import__("datetime").timedelta(days=1)
+    while target.weekday() >= 5:
+        target += __import__("datetime").timedelta(days=1)
+    wait_secs = (target - now_et).total_seconds()
+    log.info("Regime snapshot scheduled in %.0f minutes", wait_secs / 60)
     await asyncio.sleep(wait_secs)
 
 
@@ -4352,24 +4390,120 @@ def send_critical_alert(subject, message):
 
 @bot.command(name="memory-query")
 async def memory_query_cmd(ctx, *, theme: str = ""):
-    """Query echo memory for historical patterns. Usage: !memory-query iran"""
+    """Query echo memory + causal chain for a theme. Usage: !memory-query iran"""
     if not theme:
         await ctx.send("Usage: `!memory-query iran` or `!memory-query fed`")
         return
+
+    # Echo memory (SQLite)
     events = echo_memory_query(theme, days=30, limit=10)
-    if not events:
-        await ctx.send(f"**Echo Memory**: No events for '{theme}' in last 30 days")
-        return
     pattern = echo_memory_get_pattern(theme)
     msg = f"**Echo Memory: {theme}**\n"
     if pattern:
         msg += f"> {pattern}\n"
-    msg += "```\n"
-    for e in events:
-        _pnl = f"${e['pnl']:+.2f}" if e.get("pnl") else "—"
-        msg += f"  [{e.get('date', '?')[:10]}] {e.get('event_type', '?'):12s} prob={e.get('prob', 0):.2f} {_pnl} {e.get('headline', '')[:40]}\n"
-    msg += "```"
-    await ctx.send(msg)
+    if events:
+        msg += "```\n"
+        for e in events:
+            _pnl = f"${e['pnl']:+.2f}" if e.get("pnl") else "—"
+            msg += f"  [{e.get('date', '?')[:10]}] {e.get('event_type', '?'):12s} prob={e.get('prob', 0):.2f} {_pnl} {e.get('headline', '')[:40]}\n"
+        msg += "```\n"
+    else:
+        msg += "> No events in last 30 days\n"
+
+    # Causal chain: asset impact from similar historical dates
+    msg += f"\n**Causal Chain: What happened to related assets (48h after {theme} escalation)**\n"
+    try:
+        impacts = causal_memory_asset_impact(theme, hours=48)
+        if impacts:
+            msg += "```\n"
+            for asset, pct, dt in impacts:
+                arrow = "+" if pct > 0 else ""
+                msg += f"  {dt} → {asset:5s} {arrow}{pct:.1f}%\n"
+            msg += "```"
+        else:
+            msg += "> No causal data yet — snapshots build over time\n"
+    except Exception:
+        msg += "> Causal chain unavailable\n"
+
+    # Regime similarity
+    try:
+        matches = causal_memory_query(n_results=3)
+        if matches:
+            msg += f"\n**Most Similar Regimes:**\n```\n"
+            for meta, dist in matches:
+                msg += (f"  {meta.get('date', '?')} VIX={meta.get('vix', '?')} "
+                        f"F&G={meta.get('fng', '?')} pnl=${meta.get('total_daily_pnl', 0):+.0f} "
+                        f"(sim={1-dist:.2f})\n")
+            msg += "```"
+    except Exception:
+        pass
+
+    await ctx.send(msg[:1900])
+
+
+@bot.command(name="memory-status")
+async def memory_status_cmd(ctx):
+    """Show causal memory engine status: stored snapshots, current regime, similar dates."""
+    # Current regime vector
+    vector, meta = _build_regime_vector()
+    msg = "**CAUSAL MEMORY ENGINE**\n"
+    if meta:
+        msg += (f"**Current Regime Vector:**\n"
+                f"> VIX: {meta['vix']} | F&G: {meta['fng']} | SPY: ${meta['spy_price']:.0f} | "
+                f"Trend: {meta['spy_trend_5d']:+.1f}%\n"
+                f"> Regime: {meta['regime'].upper()} | "
+                f"Iran: {meta['iran_esc']} | Ukraine: {meta['ukraine_esc']} | Taiwan: {meta['taiwan_esc']}\n")
+    else:
+        msg += "> Cannot build regime vector\n"
+
+    # Collection stats
+    try:
+        if _CHROMA_COLLECTION:
+            count = _CHROMA_COLLECTION.count()
+            msg += f"\n**ChromaDB:** {count} snapshots stored\n"
+        else:
+            msg += "\n**ChromaDB:** Not initialized\n"
+    except Exception:
+        msg += "\n**ChromaDB:** Error reading collection\n"
+
+    # Last 10 snapshots
+    try:
+        if _CHROMA_COLLECTION and _CHROMA_COLLECTION.count() > 0:
+            all_data = _CHROMA_COLLECTION.get(
+                limit=10,
+                include=["metadatas"],
+            )
+            if all_data and all_data.get("metadatas"):
+                msg += "\n**Recent Snapshots:**\n```\n"
+                snapshots = sorted(all_data["metadatas"],
+                                   key=lambda m: m.get("date", ""), reverse=True)
+                for m in snapshots[:10]:
+                    msg += (f"  {m.get('date', '?'):10s} VIX={m.get('vix', '?'):5s} "
+                            f"F&G={str(m.get('fng', '?')):3s} "
+                            f"regime={str(m.get('regime', '?')):8s} "
+                            f"pnl=${m.get('total_daily_pnl', 0):+.0f}\n")
+                msg += "```"
+    except Exception as e:
+        msg += f"\n> Snapshot read error: {e}\n"
+
+    # Top 3 similar historical dates
+    try:
+        matches = causal_memory_query(n_results=3)
+        if matches:
+            msg += "\n**Top 3 Similar Historical Dates:**\n```\n"
+            for meta_m, dist in matches:
+                msg += (f"  {meta_m.get('date', '?')} "
+                        f"VIX={meta_m.get('vix', '?')} F&G={meta_m.get('fng', '?')} "
+                        f"SPY=${meta_m.get('spy_price', 0):.0f} "
+                        f"pnl=${meta_m.get('total_daily_pnl', 0):+.0f} "
+                        f"(similarity={1-dist:.2f})\n")
+            msg += "```"
+        else:
+            msg += "\n> No historical matches yet — build snapshots over time\n"
+    except Exception:
+        pass
+
+    await ctx.send(msg[:1900])
 
 
 @bot.command(name="vol-skew")
@@ -9767,6 +9901,15 @@ async def scan_oracle_signals(channel=None):
             kelly_mult = min(yes_price * (1 + abs(delta_1h) * 5), 2.0)
             leg_size = base_size * kelly_mult * psychologist_size_multiplier() * meta_alloc_multiplier("oracle_trade")
 
+            # Causal Memory: adjust size based on historical regime similarity
+            try:
+                _cm_mult, _cm_details = causal_memory_size_adjustment("oracle_trade")
+                if _cm_mult != 1.0:
+                    leg_size *= _cm_mult
+                    log.info("CAUSAL MEMORY ORACLE: %s %.2fx → $%.0f | %s", signal_name, _cm_mult, leg_size, _cm_details)
+            except Exception:
+                pass
+
             if leg_size < 10:
                 continue
 
@@ -11863,6 +12006,291 @@ def echo_memory_get_pattern(theme):
     return f"Last 30d: {len(trades)} trades, {wins}/{len(trades)} wins, ${total_pnl:+.2f}"
 
 
+# ---------------------------------------------------------------------------
+# ECHO CAUSAL MEMORY ENGINE — ChromaDB-backed regime similarity search
+# Closes the learning loop: reactive → predictive
+# ---------------------------------------------------------------------------
+_CHROMA_CLIENT = None
+_CHROMA_COLLECTION = None
+
+
+def _init_chromadb():
+    """Initialize ChromaDB with persistent local storage."""
+    global _CHROMA_CLIENT, _CHROMA_COLLECTION
+    try:
+        import chromadb
+        from chromadb.config import Settings
+        _CHROMA_CLIENT = chromadb.PersistentClient(path="/app/data/chromadb")
+        _CHROMA_COLLECTION = _CHROMA_CLIENT.get_or_create_collection(
+            name="regime_snapshots",
+            metadata={"hnsw:space": "cosine"},
+        )
+        log.info("CAUSAL MEMORY: ChromaDB initialized (%d snapshots stored)",
+                 _CHROMA_COLLECTION.count())
+    except Exception as e:
+        log.warning("CAUSAL MEMORY: ChromaDB init failed: %s — falling back to no-op", e)
+        _CHROMA_CLIENT = None
+        _CHROMA_COLLECTION = None
+
+
+def _build_regime_vector():
+    """Build a numeric vector representing the current market regime.
+    Returns (vector_list, metadata_dict) or (None, None) on failure."""
+    try:
+        regime = get_regime("equities")
+        vix = regime.get("vix") or 20
+        fng = _PSYCH_STATE.get("last_fng", 50)
+        spy_price = _get_spy_price() or 0
+
+        # Regime label to numeric
+        regime_map = {"low": 0, "normal": 1, "elevated": 2, "extreme": 3}
+        regime_num = regime_map.get(regime.get("regime", "normal"), 1)
+
+        # SPY 5-day trend from price history
+        spy_trend = 0
+        try:
+            import yfinance as _yf
+            _spy = _yf.Ticker("SPY")
+            _hist = _spy.history(period="5d")
+            if len(_hist) >= 2:
+                spy_trend = (_hist["Close"].iloc[-1] / _hist["Close"].iloc[0] - 1) * 100
+        except Exception:
+            pass
+
+        # Active geo themes
+        iran_esc = _intel_theme_escalation_count("iran")
+        ukraine_esc = _intel_theme_escalation_count("ukraine")
+        taiwan_esc = _intel_theme_escalation_count("taiwan")
+
+        # Active oracle signal count
+        oracle_active = sum(1 for p in PAPER_PORTFOLIO.get("positions", [])
+                           if p.get("strategy") in ("oracle_trade", "cascade_trade"))
+
+        # Normalize to 0-1 range for vector similarity
+        vector = [
+            vix / 50.0,           # VIX normalized (0-50 → 0-1)
+            fng / 100.0,          # F&G already 0-100
+            regime_num / 3.0,     # Regime 0-3 → 0-1
+            spy_trend / 10.0,     # 5-day trend normalized (-10% to +10% → -1 to 1)
+            min(iran_esc / 10.0, 1.0),     # Iran headlines 0-10 → 0-1
+            min(ukraine_esc / 10.0, 1.0),  # Ukraine headlines
+            min(taiwan_esc / 10.0, 1.0),   # Taiwan headlines
+            min(oracle_active / 4.0, 1.0), # Oracle positions 0-4 → 0-1
+        ]
+
+        metadata = {
+            "vix": round(vix, 1),
+            "fng": fng,
+            "spy_price": round(spy_price, 2),
+            "spy_trend_5d": round(spy_trend, 2),
+            "regime": regime.get("regime", "normal"),
+            "iran_esc": iran_esc,
+            "ukraine_esc": ukraine_esc,
+            "taiwan_esc": taiwan_esc,
+            "oracle_active": oracle_active,
+        }
+        return vector, metadata
+    except Exception as e:
+        log.warning("CAUSAL MEMORY: vector build error: %s", e)
+        return None, None
+
+
+def causal_memory_store_snapshot():
+    """Store daily regime snapshot in ChromaDB. Called at 4 PM ET."""
+    if not _CHROMA_COLLECTION:
+        _init_chromadb()
+    if not _CHROMA_COLLECTION:
+        return
+
+    vector, metadata = _build_regime_vector()
+    if vector is None:
+        return
+
+    now = datetime.now(timezone.utc)
+    date_str = now.strftime("%Y-%m-%d")
+    doc_id = f"regime_{date_str}"
+
+    # Calculate daily P&L by strategy
+    try:
+        import sqlite3 as _csq
+        conn = _csq.connect(DB_PATH)
+        c = conn.cursor()
+        today = now.strftime("%Y-%m-%d")
+        strategies = ["pairs", "oracle_trade", "cascade_trade", "crash_hedge_put",
+                      "crash_hedge_call_spread", "prediction"]
+        pnl_by_strat = {}
+        for strat in strategies:
+            row = c.execute(
+                "SELECT COALESCE(SUM(realized_pnl), 0) FROM positions WHERE strategy=? AND closed_at LIKE ?",
+                (strat, f"{today}%")).fetchone()
+            pnl_by_strat[strat] = round(row[0], 2) if row else 0
+        conn.close()
+        metadata["daily_pnl"] = pnl_by_strat
+        metadata["total_daily_pnl"] = round(sum(pnl_by_strat.values()), 2)
+    except Exception:
+        metadata["daily_pnl"] = {}
+        metadata["total_daily_pnl"] = 0
+
+    metadata["date"] = date_str
+    metadata["timestamp"] = now.strftime("%Y-%m-%d %H:%M UTC")
+
+    # Flatten metadata — ChromaDB requires flat string/int/float values
+    flat_meta = {}
+    for k, v in metadata.items():
+        if isinstance(v, dict):
+            for dk, dv in v.items():
+                flat_meta[f"{k}_{dk}"] = dv
+        else:
+            flat_meta[k] = v
+
+    try:
+        _CHROMA_COLLECTION.upsert(
+            ids=[doc_id],
+            embeddings=[vector],
+            metadatas=[flat_meta],
+            documents=[f"Regime snapshot {date_str}: VIX={metadata['vix']} F&G={metadata['fng']} "
+                       f"SPY=${metadata['spy_price']} trend={metadata['spy_trend_5d']:+.1f}% "
+                       f"regime={metadata['regime']}"],
+        )
+        log.info("CAUSAL MEMORY: stored snapshot %s (VIX=%.1f F&G=%d SPY=$%.0f pnl=$%.2f)",
+                 date_str, metadata["vix"], metadata["fng"], metadata["spy_price"],
+                 metadata.get("total_daily_pnl", 0))
+    except Exception as e:
+        log.warning("CAUSAL MEMORY: store error: %s", e)
+
+
+def causal_memory_query(strategy=None, n_results=5):
+    """Query ChromaDB for the N most similar regime snapshots to current conditions.
+    Returns list of (metadata_dict, distance) tuples, or empty list."""
+    if not _CHROMA_COLLECTION:
+        _init_chromadb()
+    if not _CHROMA_COLLECTION or _CHROMA_COLLECTION.count() == 0:
+        return []
+
+    vector, _ = _build_regime_vector()
+    if vector is None:
+        return []
+
+    try:
+        results = _CHROMA_COLLECTION.query(
+            query_embeddings=[vector],
+            n_results=min(n_results, _CHROMA_COLLECTION.count()),
+        )
+        matches = []
+        if results and results.get("metadatas"):
+            for i, meta in enumerate(results["metadatas"][0]):
+                dist = results["distances"][0][i] if results.get("distances") else 0
+                matches.append((meta, dist))
+        return matches
+    except Exception as e:
+        log.warning("CAUSAL MEMORY: query error: %s", e)
+        return []
+
+
+def causal_memory_size_adjustment(strategy, n_results=5):
+    """Pre-trade memory query: check historical win rate in similar regimes.
+    Returns (multiplier, details_str). Multiplier: 0.5 if <40% win, 1.25 if >70%, else 1.0."""
+    matches = causal_memory_query(strategy=strategy, n_results=n_results)
+    if not matches or len(matches) < 3:
+        return 1.0, "insufficient history"
+
+    # Calculate win rate for this strategy in similar regimes
+    wins = 0
+    losses = 0
+    total_pnl = 0
+    matched_dates = []
+    for meta, dist in matches:
+        date = meta.get("date", "?")
+        matched_dates.append(date)
+        pnl_key = f"daily_pnl_{strategy}"
+        strat_pnl = meta.get(pnl_key, 0)
+        if isinstance(strat_pnl, (int, float)):
+            total_pnl += strat_pnl
+            if strat_pnl > 0:
+                wins += 1
+            elif strat_pnl < 0:
+                losses += 1
+
+    total = wins + losses
+    if total == 0:
+        return 1.0, f"no {strategy} trades in {len(matches)} similar dates: {', '.join(matched_dates)}"
+
+    win_rate = wins / total
+    details = (f"similar dates: {', '.join(matched_dates)} | "
+               f"win_rate={win_rate:.0%} ({wins}W/{losses}L) pnl=${total_pnl:+.2f}")
+
+    if win_rate < 0.40:
+        log.info("CAUSAL MEMORY: %s win_rate=%.0f%% < 40%% → SIZE -50%% | %s", strategy, win_rate * 100, details)
+        return 0.5, details
+    elif win_rate > 0.70:
+        log.info("CAUSAL MEMORY: %s win_rate=%.0f%% > 70%% → SIZE +25%% | %s", strategy, win_rate * 100, details)
+        return 1.25, details
+    else:
+        log.info("CAUSAL MEMORY: %s win_rate=%.0f%% → SIZE 1.0x | %s", strategy, win_rate * 100, details)
+        return 1.0, details
+
+
+def causal_memory_asset_impact(theme, hours=48):
+    """Causal chain query: last time this theme was active, what happened to related assets.
+    Returns list of (asset, pct_change, date) tuples."""
+    matches = causal_memory_query(n_results=10)
+    if not matches:
+        return []
+
+    # Find dates where this theme had high escalation
+    theme_key = f"{theme}_esc"
+    active_dates = []
+    for meta, dist in matches:
+        if meta.get(theme_key, 0) >= 5:
+            active_dates.append(meta.get("date", ""))
+
+    if not active_dates:
+        return []
+
+    # Check asset price changes for related tickers over 48h after those dates
+    asset_map = {
+        "iran": ["XLE", "AAL", "GLD", "CL=F"],
+        "ukraine": ["LMT", "RTX", "UAL", "GLD", "EFA"],
+        "taiwan": ["TSM", "INTC", "SMH", "NVDA"],
+        "fed": ["XLF", "TLT", "SPY"],
+        "recession": ["GLD", "SPY", "TLT"],
+    }
+    assets = asset_map.get(theme, [])
+    results = []
+
+    try:
+        import yfinance as _yf
+        for asset in assets[:5]:
+            try:
+                _tk = _yf.Ticker(asset)
+                _hist = _tk.history(period="30d")
+                if len(_hist) < 3:
+                    continue
+                for dt_str in active_dates[:3]:
+                    try:
+                        import datetime as _dt_ca
+                        dt = _dt_ca.datetime.strptime(dt_str, "%Y-%m-%d")
+                        # Find the closest trading day in history
+                        closest_idx = None
+                        for i, idx in enumerate(_hist.index):
+                            if idx.date() >= dt.date():
+                                closest_idx = i
+                                break
+                        if closest_idx is not None and closest_idx + 2 < len(_hist):
+                            price_at = _hist["Close"].iloc[closest_idx]
+                            price_after = _hist["Close"].iloc[min(closest_idx + 2, len(_hist) - 1)]
+                            pct = (price_after / price_at - 1) * 100
+                            results.append((asset, round(pct, 2), dt_str))
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return results
+
+
 # VOLATILITY SKEW SCANNER — Put/Call IV analysis for options strategy
 # ---------------------------------------------------------------------------
 _VOL_SKEW_CACHE = {}  # {underlying: {"put_iv": x, "call_iv": y, "skew": z, "ts": datetime}}
@@ -12807,6 +13235,16 @@ def scan_pairs_opportunities():
                     log.info("FLAT SIZING: %s/%s $%.0f/leg (Kelly gates failed: MC=%.0f%% hist_rev=%.0f%%)",
                              ticker_a, ticker_b, _pair_size,
                              (_mc_prob or 0) * 100, _kelly_details.get("hist_reversion", 0) * 100)
+                # Causal Memory: adjust size based on historical regime similarity
+                try:
+                    _cm_mult, _cm_details = causal_memory_size_adjustment("pairs")
+                    if _cm_mult != 1.0:
+                        _pair_size *= _cm_mult
+                        log.info("CAUSAL MEMORY PAIRS: %s/%s %.2fx → $%.0f | %s",
+                                 ticker_a, ticker_b, _cm_mult, _pair_size, _cm_details)
+                except Exception:
+                    pass
+
                 if direction == "short_a_long_b":
                     _long_tk, _short_tk = ticker_b, ticker_a
                 else:
