@@ -9171,6 +9171,11 @@ ORACLE_SIGNALS = [
     {"name": "ukraine_escalation", "keywords": ["ukraine"],
      "threshold": 0.35, "long": "LMT", "short": "UAL", "extra_long": "GLD",
      "inverse": True, "geo_required": "ukraine", "geo_min_headlines": 5},
+    # Taiwan escalation: semiconductor supply chain disruption play
+    {"name": "taiwan_escalation", "keywords": ["taiwan"],
+     "threshold": 0.35, "long": "INTC", "short": "TSM", "extra_long": "SMH",
+     "inverse": True, "geo_required": "taiwan", "geo_min_headlines": 8,
+     "extra_long_side": "short"},  # extra_long_side=short means SHORT SMH, not long
 ]
 
 # Price history: {market_title_lower: [(timestamp, yes_price), ...]}
@@ -9193,6 +9198,7 @@ _INTEL_THEMES = {
     "recession":  ["US recession economy", "recession indicators GDP"],
     "china":      ["china taiwan", "china sanctions", "china trade"],
     "ukraine":    ["ukraine russia war", "ukraine ceasefire"],
+    "taiwan":     ["taiwan china military", "taiwan strait crisis", "taiwan invasion"],
 }
 
 # Escalation keywords — weighted heavier in geo monitor
@@ -9247,7 +9253,7 @@ def _intel_get_relevant_headlines(signal_name, limit=3):
     theme_map = {
         "fed_hike": "fed", "fed_cut": "fed",
         "iran_ceasefire": "iran", "iran_attack": "iran", "iran_escalation": "iran",
-        "ukraine_escalation": "ukraine",
+        "ukraine_escalation": "ukraine", "taiwan_escalation": "taiwan",
         "tariff": "tariff", "recession": "recession",
     }
     theme = theme_map.get(signal_name, "")
@@ -9471,6 +9477,23 @@ async def scan_oracle_signals(channel=None):
             if any(p.get("market", "") == market_id for p in PAPER_PORTFOLIO.get("positions", [])):
                 continue
 
+            # Overlap check: don't open positions with tickers already held by other oracle signals
+            _existing_tickers = set()
+            for _ep in PAPER_PORTFOLIO.get("positions", []):
+                if _ep.get("strategy") == "oracle_trade":
+                    _existing_tickers.add(_ep.get("long_leg", ""))
+                    _existing_tickers.add(_ep.get("short_leg", ""))
+                    _existing_tickers.add(_ep.get("extra_long_leg", ""))
+            _existing_tickers.discard("")
+            _sig_tickers = {sig["long"], sig["short"]}
+            if sig.get("extra_long"):
+                _sig_tickers.add(sig["extra_long"])
+            _overlap = _sig_tickers & _existing_tickers
+            if _overlap:
+                log.info("ORACLE OVERLAP: %s skipped — %s already in oracle positions",
+                         signal_name, ",".join(_overlap))
+                continue
+
             # Cooldown: check SQLite for recently closed
             try:
                 import sqlite3 as _osq
@@ -9557,7 +9580,8 @@ async def scan_oracle_signals(channel=None):
             short_tk = sig["short"]
             extra_long_tk = sig.get("extra_long", "")
 
-            _legs_str = f"Long {long_tk} / Short {short_tk}" + (f" / Long {extra_long_tk}" if extra_long_tk else "")
+            _extra_dir = "Short" if sig.get("extra_long_side") == "short" else "Long"
+            _legs_str = f"Long {long_tk} / Short {short_tk}" + (f" / {_extra_dir} {extra_long_tk}" if extra_long_tk else "")
             log.info("ORACLE SIGNAL: %s YES=$%.2f (Δ1h=%+.3f) → %s | $%.0f/leg",
                      signal_name, yes_price, delta_1h, _legs_str, leg_size)
 
@@ -9617,20 +9641,42 @@ async def scan_oracle_signals(channel=None):
                 _short_oid = _rs.json().get("id", "unknown")
                 log.info("ORACLE SHORT ORDER: %s id=%s", short_tk, _short_oid)
 
-                # Extra long leg (e.g. GLD for ukraine_escalation)
+                # Extra leg (e.g. GLD long for ukraine, SMH short for taiwan)
                 _extra_long_oid = None
+                _extra_side = sig.get("extra_long_side", "buy")  # default buy, "short" for sells
                 if extra_long_tk:
-                    _extra_body = {
-                        "symbol": extra_long_tk, "notional": str(round(leg_size, 2)),
-                        "side": "buy", "type": "market", "time_in_force": "day",
-                    }
-                    _re = requests.post(_alp_url, json=_extra_body, headers=_alp_hdr, timeout=10)
-                    if _re.status_code in (200, 201):
-                        _extra_long_oid = _re.json().get("id", "unknown")
-                        log.info("ORACLE EXTRA LONG ORDER: %s id=%s", extra_long_tk, _extra_long_oid)
+                    if _extra_side == "short":
+                        # Short: need whole shares
+                        _extra_price = 0
+                        try:
+                            _eq = requests.get(f"https://data.alpaca.markets/v2/stocks/{extra_long_tk}/quotes/latest",
+                                               headers=_data_hdr, timeout=5)
+                            if _eq.status_code == 200:
+                                _extra_price = float(_eq.json().get("quote", {}).get("ap", 0) or 0)
+                        except Exception:
+                            pass
+                        _extra_shares = _omath.floor(leg_size / _extra_price) if _extra_price > 0 else 0
+                        if _extra_shares >= 1:
+                            _extra_body = {
+                                "symbol": extra_long_tk, "qty": str(_extra_shares),
+                                "side": "sell", "type": "market", "time_in_force": "day",
+                            }
+                        else:
+                            _extra_body = None
+                            log.warning("ORACLE EXTRA SHORT SKIP: %s — 0 shares at $%.2f", extra_long_tk, _extra_price)
                     else:
-                        log.warning("ORACLE EXTRA LONG FAILED: %s HTTP %d: %s (continuing with 2 legs)",
-                                    extra_long_tk, _re.status_code, _re.text[:200])
+                        _extra_body = {
+                            "symbol": extra_long_tk, "notional": str(round(leg_size, 2)),
+                            "side": "buy", "type": "market", "time_in_force": "day",
+                        }
+                    if _extra_body:
+                        _re = requests.post(_alp_url, json=_extra_body, headers=_alp_hdr, timeout=10)
+                        if _re.status_code in (200, 201):
+                            _extra_long_oid = _re.json().get("id", "unknown")
+                            log.info("ORACLE EXTRA %s ORDER: %s id=%s", _extra_side.upper(), extra_long_tk, _extra_long_oid)
+                        else:
+                            log.warning("ORACLE EXTRA %s FAILED: %s HTTP %d: %s (continuing with 2 legs)",
+                                        _extra_side.upper(), extra_long_tk, _re.status_code, _re.text[:200])
 
                 # Get fill prices
                 _entry_long_price = 0
@@ -9834,19 +9880,33 @@ async def scan_oracle_signals(channel=None):
                 continue
             _short_oid = _rs.json().get("id", "unknown")
 
-            # Extra long leg
+            # Extra leg (long or short depending on signal config)
             _extra_long_oid = None
+            _extra_side = sig.get("extra_long_side", "buy")
             if extra_long_tk:
-                _extra_body = {
-                    "symbol": extra_long_tk, "notional": str(round(leg_size, 2)),
-                    "side": "buy", "type": "market", "time_in_force": "day",
-                }
-                _re = requests.post(_alp_url, json=_extra_body, headers=_alp_hdr, timeout=10)
-                if _re.status_code in (200, 201):
-                    _extra_long_oid = _re.json().get("id", "unknown")
-                    log.info("GEO-ONLY EXTRA LONG: %s id=%s", extra_long_tk, _extra_long_oid)
+                if _extra_side == "short":
+                    _extra_price = 0
+                    try:
+                        _eq = requests.get(f"https://data.alpaca.markets/v2/stocks/{extra_long_tk}/quotes/latest",
+                                           headers=_data_hdr, timeout=5)
+                        if _eq.status_code == 200:
+                            _extra_price = float(_eq.json().get("quote", {}).get("ap", 0) or 0)
+                    except Exception:
+                        pass
+                    import math as _gmath
+                    _extra_shares = _gmath.floor(leg_size / _extra_price) if _extra_price > 0 else 0
+                    _extra_body = {"symbol": extra_long_tk, "qty": str(_extra_shares),
+                                   "side": "sell", "type": "market", "time_in_force": "day"} if _extra_shares >= 1 else None
                 else:
-                    log.warning("GEO-ONLY EXTRA LONG FAILED: %s (continuing with 2 legs)", extra_long_tk)
+                    _extra_body = {"symbol": extra_long_tk, "notional": str(round(leg_size, 2)),
+                                   "side": "buy", "type": "market", "time_in_force": "day"}
+                if _extra_body:
+                    _re = requests.post(_alp_url, json=_extra_body, headers=_alp_hdr, timeout=10)
+                    if _re.status_code in (200, 201):
+                        _extra_long_oid = _re.json().get("id", "unknown")
+                        log.info("GEO-ONLY EXTRA %s: %s id=%s", _extra_side.upper(), extra_long_tk, _extra_long_oid)
+                    else:
+                        log.warning("GEO-ONLY EXTRA %s FAILED: %s (continuing with 2 legs)", _extra_side.upper(), extra_long_tk)
 
             _num_legs = 3 if extra_long_tk else 2
             total_cost = leg_size * _num_legs
