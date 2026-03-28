@@ -9919,7 +9919,12 @@ async def scan_oracle_signals(channel=None):
             except Exception:
                 pass
 
+            log.info("ORACLE SIZING: %s conv=%.2f kelly=%.2f base=$%.0f psych=%.1f meta=%.1f → leg=$%.0f",
+                     signal_name, _conv_price, kelly_mult, base_size,
+                     psychologist_size_multiplier(), meta_alloc_multiplier("oracle_trade"), leg_size)
+
             if leg_size < 10:
+                log.info("ORACLE DUST SKIP: %s leg=$%.2f < $10", signal_name, leg_size)
                 continue
 
             # Monte Carlo validation on oracle trade legs
