@@ -404,13 +404,45 @@ def get_kalshi_events(limit=20):
         r = requests.get(
             KALSHI_BASE + path,
             headers=headers,
-            params={"limit": limit, "status": "open"},
+            params={"limit": limit, "status": "open",
+                    "with_nested_markets": "true"},
             timeout=15,
         )
         if r.status_code == 200:
             return r.json().get("events", [])
     except Exception as exc:
         log.warning("Kalshi events fetch error: %s", exc)
+    return []
+
+
+def get_kalshi_active_markets(limit=50):
+    """Fetch active Kalshi markets directly, sorted by volume. More reliable than events→markets."""
+    if not KALSHI_API_KEY_ID or not KALSHI_PRIVATE_KEY:
+        return []
+    path = "/markets"
+    ts, sig = kalshi_sign("GET", path)
+    headers = {
+        "KALSHI-ACCESS-KEY": KALSHI_API_KEY_ID,
+        "KALSHI-ACCESS-TIMESTAMP": ts,
+        "KALSHI-ACCESS-SIGNATURE": sig,
+        "Content-Type": "application/json",
+    }
+    try:
+        r = requests.get(
+            KALSHI_BASE + path,
+            headers=headers,
+            params={"limit": limit, "status": "open"},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            markets = r.json().get("markets", [])
+            # Sort by volume descending
+            markets.sort(key=lambda m: float(m.get("volume", 0) or 0), reverse=True)
+            return markets
+        else:
+            log.warning("Kalshi active markets: HTTP %d", r.status_code)
+    except Exception as exc:
+        log.warning("Kalshi active markets error: %s", exc)
     return []
 
 
@@ -3627,35 +3659,23 @@ async def kalshi_status_cmd(ctx):
     msg += f"Min Volume: ${KALSHI_MIN_VOLUME:,}\n\n"
 
     if connected:
-        events = get_kalshi_events(limit=10)
-        msg += f"**Events Found: {len(events)}**\n"
-        # Get markets for each event, sort by volume
-        all_markets = []
-        for event in events[:5]:
-            ticker = event.get("event_ticker", "")
-            markets = get_kalshi_markets_for_event(ticker)
-            for mkt in markets:
-                vol = float(mkt.get("volume", 0) or 0)
-                yes_ask = mkt.get("yes_ask", 0)
-                no_ask = mkt.get("no_ask", 0)
-                all_markets.append({
-                    "title": mkt.get("title", "")[:50],
-                    "ticker": mkt.get("ticker", ""),
-                    "volume": vol,
-                    "yes": yes_ask / 100 if yes_ask else 0,
-                    "no": no_ask / 100 if no_ask else 0,
-                })
-        all_markets.sort(key=lambda m: m["volume"], reverse=True)
+        # Fetch markets directly (more reliable than events→markets)
+        markets = get_kalshi_active_markets(limit=50)
+        msg += f"**Markets Fetched: {len(markets)}**\n"
         msg += "\n**Top 5 Markets by Volume:**\n```\n"
-        for m in all_markets[:5]:
-            msg += (f"  {m['title'][:40]:40s} Vol: ${m['volume']:>8,.0f} "
-                    f"YES: ${m['yes']:.2f} NO: ${m['no']:.2f}\n")
+        for m in markets[:5]:
+            vol = float(m.get("volume", 0) or 0)
+            yes_ask = m.get("yes_ask", 0)
+            no_ask = m.get("no_ask", 0)
+            yes_p = yes_ask / 100 if yes_ask else 0
+            no_p = no_ask / 100 if no_ask else 0
+            msg += (f"  {m.get('title', '?')[:40]:40s} Vol: ${vol:>8,.0f} "
+                    f"YES: ${yes_p:.2f} NO: ${no_p:.2f}\n")
         msg += "```"
-        if not all_markets:
-            msg += "No markets with pricing found\n"
-        # Count qualifying markets
-        qualifying = sum(1 for m in all_markets if m["volume"] >= KALSHI_MIN_VOLUME)
-        msg += f"\n{qualifying} markets pass volume filter (>= ${KALSHI_MIN_VOLUME:,})"
+        if not markets:
+            msg += "No markets found\n"
+        qualifying = sum(1 for m in markets if float(m.get("volume", 0) or 0) >= KALSHI_MIN_VOLUME)
+        msg += f"\n{qualifying}/{len(markets)} markets pass volume filter (>= ${KALSHI_MIN_VOLUME:,})"
     else:
         msg += f"\nKey ID: {KALSHI_API_KEY_ID[:12]}... | PEM: {'loaded' if KALSHI_PRIVATE_KEY else 'MISSING'}"
     await ctx.send(msg[:1900])
@@ -5123,109 +5143,89 @@ async def alert_scan_task():
                     log.warning("Pairs scan error: %s", pairs_err)
             elif EQUITIES_ENABLED and not is_market_open():
                 pass  # Market closed, skip silently
-            # === FUNDING ARB SCANNER (runs 24/7) ===
+            # === FUNDING ARB SCANNER (runs 24/7, Phemex + Binance) ===
             try:
                 _arb_cfg = globals().get("FUNDING_ARB_CONFIG", {})
-                _arb_threshold = _arb_cfg.get("min_spread", 0.0003)
-                # Fetch LIVE funding rates from Phemex
-                import requests as _arb_req
-                _funding_pairs = [("BTC", "BTCUSDT"), ("ETH", "ETHUSDT"), ("SOL", "SOLUSDT"), ("XRP", "XRPUSDT")]
-                for _fname, _fsymbol in _funding_pairs:
+                _arb_threshold = _arb_cfg.get("min_funding_rate", 0.0003)
+                _arb_rates = fetch_all_funding_rates()
+                for _fname, _ri in _arb_rates.items():
                     try:
-                        _fr = _arb_req.get(
-                            f"https://api.phemex.com/md/v2/ticker/24hr?symbol={_fsymbol}",
-                            timeout=5
-                        )
-                        if _fr.status_code == 200:
-                            _fdata = _fr.json()
-                            _result = _fdata.get("result", {})
-                            _funding_rate = _result.get("fundingRate", 0)
-                            # Phemex returns rate as integer, divide by 10^8
-                            if isinstance(_funding_rate, (int, float)) and _funding_rate != 0:
-                                _rate_pct = _funding_rate / 1e8 if abs(_funding_rate) > 1 else _funding_rate
-                            else:
-                                _rate_pct = 0
-                            _above = _rate_pct > (0.0005 if _fname in ("SOL","XRP") else _arb_threshold)
-                            log.info("FUNDING-ARB %s: rate=%.4f%% threshold=%.4f%% %s",
-                                     _fname, _rate_pct * 100, (0.0005 if _fname in ("SOL","XRP") else _arb_threshold) * 100,
-                                     ">>> SIGNAL" if _above else "below threshold")
-                            if _above and AUTO_PAPER_ENABLED:
-                                _arb_size = PAPER_PORTFOLIO.get("cash", 25000) * 0.02
-                                if _arb_size > 50 and len(PAPER_PORTFOLIO.get("positions", [])) < 25:
-                                    # Execute both legs: Coinbase spot buy + Phemex perp short
-                                    _spot_ok, _spot_msg = False, ""
-                                    _perp_ok, _perp_msg, _perp_oid = False, "", None
-                                    _spot_oid = None
-                                    try:
-                                        _spot_ok, _spot_msg = await execute_coinbase_order("BUY", _fname, _arb_size)
-                                        if _spot_ok:
-                                            # Extract order ID from message
-                                            import re as _arb_re
-                                            _oid_match = _arb_re.search(r"ID: ([^\)]+)", _spot_msg)
-                                            _spot_oid = _oid_match.group(1) if _oid_match else "unknown"
-                                            log.info("ARB SPOT LEG OK: %s %s", _fname, _spot_msg[:80])
-                                        else:
-                                            log.warning("ARB SPOT LEG FAILED: %s %s", _fname, _spot_msg[:100])
-                                            continue  # Don't open perp if spot failed
-                                    except Exception as _se:
-                                        log.warning("ARB SPOT LEG ERROR: %s %s", _fname, _se)
+                        _rate_pct = _ri["best"]
+                        _above = _rate_pct > (0.0005 if _fname in ("SOL", "XRP", "BNB") else _arb_threshold)
+                        log.info("FUNDING-ARB %s: phemex=%.4f%% binance=%.4f%% best=%.4f%% threshold=%.4f%% %s",
+                                 _fname, _ri["phemex"] * 100, _ri["binance"] * 100,
+                                 _rate_pct * 100, (0.0005 if _fname in ("SOL", "XRP", "BNB") else _arb_threshold) * 100,
+                                 ">>> SIGNAL" if _above else "below threshold")
+                        if _above and AUTO_PAPER_ENABLED:
+                            _arb_size = PAPER_PORTFOLIO.get("cash", 25000) * 0.02
+                            if _arb_size > 50 and len(PAPER_PORTFOLIO.get("positions", [])) < 25:
+                                _spot_ok, _spot_msg = False, ""
+                                _perp_ok, _perp_msg, _perp_oid = False, "", None
+                                _spot_oid = None
+                                try:
+                                    _spot_ok, _spot_msg = await execute_coinbase_order("BUY", _fname, _arb_size)
+                                    if _spot_ok:
+                                        import re as _arb_re
+                                        _oid_match = _arb_re.search(r"ID: ([^\)]+)", _spot_msg)
+                                        _spot_oid = _oid_match.group(1) if _oid_match else "unknown"
+                                        log.info("ARB SPOT LEG OK: %s %s", _fname, _spot_msg[:80])
+                                    else:
+                                        log.warning("ARB SPOT LEG FAILED: %s %s", _fname, _spot_msg[:100])
                                         continue
-
-                                    try:
-                                        _perp_ok, _perp_msg, _perp_oid = await execute_phemex_perp_short(_fname, _arb_size)
-                                        if _perp_ok:
-                                            log.info("ARB PERP LEG OK: %s %s", _fname, _perp_msg[:80])
-                                        else:
-                                            log.warning("ARB PERP LEG FAILED: %s %s — spot already filled", _fname, _perp_msg[:100])
-                                            # Spot filled but perp failed — sell spot to unwind
-                                            try:
-                                                await execute_coinbase_order("SELL", _fname, _arb_size)
-                                                log.info("ARB UNWIND: sold spot %s (perp leg failed)", _fname)
-                                            except Exception:
-                                                log.warning("ARB UNWIND FAILED: %s — manual intervention needed", _fname)
-                                            continue
-                                    except Exception as _pe:
-                                        log.warning("ARB PERP LEG ERROR: %s %s — unwinding spot", _fname, _pe)
+                                except Exception as _se:
+                                    log.warning("ARB SPOT LEG ERROR: %s %s", _fname, _se)
+                                    continue
+                                try:
+                                    _perp_ok, _perp_msg, _perp_oid = await execute_phemex_perp_short(_fname, _arb_size)
+                                    if _perp_ok:
+                                        log.info("ARB PERP LEG OK: %s %s", _fname, _perp_msg[:80])
+                                    else:
+                                        log.warning("ARB PERP LEG FAILED: %s %s", _fname, _perp_msg[:100])
                                         try:
                                             await execute_coinbase_order("SELL", _fname, _arb_size)
+                                            log.info("ARB UNWIND: sold spot %s (perp leg failed)", _fname)
                                         except Exception:
-                                            pass
+                                            log.warning("ARB UNWIND FAILED: %s", _fname)
                                         continue
-
-                                    # Both legs successful — record position
-                                    _arb_pos = {
-                                        "market": f"FUNDING-ARB:{_fname}",
-                                        "side": "ARB", "shares": 1,
-                                        "entry_price": _rate_pct,
-                                        "cost": _arb_size * 2, "value": _arb_size * 2,
-                                        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-                                        "platform": "Phemex+Coinbase",
-                                        "ev": _rate_pct, "strategy": "funding_arb",
-                                        "spot_order_id": _spot_oid,
-                                        "perp_order_id": _perp_oid,
-                                    }
-                                    PAPER_PORTFOLIO["positions"].append(_arb_pos)
-                                    PAPER_PORTFOLIO["cash"] -= _arb_size * 2
-                                    db_log_paper_trade(_arb_pos)
-                                    db_open_position(
-                                        market_id=f"FUNDING-ARB:{_fname}",
-                                        platform="Phemex+Coinbase", strategy="funding_arb",
-                                        direction="arb", size_usd=_arb_size * 2, shares=1,
-                                        entry_price=_rate_pct,
-                                        metadata={"funding_rate": _rate_pct, "spot_order": _spot_oid,
-                                                  "perp_order": _perp_oid, "leg_size": _arb_size},
-                                    )
-                                    log.info("FUNDING-ARB TRADE: %s rate=%.4f%% size=$%.0f (spot+perp)",
-                                             _fname, _rate_pct * 100, _arb_size)
-                                    if channel:
-                                        await channel.send(
-                                            f"**FUNDING ARB** {_fname} | Rate: {_rate_pct*100:.4f}%\n"
-                                            f"Spot BUY: ${_arb_size:.0f} | Perp SHORT: ${_arb_size:.0f}\n"
-                                            f"Spot ID: {_spot_oid} | Perp ID: {_perp_oid}")
-                        else:
-                            log.warning("Phemex API %s: status %d", _fname, _fr.status_code)
+                                except Exception as _pe:
+                                    log.warning("ARB PERP LEG ERROR: %s %s — unwinding spot", _fname, _pe)
+                                    try:
+                                        await execute_coinbase_order("SELL", _fname, _arb_size)
+                                    except Exception:
+                                        pass
+                                    continue
+                                _arb_pos = {
+                                    "market": f"FUNDING-ARB:{_fname}",
+                                    "side": "ARB", "shares": 1,
+                                    "entry_price": _rate_pct,
+                                    "cost": _arb_size * 2, "value": _arb_size * 2,
+                                    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                                    "platform": f"{_ri['best_source'].title()}+Coinbase",
+                                    "ev": _rate_pct, "strategy": "funding_arb",
+                                    "spot_order_id": _spot_oid,
+                                    "perp_order_id": _perp_oid,
+                                }
+                                PAPER_PORTFOLIO["positions"].append(_arb_pos)
+                                PAPER_PORTFOLIO["cash"] -= _arb_size * 2
+                                db_log_paper_trade(_arb_pos)
+                                db_open_position(
+                                    market_id=f"FUNDING-ARB:{_fname}",
+                                    platform=f"{_ri['best_source'].title()}+Coinbase",
+                                    strategy="funding_arb",
+                                    direction="arb", size_usd=_arb_size * 2, shares=1,
+                                    entry_price=_rate_pct,
+                                    metadata={"funding_rate": _rate_pct, "source": _ri["best_source"],
+                                              "spot_order": _spot_oid, "perp_order": _perp_oid,
+                                              "leg_size": _arb_size},
+                                )
+                                log.info("FUNDING-ARB TRADE: %s rate=%.4f%% size=$%.0f (%s+spot)",
+                                         _fname, _rate_pct * 100, _arb_size, _ri["best_source"])
+                                if channel:
+                                    await channel.send(
+                                        f"**FUNDING ARB** {_fname} | Rate: {_rate_pct*100:.4f}% ({_ri['best_source']})\n"
+                                        f"Spot BUY: ${_arb_size:.0f} | Perp SHORT: ${_arb_size:.0f}")
                     except Exception as _fe:
-                        log.warning("Phemex %s fetch error: %s", _fname, _fe)
+                        log.warning("Funding arb %s error: %s", _fname, _fe)
             except Exception as arb_err:
                 log.warning("Funding arb scan error: %s", arb_err)
             # === CRASH HEDGE SCANNER (runs during market hours) ===
