@@ -1403,50 +1403,89 @@ CRYPTO_MEME_BLACKLIST = {"SHIB","DOGE","PEPE","FLOKI","BONK","WIF","RAIN","HYPE"
 CRYPTO_MIN_VOLUME_24H = 10_000_000  # $10M minimum 24h volume
 CRYPTO_MIN_PRICE = 1.00  # Skip assets under $1.00
 
+def _fetch_binance_movers():
+    """Fetch 24h movers from Binance public API. Returns list of dicts with sym, price, chg, vol."""
+    movers = []
+    try:
+        r = requests.get("https://api.binance.com/api/v3/ticker/24hr", timeout=10)
+        if r.status_code != 200:
+            return movers
+        for t in r.json():
+            sym_raw = t.get("symbol", "")
+            if not sym_raw.endswith("USDT"):
+                continue
+            base = sym_raw.replace("USDT", "")
+            px = float(t.get("lastPrice", 0) or 0)
+            chg = float(t.get("priceChangePercent", 0) or 0)
+            vol_usd = float(t.get("quoteVolume", 0) or 0)
+            if px >= CRYPTO_MIN_PRICE and vol_usd >= CRYPTO_MIN_VOLUME_24H and abs(chg) > 8:
+                if base not in CRYPTO_MEME_BLACKLIST and len(base) <= 5:
+                    movers.append({"sym": base, "price": px, "chg": chg, "vol": vol_usd, "source": "binance"})
+    except Exception as e:
+        log.warning("Binance crypto scan: %s", e)
+    return movers
+
+
 def find_crypto_momentum():
     opportunities = []
+    seen_syms = set()
+
+    # Source 1: CoinGecko (market cap top 50)
     try:
         r = requests.get("https://api.coingecko.com/api/v3/coins/markets",
             params={"vs_currency": "usd", "order": "market_cap_desc",
                     "per_page": 50, "sparkline": "false"}, timeout=15)
-        if r.status_code != 200:
-            return opportunities
-        for coin in r.json():
-            sym = coin.get("symbol", "").upper()
-            px = coin.get("current_price", 0) or 0
-            chg = coin.get("price_change_percentage_24h") or 0
-            vol = coin.get("total_volume", 0) or 0
-
-            # Hard filters
-            if sym in CRYPTO_MEME_BLACKLIST:
-                continue
-            if px < CRYPTO_MIN_PRICE:
-                continue
-            if vol < CRYPTO_MIN_VOLUME_24H:
-                continue
-
-            # Verify live price from Coinbase before adding
-            try:
-                _cr = requests.get(f"https://api.coinbase.com/v2/prices/{sym}-USD/spot", timeout=5)
-                if _cr.status_code == 200:
-                    _live_px = float(_cr.json().get("data", {}).get("amount", 0))
-                    if _live_px < CRYPTO_MIN_PRICE:
-                        continue
-                    px = _live_px  # Use live price
-            except Exception:
-                pass  # Fall back to CoinGecko price
-
-            if abs(chg) > 8:
-                opportunities.append({
-                    "platform": "Crypto",
-                    "market": f"{sym} ${px:,.2f} ({chg:+.1f}% 24h)",
-                    "ticker": sym,
-                    "type": "Momentum" if chg > 0 else "Reversal",
-                    "ev": abs(chg) / 100 * 0.3,
-                    "detail": f"Price: ${px:,.2f} | Vol: ${vol/1e6:.0f}M | 24h: {chg:+.1f}%",
-                })
+        if r.status_code == 200:
+            for coin in r.json():
+                sym = coin.get("symbol", "").upper()
+                px = coin.get("current_price", 0) or 0
+                chg = coin.get("price_change_percentage_24h") or 0
+                vol = coin.get("total_volume", 0) or 0
+                if sym in CRYPTO_MEME_BLACKLIST or px < CRYPTO_MIN_PRICE or vol < CRYPTO_MIN_VOLUME_24H:
+                    continue
+                # Verify live price from Coinbase
+                try:
+                    _cr = requests.get(f"https://api.coinbase.com/v2/prices/{sym}-USD/spot", timeout=5)
+                    if _cr.status_code == 200:
+                        _live_px = float(_cr.json().get("data", {}).get("amount", 0))
+                        if _live_px >= CRYPTO_MIN_PRICE:
+                            px = _live_px
+                except Exception:
+                    pass
+                if abs(chg) > 8:
+                    seen_syms.add(sym)
+                    opportunities.append({
+                        "platform": "Crypto",
+                        "market": f"{sym} ${px:,.2f} ({chg:+.1f}% 24h)",
+                        "ticker": sym,
+                        "type": "Momentum" if chg > 0 else "Reversal",
+                        "ev": abs(chg) / 100 * 0.3,
+                        "detail": f"Price: ${px:,.2f} | Vol: ${vol/1e6:.0f}M | 24h: {chg:+.1f}% [CoinGecko]",
+                    })
     except Exception as e:
-        log.warning("Crypto scan: %s", e)
+        log.warning("CoinGecko crypto scan: %s", e)
+
+    # Source 2: Binance (all USDT pairs — doubles opportunity set)
+    try:
+        binance_movers = _fetch_binance_movers()
+        for m in binance_movers:
+            if m["sym"] in seen_syms:
+                continue  # Deduplicate
+            seen_syms.add(m["sym"])
+            opportunities.append({
+                "platform": "Crypto",
+                "market": f"{m['sym']} ${m['price']:,.2f} ({m['chg']:+.1f}% 24h)",
+                "ticker": m["sym"],
+                "type": "Momentum" if m["chg"] > 0 else "Reversal",
+                "ev": abs(m["chg"]) / 100 * 0.3,
+                "detail": f"Price: ${m['price']:,.2f} | Vol: ${m['vol']/1e6:.0f}M | 24h: {m['chg']:+.1f}% [Binance]",
+            })
+        if binance_movers:
+            log.info("BINANCE CRYPTO: %d movers >8%% from %d USDT pairs",
+                     len(binance_movers), len([1 for _ in binance_movers]))
+    except Exception as e:
+        log.warning("Binance crypto merge: %s", e)
+
     return opportunities
 
 def get_fear_greed():
