@@ -1139,6 +1139,10 @@ def find_kalshi_opportunities():
                 mkt_ticker = mkt.get("ticker", "")
                 mkt_lower = mkt_title.lower()
 
+                # Sports/junk filter — only trade catalyst markets
+                if is_sports_or_junk(mkt_title):
+                    continue
+
                 total = yes_price + no_price
                 if total < 0.98:
                     spread_ev = 1.0 - total
