@@ -2529,9 +2529,14 @@ LAST_VOLATILITY_CHECK = 0
 
 
 def adapt_cycle_rate():
-    """Adjust cycle rate based on market volatility."""
+    """Adjust cycle rate based on market volatility and day of week.
+    Weekends: faster crypto scanning (5 min). Weekdays: volatility-based."""
     global CYCLE_INTERVAL
     try:
+        # Weekend: crypto trades 24/7, scan faster
+        if datetime.now(timezone.utc).weekday() >= 5:  # Sat=5, Sun=6
+            CYCLE_INTERVAL = 300  # 5 min on weekends for crypto momentum
+            return
         fng_val, _ = get_fear_greed()
         # High fear or greed = high volatility = faster scanning
         if fng_val < 20 or fng_val > 80:
@@ -3726,6 +3731,91 @@ async def status_cmd(ctx):
         await ctx.send(m2)
 
 
+@bot.command(name="firm-stats")
+async def firm_stats_cmd(ctx):
+    """Comprehensive firm statistics since inception from SQLite."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+
+        # Total trades and P&L
+        c.execute("SELECT COUNT(*), COALESCE(SUM(realized_pnl),0) FROM positions WHERE status='closed' AND strategy != 'pairs_legacy'")
+        total_trades, total_pnl = c.fetchone()
+
+        # Best/worst single trade
+        c.execute("SELECT market_id, realized_pnl, strategy FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL ORDER BY realized_pnl DESC LIMIT 1")
+        best_row = c.fetchone()
+        c.execute("SELECT market_id, realized_pnl, strategy FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL ORDER BY realized_pnl ASC LIMIT 1")
+        worst_row = c.fetchone()
+
+        # Daily P&L for best/worst day and streak
+        c.execute("""SELECT DATE(closed_at) as d, SUM(realized_pnl) as dpnl
+            FROM positions WHERE status='closed' AND closed_at IS NOT NULL AND strategy != 'pairs_legacy'
+            GROUP BY DATE(closed_at) ORDER BY d""")
+        daily_rows = c.fetchall()
+
+        best_day = ("—", 0)
+        worst_day = ("—", 0)
+        streak = 0
+        current_streak = 0
+        daily_pnls = []
+        for d, dpnl in daily_rows:
+            if dpnl is None:
+                continue
+            daily_pnls.append(dpnl)
+            if dpnl > best_day[1]:
+                best_day = (d, dpnl)
+            if dpnl < worst_day[1]:
+                worst_day = (d, dpnl)
+            if dpnl > 0:
+                current_streak += 1
+                streak = max(streak, current_streak)
+            else:
+                current_streak = 0
+
+        # Sharpe ratio (annualized from daily P&L)
+        sharpe = 0
+        if len(daily_pnls) >= 5:
+            import statistics
+            mean_d = statistics.mean(daily_pnls)
+            std_d = statistics.stdev(daily_pnls) if len(daily_pnls) > 1 else 1
+            sharpe = (mean_d / std_d) * (252 ** 0.5) if std_d > 0 else 0
+
+        # Win rate by strategy
+        c.execute("""SELECT strategy,
+            COUNT(*) as total,
+            SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins,
+            COALESCE(SUM(realized_pnl), 0) as pnl
+            FROM positions WHERE status='closed' AND strategy != 'pairs_legacy' AND realized_pnl IS NOT NULL
+            GROUP BY strategy ORDER BY pnl DESC""")
+        strat_rows = c.fetchall()
+        conn.close()
+
+        msg = "**TRADERJOES FIRM STATISTICS**\n"
+        msg += "```\n"
+        msg += f"Total Trades:    {total_trades}\n"
+        msg += f"Total P&L:       ${total_pnl:+,.2f}\n"
+        if best_row:
+            msg += f"Best Trade:      ${best_row[1]:+,.2f} ({best_row[0][:25]})\n"
+        if worst_row:
+            msg += f"Worst Trade:     ${worst_row[1]:+,.2f} ({worst_row[0][:25]})\n"
+        msg += f"Best Day:        ${best_day[1]:+,.2f} ({best_day[0]})\n"
+        msg += f"Worst Day:       ${worst_day[1]:+,.2f} ({worst_day[0]})\n"
+        msg += f"Best Streak:     {streak} consecutive profitable days\n"
+        msg += f"Current Streak:  {current_streak} days\n"
+        msg += f"Sharpe Ratio:    {sharpe:.2f} (annualized)\n"
+        msg += f"Trading Days:    {len(daily_pnls)}\n"
+        msg += f"\n{'Strategy':20s} {'Trades':>6s} {'Wins':>5s} {'WR%':>5s} {'P&L':>10s}\n"
+        msg += f"{'-'*50}\n"
+        for strat, total, wins, pnl in strat_rows:
+            wr = (wins / total * 100) if total > 0 else 0
+            msg += f"{strat[:20]:20s} {total:>6d} {wins:>5d} {wr:>4.0f}% ${pnl:>+9,.2f}\n"
+        msg += "```"
+        await ctx.send(msg[:1900])
+    except Exception as e:
+        await ctx.send(f"Error fetching stats: {e}")
+
+
 @bot.command(name="next-trades")
 async def next_trades_cmd(ctx):
     """Show top 5 highest-conviction opportunities across all strategies right now."""
@@ -3904,19 +3994,27 @@ async def funding_status_cmd(ctx):
     friction = FUNDING_ARB_CONFIG["commission_estimate"] * 2 + FUNDING_ARB_CONFIG["slippage_estimate"]
     msg = f"**FUNDING RATE MONITOR** (threshold: {min_rate*100:.4f}%)\n"
     msg += "```\n"
-    msg += f"{'Asset':6s} {'Phemex':>10s} {'Binance':>10s} {'Best':>10s} {'Net':>10s} {'Ann%':>8s} Status\n"
-    msg += f"{'-'*66}\n"
+    msg += f"{'Asset':6s} {'Phemex':>10s} {'Binance':>10s} {'Best+':>10s} {'MostNeg':>10s} Status\n"
+    msg += f"{'-'*60}\n"
     for asset in FUNDING_ARB_CONFIG["pairs"]:
         ri = rates.get(asset, {})
         ph = ri.get("phemex", 0)
         bn = ri.get("binance", 0)
         best = ri.get("best", 0)
-        src = ri.get("best_source", "?")
-        net = best - friction if best > friction else 0
-        ann = net * 3 * 365 * 100
-        status = "SIGNAL" if best > min_rate and best > friction else "below"
+        most_neg = ri.get("most_negative", 0)
+        # Positive arb check
+        pos_signal = best > min_rate and best > friction
+        # Negative arb check
+        neg_yield = abs(most_neg) - friction if most_neg < -min_rate else 0
+        neg_signal = neg_yield > 0
+        if pos_signal:
+            status = "LONG ARB"
+        elif neg_signal:
+            status = "NEG ARB"
+        else:
+            status = "—"
         msg += (f"{asset:6s} {ph*100:>9.4f}% {bn*100:>9.4f}% {best*100:>9.4f}% "
-                f"{net*100:>9.4f}% {ann:>7.1f}% {status}\n")
+                f"{most_neg*100:>9.4f}% {status}\n")
     msg += "```\n"
     # Active arb positions
     arb_positions = [p for p in PAPER_PORTFOLIO.get("positions", [])
@@ -8922,16 +9020,25 @@ def _fetch_binance_funding_rate(asset):
 
 
 def fetch_all_funding_rates():
-    """Fetch funding rates from both Phemex and Binance for all pairs. Updates cache."""
+    """Fetch funding rates from both Phemex and Binance for all pairs. Updates cache.
+    Tracks both positive (short arb) and negative (long arb) opportunities."""
     now = datetime.now(timezone.utc)
     for asset in FUNDING_ARB_CONFIG["pairs"]:
         phemex_rate = _fetch_phemex_funding_rate(asset)
         binance_rate = _fetch_binance_funding_rate(asset)
+        # Best positive rate (longs pay shorts → short the perp, buy spot)
+        best_pos = max(phemex_rate, binance_rate)
+        best_pos_src = "binance" if binance_rate > phemex_rate else "phemex"
+        # Most negative rate (shorts pay longs → short the perp, collect funding)
+        most_neg = min(phemex_rate, binance_rate)
+        most_neg_src = "binance" if binance_rate < phemex_rate else "phemex"
         _FUNDING_RATES_CACHE[asset] = {
             "phemex": phemex_rate,
             "binance": binance_rate,
-            "best": max(phemex_rate, binance_rate),
-            "best_source": "binance" if binance_rate > phemex_rate else "phemex",
+            "best": best_pos,
+            "best_source": best_pos_src,
+            "most_negative": most_neg,
+            "most_negative_source": most_neg_src,
             "ts": now,
         }
     return _FUNDING_RATES_CACHE
@@ -8957,6 +9064,7 @@ async def check_funding_rate_arb():
             log.info("FUNDING-ARB %s: phemex=%.4f%% binance=%.4f%% best=%.4f%% (%s) threshold=%.4f%%",
                      asset, phemex_r * 100, binance_r * 100, funding_rate * 100, source, min_rate * 100)
 
+            # Positive rate arb: longs pay shorts → short perp + buy spot
             if funding_rate > min_rate and funding_rate > friction:
                 net_yield = funding_rate - friction
                 annualized = net_yield * 3 * 365 * 100
@@ -8973,6 +9081,28 @@ async def check_funding_rate_arb():
                 })
                 log.info("FUNDING-ARB SIGNAL: %s rate=%.4f%% net=%.4f%% ann=%.1f%% (%s)",
                          asset, funding_rate * 100, net_yield * 100, annualized, source)
+
+            # Negative rate arb: shorts pay longs → short the perp, collect funding from longs
+            most_neg = rate_info.get("most_negative", 0)
+            neg_source = rate_info.get("most_negative_source", "?")
+            if most_neg < -min_rate:
+                neg_yield = abs(most_neg) - friction
+                if neg_yield > 0:
+                    neg_ann = neg_yield * 3 * 365 * 100
+                    opps.append({
+                        "platform": f"{neg_source.title()} (Negative)",
+                        "type": "Negative Funding Arb",
+                        "market": f"{asset} Negative Rate Arb (SHORT perp)",
+                        "detail": f"Rate: {most_neg*100:.4f}% ({neg_source}) | Collect: {neg_yield*100:.4f}% | Ann: {neg_ann:.1f}%",
+                        "ev": neg_yield * 3,
+                        "ticker": asset,
+                        "funding_rate": most_neg,
+                        "net_yield": neg_yield,
+                        "source": neg_source,
+                        "direction": "short_perp",
+                    })
+                    log.info("FUNDING-ARB NEG SIGNAL: %s rate=%.4f%% collect=%.4f%% ann=%.1f%% (%s) → SHORT perp",
+                             asset, most_neg * 100, neg_yield * 100, neg_ann, neg_source)
         except Exception as exc:
             log.warning("Funding rate check error for %s: %s", asset, exc)
     return opps
