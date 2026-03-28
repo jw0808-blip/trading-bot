@@ -1066,7 +1066,7 @@ def calc_ev(yes_price, implied_prob):
     return (implied_prob * (1 - yes_price)) - ((1 - implied_prob) * yes_price)
 
 
-KALSHI_MIN_VOLUME = 50000  # $50K minimum volume for Kalshi markets
+KALSHI_MIN_VOLUME = 1000  # $1K minimum volume — was $50K which filtered everything
 
 def find_kalshi_opportunities():
     opportunities = []
@@ -3615,6 +3615,52 @@ async def status_cmd(ctx):
         await ctx.send(m2)
 
 
+@bot.command(name="kalshi-status")
+async def kalshi_status_cmd(ctx):
+    """Show Kalshi connection state, balance, and top markets by volume."""
+    msg = "**KALSHI STATUS**\n"
+    # Connection test
+    balance = get_kalshi_balance()
+    msg += f"Balance: {balance}\n"
+    connected = "$" in str(balance)
+    msg += f"Connection: {'OK' if connected else 'FAILED'}\n"
+    msg += f"Min Volume: ${KALSHI_MIN_VOLUME:,}\n\n"
+
+    if connected:
+        events = get_kalshi_events(limit=10)
+        msg += f"**Events Found: {len(events)}**\n"
+        # Get markets for each event, sort by volume
+        all_markets = []
+        for event in events[:5]:
+            ticker = event.get("event_ticker", "")
+            markets = get_kalshi_markets_for_event(ticker)
+            for mkt in markets:
+                vol = float(mkt.get("volume", 0) or 0)
+                yes_ask = mkt.get("yes_ask", 0)
+                no_ask = mkt.get("no_ask", 0)
+                all_markets.append({
+                    "title": mkt.get("title", "")[:50],
+                    "ticker": mkt.get("ticker", ""),
+                    "volume": vol,
+                    "yes": yes_ask / 100 if yes_ask else 0,
+                    "no": no_ask / 100 if no_ask else 0,
+                })
+        all_markets.sort(key=lambda m: m["volume"], reverse=True)
+        msg += "\n**Top 5 Markets by Volume:**\n```\n"
+        for m in all_markets[:5]:
+            msg += (f"  {m['title'][:40]:40s} Vol: ${m['volume']:>8,.0f} "
+                    f"YES: ${m['yes']:.2f} NO: ${m['no']:.2f}\n")
+        msg += "```"
+        if not all_markets:
+            msg += "No markets with pricing found\n"
+        # Count qualifying markets
+        qualifying = sum(1 for m in all_markets if m["volume"] >= KALSHI_MIN_VOLUME)
+        msg += f"\n{qualifying} markets pass volume filter (>= ${KALSHI_MIN_VOLUME:,})"
+    else:
+        msg += f"\nKey ID: {KALSHI_API_KEY_ID[:12]}... | PEM: {'loaded' if KALSHI_PRIVATE_KEY else 'MISSING'}"
+    await ctx.send(msg[:1900])
+
+
 @bot.command(name="funding-status")
 async def funding_status_cmd(ctx):
     """Show funding rates across Phemex and Binance for all pairs."""
@@ -5946,7 +5992,7 @@ async def execute_kalshi_order(action, ticker, amount):
             msg_string.encode(),
             _padding.PSS(
                 mgf=_padding.MGF1(hashes.SHA256()),
-                salt_length=_padding.PSS.MAX_LENGTH
+                salt_length=_padding.PSS.DIGEST_LENGTH
             ),
             hashes.SHA256()
         )
@@ -6328,32 +6374,20 @@ ARB_HISTORY = []  # Track arb opportunities found
 
 
 def find_kalshi_markets_for_arb():
-    """Fetch Kalshi markets with prices for arbitrage comparison."""
-    if not KALSHI_API_KEY_ID:
+    """Fetch Kalshi markets with prices for arbitrage comparison. Uses kalshi_sign for auth."""
+    if not KALSHI_API_KEY_ID or not KALSHI_PRIVATE_KEY:
         return []
     try:
-        ts = str(int(time.time()))
-        method = "GET"
-        path = "/trade-api/v2/markets"
-        msg_to_sign = ts + "\n" + method + "\n" + path + "\n"
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import padding
-        pk_bytes = KALSHI_PRIVATE_KEY.encode()
-        if "BEGIN" in KALSHI_PRIVATE_KEY:
-            private_key = serialization.load_pem_private_key(pk_bytes, password=None)
-        else:
-            import base64
-            der = base64.b64decode(KALSHI_PRIVATE_KEY)
-            private_key = serialization.load_der_private_key(der, password=None)
-        sig = private_key.sign(msg_to_sign.encode(), padding.PKCS1v15(), hashes.SHA256())
-        import base64 as b64
-        sig_b64 = b64.b64encode(sig).decode()
+        path = "/markets"
+        ts, sig = kalshi_sign("GET", path)
         hdrs = {
-            "Authorization": f"Bearer {KALSHI_API_KEY_ID}",
+            "KALSHI-ACCESS-KEY": KALSHI_API_KEY_ID,
+            "KALSHI-ACCESS-TIMESTAMP": ts,
+            "KALSHI-ACCESS-SIGNATURE": sig,
             "Content-Type": "application/json",
         }
         params = {"status": "open", "limit": 100}
-        r = requests.get(f"https://api.elections.kalshi.com{path}", headers=hdrs, params=params, timeout=15)
+        r = requests.get(KALSHI_BASE + path, headers=hdrs, params=params, timeout=15)
         if r.status_code == 200:
             markets = r.json().get("markets", [])
             result = []
@@ -6370,6 +6404,8 @@ def find_kalshi_markets_for_arb():
                         "platform": "Kalshi",
                     })
             return result
+        else:
+            log.warning("Kalshi arb fetch: HTTP %d %s", r.status_code, r.text[:100])
         return []
     except Exception as exc:
         log.warning("Kalshi arb fetch error: %s", exc)
