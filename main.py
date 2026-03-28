@@ -3615,6 +3615,41 @@ async def status_cmd(ctx):
         await ctx.send(m2)
 
 
+@bot.command(name="funding-status")
+async def funding_status_cmd(ctx):
+    """Show funding rates across Phemex and Binance for all pairs."""
+    rates = fetch_all_funding_rates()
+    min_rate = FUNDING_ARB_CONFIG["min_funding_rate"]
+    friction = FUNDING_ARB_CONFIG["commission_estimate"] * 2 + FUNDING_ARB_CONFIG["slippage_estimate"]
+    msg = f"**FUNDING RATE MONITOR** (threshold: {min_rate*100:.4f}%)\n"
+    msg += "```\n"
+    msg += f"{'Asset':6s} {'Phemex':>10s} {'Binance':>10s} {'Best':>10s} {'Net':>10s} {'Ann%':>8s} Status\n"
+    msg += f"{'-'*66}\n"
+    for asset in FUNDING_ARB_CONFIG["pairs"]:
+        ri = rates.get(asset, {})
+        ph = ri.get("phemex", 0)
+        bn = ri.get("binance", 0)
+        best = ri.get("best", 0)
+        src = ri.get("best_source", "?")
+        net = best - friction if best > friction else 0
+        ann = net * 3 * 365 * 100
+        status = "SIGNAL" if best > min_rate and best > friction else "below"
+        msg += (f"{asset:6s} {ph*100:>9.4f}% {bn*100:>9.4f}% {best*100:>9.4f}% "
+                f"{net*100:>9.4f}% {ann:>7.1f}% {status}\n")
+    msg += "```\n"
+    # Active arb positions
+    arb_positions = [p for p in PAPER_PORTFOLIO.get("positions", [])
+                     if "funding" in p.get("strategy", "").lower() or "arb" in p.get("market", "").lower()]
+    if arb_positions:
+        msg += f"**Active Arb Positions ({len(arb_positions)}):**\n"
+        for p in arb_positions:
+            msg += f"  {p.get('market', '?')} | ${p.get('cost', 0):.0f}\n"
+    else:
+        msg += "No active arb positions\n"
+    msg += f"\n*Sources: Phemex API + Binance Futures public API*"
+    await ctx.send(msg[:1900])
+
+
 @bot.command(name="pead-status")
 async def pead_status_cmd(ctx):
     """Show PEAD scanner state, last scan results, and open positions."""
@@ -8586,7 +8621,7 @@ def get_predictit_balance():
 
 
 # ============================================================================
-# FUNDING RATE ARBITRAGE MODULE (Phemex + Coinbase)
+# FUNDING RATE ARBITRAGE MODULE (Phemex + Binance + Coinbase)
 # ============================================================================
 FUNDING_ARB_CONFIG = {
     "enabled": True,
@@ -8594,44 +8629,99 @@ FUNDING_ARB_CONFIG = {
     "commission_estimate": 0.0002,  # ~0.02% per side (Phemex + Coinbase)
     "slippage_estimate": 0.0001,  # ~0.01% estimated slippage
     "max_position_usd": 2000,  # Max $2000 per arb leg
-    "pairs": ["BTC", "ETH"],  # Assets to monitor
+    "pairs": ["BTC", "ETH", "SOL", "XRP", "BNB"],  # Assets to monitor
     "active_arbs": [],  # Currently open arb positions
 }
 
+# Latest funding rates cache: {source_asset: {"phemex": rate, "binance": rate, "ts": datetime}}
+_FUNDING_RATES_CACHE = {}
+
+
+def _fetch_phemex_funding_rate(asset):
+    """Fetch funding rate from Phemex. Returns rate as decimal or 0."""
+    try:
+        symbol = f"s{asset}USDT"
+        url = f"https://api.phemex.com/v1/md/ticker/24hr?symbol={symbol}"
+        r = requests.get(url, timeout=5)
+        if r.status_code != 200:
+            return 0
+        result = r.json().get("result", {})
+        raw = result.get("fundingRate", 0)
+        if isinstance(raw, (int, float)) and raw != 0:
+            return raw / 1e8 if abs(raw) > 1 else raw
+        return float(raw) / 1e8 if raw else 0
+    except Exception:
+        return 0
+
+
+def _fetch_binance_funding_rate(asset):
+    """Fetch funding rate from Binance Futures public API (no key needed). Returns rate as decimal or 0."""
+    try:
+        symbol = f"{asset}USDT"
+        url = f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={symbol}&limit=1"
+        r = requests.get(url, timeout=5)
+        if r.status_code != 200:
+            return 0
+        data = r.json()
+        if data and len(data) > 0:
+            return float(data[0].get("fundingRate", 0))
+        return 0
+    except Exception:
+        return 0
+
+
+def fetch_all_funding_rates():
+    """Fetch funding rates from both Phemex and Binance for all pairs. Updates cache."""
+    now = datetime.now(timezone.utc)
+    for asset in FUNDING_ARB_CONFIG["pairs"]:
+        phemex_rate = _fetch_phemex_funding_rate(asset)
+        binance_rate = _fetch_binance_funding_rate(asset)
+        _FUNDING_RATES_CACHE[asset] = {
+            "phemex": phemex_rate,
+            "binance": binance_rate,
+            "best": max(phemex_rate, binance_rate),
+            "best_source": "binance" if binance_rate > phemex_rate else "phemex",
+            "ts": now,
+        }
+    return _FUNDING_RATES_CACHE
+
+
 async def check_funding_rate_arb():
-    """Check Phemex funding rates for arbitrage opportunities."""
+    """Check Phemex + Binance funding rates for arbitrage opportunities."""
     if not FUNDING_ARB_CONFIG["enabled"]:
         return []
     opps = []
     min_rate = FUNDING_ARB_CONFIG["min_funding_rate"]
     friction = FUNDING_ARB_CONFIG["commission_estimate"] * 2 + FUNDING_ARB_CONFIG["slippage_estimate"]
-    for asset in FUNDING_ARB_CONFIG["pairs"]:
+
+    rates = fetch_all_funding_rates()
+
+    for asset, rate_info in rates.items():
         try:
-            # Fetch funding rate from Phemex
-            symbol = f"s{asset}USDT" if asset == "BTC" else f"s{asset}USDT"
-            url = f"https://api.phemex.com/v1/md/ticker/24hr?symbol={symbol}"
-            r = requests.get(url, timeout=5)
-            if r.status_code != 200:
-                continue
-            data = r.json()
-            # Phemex returns funding rate in result
-            result = data.get("result", {})
-            funding_rate = float(result.get("fundingRate", "0")) / 1e8 if result.get("fundingRate") else 0
+            funding_rate = rate_info["best"]
+            source = rate_info["best_source"]
+            phemex_r = rate_info["phemex"]
+            binance_r = rate_info["binance"]
+
+            log.info("FUNDING-ARB %s: phemex=%.4f%% binance=%.4f%% best=%.4f%% (%s) threshold=%.4f%%",
+                     asset, phemex_r * 100, binance_r * 100, funding_rate * 100, source, min_rate * 100)
+
             if funding_rate > min_rate and funding_rate > friction:
                 net_yield = funding_rate - friction
-                annualized = net_yield * 3 * 365 * 100  # 3x daily funding, annualized %
+                annualized = net_yield * 3 * 365 * 100
                 opps.append({
-                    "platform": "Phemex+Coinbase",
+                    "platform": f"{source.title()}+Coinbase",
                     "type": "Funding Rate Arb",
                     "market": f"{asset} Funding Rate Arbitrage",
-                    "detail": f"Rate: {funding_rate*100:.4f}% | Net: {net_yield*100:.4f}% | Ann: {annualized:.1f}% | Friction: {friction*100:.4f}%",
-                    "ev": net_yield * 3,  # Daily EV (3 funding periods)
+                    "detail": f"Rate: {funding_rate*100:.4f}% ({source}) | Net: {net_yield*100:.4f}% | Ann: {annualized:.1f}%",
+                    "ev": net_yield * 3,
                     "ticker": asset,
                     "funding_rate": funding_rate,
                     "net_yield": net_yield,
+                    "source": source,
                 })
-                log.info("Funding arb: %s rate=%.4f%% net=%.4f%% ann=%.1f%%",
-                         asset, funding_rate*100, net_yield*100, annualized)
+                log.info("FUNDING-ARB SIGNAL: %s rate=%.4f%% net=%.4f%% ann=%.1f%% (%s)",
+                         asset, funding_rate * 100, net_yield * 100, annualized, source)
         except Exception as exc:
             log.warning("Funding rate check error for %s: %s", asset, exc)
     return opps
