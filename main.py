@@ -3686,6 +3686,141 @@ async def status_cmd(ctx):
         await ctx.send(m2)
 
 
+@bot.command(name="next-trades")
+async def next_trades_cmd(ctx):
+    """Show top 5 highest-conviction opportunities across all strategies right now."""
+    candidates = []
+
+    # 1. Pairs Z-scores above 1.1
+    try:
+        import yfinance as _nt_yf
+        _pairs_cfg = globals().get("PAIRS_CONFIG", {})
+        _seed = _pairs_cfg.get("seed", [])
+        for ta, tb in _seed[:20]:
+            try:
+                corr, zscore, _ = calculate_pair_zscore(ta, tb, _pairs_cfg.get("lookback_days", 20))
+                if corr is not None and abs(zscore) >= 1.1 and corr >= 0.7:
+                    # Already open?
+                    _open = any(p.get("market") == f"PAIRS:{ta}/{tb}" for p in PAPER_PORTFOLIO.get("positions", []))
+                    if _open:
+                        continue
+                    direction = "short_a_long_b" if zscore > 0 else "long_a_short_b"
+                    conf = min(int(abs(zscore) * 30 + corr * 20), 95)
+                    candidates.append({
+                        "strategy": "Pairs",
+                        "ticker": f"{ta}/{tb}",
+                        "confidence": conf,
+                        "reason": f"Z={zscore:+.2f} corr={corr:.2f} {direction}",
+                    })
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 2. Oracle signals above 50% of threshold
+    try:
+        prices = _oracle_get_all_prices()
+        for title, yes_price in prices.items():
+            sigs = _oracle_match_all_signals(title)
+            for sig in sigs:
+                _inv = sig.get("inverse", False)
+                if _inv:
+                    pct = (1 - yes_price) / (1 - sig["threshold"]) * 100 if sig["threshold"] < 1 else 0
+                else:
+                    pct = yes_price / sig["threshold"] * 100 if sig["threshold"] > 0 else 0
+                if pct >= 50:
+                    _open = any(p.get("market") == f"ORACLE:{sig['name']}" for p in PAPER_PORTFOLIO.get("positions", []))
+                    if _open:
+                        continue
+                    conf = min(int(pct * 0.8), 90)
+                    _dir = f"{'INV ' if _inv else ''}YES=${yes_price:.2f}/{sig['threshold']:.2f}"
+                    candidates.append({
+                        "strategy": "Oracle",
+                        "ticker": f"{sig['long']}/{sig['short']}",
+                        "confidence": conf,
+                        "reason": f"{sig['name']} {_dir} ({pct:.0f}%)",
+                    })
+    except Exception:
+        pass
+
+    # 3. Crypto momentum above 6% 24h
+    try:
+        binance_movers = _fetch_binance_movers()
+        for m in binance_movers:
+            if abs(m["chg"]) >= 6:
+                conf = min(int(abs(m["chg"]) * 5 + m["vol"] / 1e9 * 10), 85)
+                candidates.append({
+                    "strategy": "Crypto",
+                    "ticker": m["sym"],
+                    "confidence": conf,
+                    "reason": f"{m['chg']:+.1f}% 24h vol=${m['vol']/1e6:.0f}M [Binance]",
+                })
+    except Exception:
+        pass
+
+    # 4. Funding rates above 0.02%
+    try:
+        rates = fetch_all_funding_rates()
+        for asset, ri in rates.items():
+            best = ri.get("best", 0)
+            if best > 0.0002:
+                ann = best * 3 * 365 * 100
+                conf = min(int(ann / 2), 70)
+                candidates.append({
+                    "strategy": "Funding",
+                    "ticker": asset,
+                    "confidence": conf,
+                    "reason": f"Rate={best*100:.4f}% ({ri['best_source']}) ann={ann:.0f}%",
+                })
+    except Exception:
+        pass
+
+    # 5. Kalshi non-sports markets above $1K volume
+    try:
+        kalshi_mkts = get_kalshi_active_markets(limit=20)
+        for m in kalshi_mkts[:10]:
+            title = m.get("title", "")
+            vol = float(m.get("volume", 0) or 0)
+            yes_ask = m.get("yes_ask", 0)
+            if vol >= 1000 and yes_ask and not is_sports_or_junk(title):
+                yes_p = yes_ask / 100 if yes_ask > 1 else yes_ask
+                if 0.05 < yes_p < 0.30:
+                    conf = min(int(vol / 500 + (0.30 - yes_p) * 100), 75)
+                    candidates.append({
+                        "strategy": "Kalshi",
+                        "ticker": m.get("ticker", "")[:15],
+                        "confidence": conf,
+                        "reason": f"YES=${yes_p:.2f} vol=${vol:,.0f} {title[:35]}",
+                    })
+    except Exception:
+        pass
+
+    # Sort by confidence, take top 5
+    candidates.sort(key=lambda c: c["confidence"], reverse=True)
+    top5 = candidates[:5]
+
+    portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
+        p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+
+    msg = f"**NEXT TRADES — Top {len(top5)} Opportunities**\n"
+    msg += f"Portfolio: ${portfolio_value:,.0f} | Scanned: {len(candidates)} candidates\n"
+    if top5:
+        msg += "```\n"
+        msg += f"{'#':2s} {'Strategy':10s} {'Ticker':12s} {'Conf':5s} {'Size':>8s} Reason\n"
+        msg += f"{'-'*70}\n"
+        for i, c in enumerate(top5, 1):
+            # Suggested size: 0.5-2% based on confidence
+            size_pct = 0.005 + (c["confidence"] / 100) * 0.015
+            size_usd = portfolio_value * size_pct
+            msg += (f"{i:2d} {c['strategy']:10s} {c['ticker']:12s} "
+                    f"{c['confidence']:3d}%  ${size_usd:>7,.0f} {c['reason'][:40]}\n")
+        msg += "```"
+    else:
+        msg += "\nNo opportunities above threshold right now.\n"
+    msg += f"\n*Strategies: Pairs, Oracle, Crypto, Funding, Kalshi*"
+    await ctx.send(msg[:1900])
+
+
 @bot.command(name="kalshi-status")
 async def kalshi_status_cmd(ctx):
     """Show Kalshi connection state, balance, and top markets by volume."""
