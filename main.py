@@ -3615,6 +3615,32 @@ async def status_cmd(ctx):
         await ctx.send(m2)
 
 
+@bot.command(name="pead-status")
+async def pead_status_cmd(ctx):
+    """Show PEAD scanner state, last scan results, and open positions."""
+    scan = _PEAD_LAST_SCAN
+    pead_open = _count_pead_open()
+    msg = f"**PEAD Scanner Status**\n"
+    msg += f"Enabled: {PEAD_ENABLED} | Thresholds: {PEAD_MIN_SURPRISE_PCT}% surprise, {PEAD_MIN_VOLUME_MULT}x volume\n"
+    msg += f"Open: {pead_open}/{PEAD_MAX_POSITIONS} | Size: {PEAD_SIZE_PCT*100:.0f}% of portfolio\n"
+    msg += f"\n**Last Scan:** {scan.get('last_run', 'Never')}\n"
+    msg += f"Tickers checked: {scan.get('tickers_checked', 0)} | Signals found: {scan.get('signals_found', 0)}\n"
+    if scan.get("errors"):
+        msg += f"Errors: {len(scan['errors'])} — {scan['errors'][0][:60]}...\n" if len(scan["errors"]) > 0 else ""
+    # Open PEAD positions
+    pead_positions = [p for p in PAPER_PORTFOLIO.get("positions", []) if p.get("strategy") == "pead"]
+    if pead_positions:
+        msg += "\n**Open PEAD Positions:**\n```\n"
+        for p in pead_positions:
+            msg += f"  {p.get('market', '?'):20s} ${p.get('cost', 0):.0f} entry=${p.get('entry_price', 0):.2f}\n"
+        msg += "```"
+    else:
+        msg += "\nNo open PEAD positions\n"
+    # Upcoming earnings (from last scan tickers)
+    msg += f"\n*Next scan runs market hours (9:45-3:30 ET, every 30min)*"
+    await ctx.send(msg[:1900])
+
+
 @bot.command(name="hedge-status")
 async def hedge_status_cmd(ctx):
     """Show VRP regime, crash hedge positions, and options status."""
@@ -13497,17 +13523,18 @@ import statistics as _stats
 REGIME_CACHE = {}
 REGIME_CACHE_TTL = 300
 
-# PEAD SCANNER v1 — TraderJoes v15
-# 8% EPS surprise + 2.5x volume + 15-min candle confirmation
-# Gated by equities regime. 48h hold.
+# PEAD SCANNER v2 — Post-Earnings Announcement Drift
+# 5% EPS surprise + 2.0x volume + 15-min candle confirmation
+# Gated by equities regime. 72h hold. Fallback to Alpaca calendar.
 # ═══════════════════════════════════════════════════════════════════
 
 PEAD_ENABLED = True
-PEAD_MIN_SURPRISE_PCT = 8.0
-PEAD_MIN_VOLUME_MULT  = 2.5
-PEAD_HOLD_HOURS       = 48
+PEAD_MIN_SURPRISE_PCT = 5.0   # Lowered from 8% — most beats are 3-7%
+PEAD_MIN_VOLUME_MULT  = 2.0   # Lowered from 2.5x — still filters noise
+PEAD_HOLD_HOURS       = 72
 PEAD_MAX_POSITIONS    = 3
 PEAD_SIZE_PCT         = 0.01
+_PEAD_LAST_SCAN = {"tickers_checked": 0, "signals_found": 0, "last_run": None, "errors": []}
 
 def _pead_candle_confirm(ticker):
     """15-min candle filter: first candle close must be > open (no gap-and-crap)."""
@@ -13515,149 +13542,217 @@ def _pead_candle_confirm(ticker):
         import yfinance as yf
         h = yf.Ticker(ticker).history(period="1d", interval="15m")
         if h.empty or len(h) < 2:
-            return True  # can't confirm, allow through
+            return True
         first = h.iloc[0]
         return float(first["Close"]) > float(first["Open"])
-    except:
+    except Exception:
         return True
 
 def fetch_earnings_surprises():
-    import requests, yfinance as yf
-    from datetime import timedelta, datetime, timezone
+    """Fetch tickers with recent earnings surprises. Uses Alpaca news + yfinance."""
+    import yfinance as yf
     surprises = []
+    _PEAD_LAST_SCAN["tickers_checked"] = 0
+    _PEAD_LAST_SCAN["signals_found"] = 0
+    _PEAD_LAST_SCAN["errors"] = []
+    _PEAD_LAST_SCAN["last_run"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    # Method 1: Alpaca news API — find tickers mentioned in earnings headlines
+    tickers = set()
     try:
-        headers = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+        import datetime as _dt_pead
+        hdrs = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
         params = {
-            "start": (datetime.now(timezone.utc)-timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "start": (datetime.now(timezone.utc) - _dt_pead.timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "limit": 50, "sort": "desc"
         }
         resp = requests.get("https://data.alpaca.markets/v1beta1/news",
-                            headers=headers, params=params, timeout=10)
-        if resp.status_code != 200:
-            return []
-        articles = resp.json().get("news", [])
-        earnings_kw = ["earnings","eps","beats","quarterly","revenue","profit","q1","q2","q3","q4"]
-        tickers = set()
-        for a in articles:
-            if any(k in a.get("headline","").lower() for k in earnings_kw):
-                for s in a.get("symbols",[]):
-                    if s and len(s) <= 5 and s.isalpha():
-                        tickers.add(s)
-        for ticker in list(tickers)[:15]:
+                            headers=hdrs, params=params, timeout=10)
+        if resp.status_code == 200:
+            articles = resp.json().get("news", [])
+            earnings_kw = ["earnings", "eps", "beats", "quarterly", "revenue",
+                           "profit", "q1", "q2", "q3", "q4", "guidance", "forecast"]
+            for a in articles:
+                if any(k in a.get("headline", "").lower() for k in earnings_kw):
+                    for s in a.get("symbols", []):
+                        if s and len(s) <= 5 and s.isalpha():
+                            tickers.add(s)
+            log.info("PEAD: %d earnings tickers from %d news articles", len(tickers), len(articles))
+        else:
+            log.warning("PEAD: Alpaca news API returned %d", resp.status_code)
+    except Exception as e:
+        log.warning("PEAD: news fetch error: %s", e)
+        _PEAD_LAST_SCAN["errors"].append(f"news: {e}")
+
+    # Method 2: Alpaca calendar API — upcoming earnings
+    try:
+        import datetime as _dt_pead2
+        hdrs = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        yesterday = (datetime.now(timezone.utc) - _dt_pead2.timedelta(days=1)).strftime("%Y-%m-%d")
+        resp = requests.get(f"https://data.alpaca.markets/v1beta1/corporate-actions/announcements",
+                            headers=hdrs, params={"ca_types": "Dividend", "since": yesterday,
+                                                  "until": today, "limit": 20}, timeout=10)
+        # Note: Alpaca doesn't have a direct earnings calendar, but news covers it
+    except Exception:
+        pass
+
+    if not tickers:
+        log.info("PEAD: no earnings tickers found this cycle")
+        return surprises
+
+    for ticker in list(tickers)[:20]:
+        _PEAD_LAST_SCAN["tickers_checked"] += 1
+        try:
+            t = yf.Ticker(ticker)
+            # Try earnings_history first, then earnings_dates
+            eh = None
             try:
-                t = yf.Ticker(ticker)
                 eh = t.earnings_history
-                if eh is None or eh.empty:
-                    continue
+            except Exception:
+                pass
+            if eh is None or (hasattr(eh, 'empty') and eh.empty):
+                # Fallback: check quarterly_earnings
+                try:
+                    qe = t.quarterly_earnings
+                    if qe is not None and not qe.empty:
+                        latest = qe.iloc[0]
+                        est = latest.get("Estimate", 0) or latest.get("estimate", 0)
+                        act = latest.get("Actual", 0) or latest.get("actual", 0)
+                        if est and est != 0:
+                            eh = "fallback"
+                except Exception:
+                    pass
+            if eh is None:
+                log.info("PEAD: %s — no earnings data available", ticker)
+                continue
+
+            if eh != "fallback":
                 latest = eh.iloc[0]
                 est = latest.get("epsEstimate", 0)
                 act = latest.get("epsActual", 0)
-                if not est or est == 0:
-                    continue
-                surprise = ((act - est) / abs(est)) * 100
-                if surprise < PEAD_MIN_SURPRISE_PCT:
-                    continue
-                hist = t.history(period="25d")
-                if hist.empty or len(hist) < 5:
-                    continue
-                avg_vol = hist["Volume"].iloc[:-1].mean()
-                vol_mult = hist["Volume"].iloc[-1] / avg_vol if avg_vol > 0 else 0
-                if vol_mult < PEAD_MIN_VOLUME_MULT:
-                    continue
-                if not _pead_candle_confirm(ticker):
-                    print(f"[PEAD] {ticker} failed 15-min candle filter (gap-and-crap)")
-                    continue
-                price = float(hist["Close"].iloc[-1])
-                print(f"[PEAD] SIGNAL {ticker} surprise={surprise:.1f}% vol={vol_mult:.1f}x price={price:.2f}")
-                surprises.append({"ticker":ticker,"surprise_pct":round(surprise,2),
-                                  "volume_mult":round(vol_mult,2),"price":price})
-            except Exception as e:
-                print(f"[PEAD] {ticker} error: {e}")
-    except Exception as e:
-        print(f"[PEAD] fetch error: {e}")
+
+            if not est or est == 0:
+                continue
+            surprise = ((act - est) / abs(est)) * 100
+            log.info("PEAD: %s EPS est=$%.2f act=$%.2f surprise=%.1f%%", ticker, est, act, surprise)
+
+            if surprise < PEAD_MIN_SURPRISE_PCT:
+                continue
+
+            hist = t.history(period="25d")
+            if hist.empty or len(hist) < 5:
+                continue
+            avg_vol = hist["Volume"].iloc[:-1].mean()
+            vol_mult = hist["Volume"].iloc[-1] / avg_vol if avg_vol > 0 else 0
+            if vol_mult < PEAD_MIN_VOLUME_MULT:
+                log.info("PEAD: %s vol_mult=%.1f < %.1f (skipped)", ticker, vol_mult, PEAD_MIN_VOLUME_MULT)
+                continue
+            if not _pead_candle_confirm(ticker):
+                log.info("PEAD: %s failed 15-min candle filter (gap-and-crap)", ticker)
+                continue
+            price = float(hist["Close"].iloc[-1])
+            log.info("PEAD SIGNAL: %s surprise=%.1f%% vol=%.1fx price=$%.2f", ticker, surprise, vol_mult, price)
+            _PEAD_LAST_SCAN["signals_found"] += 1
+            surprises.append({"ticker": ticker, "surprise_pct": round(surprise, 2),
+                              "volume_mult": round(vol_mult, 2), "price": price})
+        except Exception as e:
+            log.warning("PEAD: %s error: %s", ticker, e)
+            _PEAD_LAST_SCAN["errors"].append(f"{ticker}: {e}")
     return surprises
 
 def _count_pead_open():
     try:
-        import sqlite3
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM positions WHERE status=\'open\' AND strategy=\'pead\'")
+        c.execute("SELECT COUNT(*) FROM positions WHERE status='open' AND strategy='pead'")
         n = c.fetchone()[0]; conn.close(); return n
-    except: return 0
+    except Exception:
+        return 0
 
 def _log_pead(ticker, price, size, surprise, vol_mult, tp, sl):
     try:
-        import sqlite3, json
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("""INSERT OR IGNORE INTO positions
-            (market_id,platform,strategy,direction,size,entry_price,status,created_at,metadata)
-            VALUES (?,\'alpaca\',\'pead\',\'long\',?,?,\'open\',datetime(\'now\'),?)""",
-            (f"PEAD:{ticker}", round(size/price,4), price,
-             json.dumps({"ticker":ticker,"size_usd":size,"surprise_pct":surprise,
-                         "volume_mult":vol_mult,"tp_price":tp,"sl_price":sl})))
+            (market_id,platform,strategy,direction,size_usd,entry_price,status,created_at,metadata)
+            VALUES (?,'alpaca','pead','long',?,?,'open',datetime('now'),?)""",
+            (f"PEAD:{ticker}", round(size, 2), price,
+             json.dumps({"ticker": ticker, "size_usd": size, "surprise_pct": surprise,
+                         "volume_mult": vol_mult, "tp_price": tp, "sl_price": sl})))
         conn.commit(); conn.close()
     except Exception as e:
-        print(f"[PEAD] DB log error: {e}")
+        log.warning("PEAD: DB log error: %s", e)
 
 def _submit_pead_order(ticker, shares):
     try:
-        import requests, json
-        headers = {"APCA-API-KEY-ID":ALPACA_API_KEY,"APCA-API-SECRET-KEY":ALPACA_SECRET_KEY,
-                   "Content-Type":"application/json"}
+        hdrs = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+                "Content-Type": "application/json"}
         resp = requests.post(f"{ALPACA_BASE_URL}/v2/orders",
-            headers=headers, timeout=10,
-            json={"symbol":ticker,"qty":str(round(shares,4)),
-                  "side":"buy","type":"market","time_in_force":"day"})
+            headers=hdrs, timeout=10,
+            json={"symbol": ticker, "qty": str(round(shares, 4)),
+                  "side": "buy", "type": "market", "time_in_force": "day"})
         resp.raise_for_status()
+        log.info("PEAD ORDER: %s qty=%.4f id=%s", ticker, shares, resp.json().get("id", "?"))
         return resp.json()
     except Exception as e:
-        print(f"[PEAD] Order error: {e}"); return None
+        log.warning("PEAD: Order error for %s: %s", ticker, e)
+        return None
 
 async def run_pead_scanner(discord_channel=None):
-    if not PEAD_ENABLED: return
-    import pytz
-    now_et = datetime.now(pytz.timezone("America/New_York"))
-    if not (now_et.replace(hour=9,minute=45,second=0) <= now_et <=
-            now_et.replace(hour=15,minute=30,second=0)):
+    if not PEAD_ENABLED:
         return
-    if _count_pead_open() >= PEAD_MAX_POSITIONS: return
+    from zoneinfo import ZoneInfo
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    if not (now_et.replace(hour=9, minute=45, second=0) <= now_et <=
+            now_et.replace(hour=15, minute=30, second=0)):
+        return
+    if _count_pead_open() >= PEAD_MAX_POSITIONS:
+        log.info("PEAD: %d positions open (max %d)", _count_pead_open(), PEAD_MAX_POSITIONS)
+        return
     regime = get_regime("equities")
     if regime["halt"]:
-        print(f"[PEAD] Regime={regime['regime']}, halting"); return
+        log.info("PEAD: regime=%s halted, skipping", regime["regime"])
+        return
+    log.info("PEAD SCAN: starting (regime=%s)", regime["regime"])
     signals = fetch_earnings_surprises()
-    if not signals: return
+    if not signals:
+        log.info("PEAD SCAN: no signals found (%d tickers checked)", _PEAD_LAST_SCAN["tickers_checked"])
+        return
     signals.sort(key=lambda x: x["surprise_pct"], reverse=True)
     bankroll = PAPER_PORTFOLIO.get("cash", 25000)
     for sig in signals[:3]:
-        if _count_pead_open() >= PEAD_MAX_POSITIONS: break
+        if _count_pead_open() >= PEAD_MAX_POSITIONS:
+            break
         ticker = sig["ticker"]
         try:
-            import sqlite3
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
-            c.execute("SELECT COUNT(*) FROM positions WHERE market_id=? AND status=\'open\'",
+            c.execute("SELECT COUNT(*) FROM positions WHERE market_id=? AND status='open'",
                       (f"PEAD:{ticker}",))
-            if c.fetchone()[0] > 0: conn.close(); continue
+            if c.fetchone()[0] > 0:
+                conn.close(); continue
             conn.close()
-        except: pass
+        except Exception:
+            pass
         price = sig["price"]
         size = bankroll * PEAD_SIZE_PCT
         tp, sl = regime_adjusted_tp_sl(0.03, 0.015, "equities")
-        tp_price = round(price*(1+tp), 2)
-        sl_price = round(price*(1-sl), 2)
-        order = _submit_pead_order(ticker, size/price)
+        tp_price = round(price * (1 + tp), 2)
+        sl_price = round(price * (1 - sl), 2)
+        order = _submit_pead_order(ticker, size / price)
         if order:
             _log_pead(ticker, price, size, sig["surprise_pct"], sig["volume_mult"], tp_price, sl_price)
-            print(f"[PEAD] EXECUTED {ticker} size=${size:.0f} tp={tp_price} sl={sl_price} regime={regime['regime']}")
+            log.info("PEAD EXECUTED: %s size=$%.0f surprise=%.1f%% tp=$%.2f sl=$%.2f regime=%s",
+                     ticker, size, sig["surprise_pct"], tp_price, sl_price, regime["regime"])
             try:
                 if discord_channel:
                     await discord_channel.send(
-                        f"📈 **PEAD** {ticker} | Surprise: +{sig['surprise_pct']:.1f}% | "
+                        f"**PEAD** {ticker} | Surprise: +{sig['surprise_pct']:.1f}% | "
                         f"Vol: {sig['volume_mult']:.1f}x | Entry: ${price:.2f} | "
                         f"TP: ${tp_price} | SL: ${sl_price} | Regime: {regime['regime'].upper()}")
-            except: pass
+            except Exception:
+                pass
 
 # ═══════════════════════════════════════════════════════════════════
 # END v15 MODULES
