@@ -415,8 +415,35 @@ def get_kalshi_events(limit=20):
     return []
 
 
+def _is_kalshi_sports(market):
+    """Detect sports/player-prop markets from Kalshi. Catches patterns that is_sports_or_junk misses."""
+    title = market.get("title", "").lower()
+    cat = market.get("category", "").lower()
+    event_ticker = market.get("event_ticker", "").upper()
+    # Category-based filter
+    _sports_cats = {"sports", "nba", "nfl", "mlb", "nhl", "mls", "soccer", "ncaa",
+                    "esports", "combat sports", "golf", "tennis", "cricket"}
+    if cat in _sports_cats:
+        return True
+    # Event ticker patterns (Kalshi uses prefixes like NBA-, NFL-, MLB-)
+    _sports_prefixes = ("NBA-", "NFL-", "MLB-", "NHL-", "MLS-", "UFC-", "NCAA-", "PGA-",
+                        "SOCCER-", "EPL-", "GOLF-", "TENNIS-", "F1-", "NASCAR-")
+    if any(event_ticker.startswith(p) for p in _sports_prefixes):
+        return True
+    # Player prop patterns: "Name: N+" (e.g. "LaMelo Ball: 10+")
+    import re
+    if re.search(r'[A-Z][a-z]+ [A-Z][a-z]+: \d+\+', market.get("title", "")):
+        return True
+    # "wins by over N.N Points" or "Over N.N Points"
+    if "wins by over" in title or "over " in title and " points" in title:
+        return True
+    if " goals" in title or " innings" in title or " touchdowns" in title:
+        return True
+    return False
+
+
 def get_kalshi_active_markets(limit=50):
-    """Fetch active Kalshi markets directly, sorted by volume. More reliable than events→markets."""
+    """Fetch active Kalshi markets directly, filtered to exclude sports. Sorted by volume."""
     if not KALSHI_API_KEY_ID or not KALSHI_PRIVATE_KEY:
         return []
     path = "/markets"
@@ -428,17 +455,21 @@ def get_kalshi_active_markets(limit=50):
         "Content-Type": "application/json",
     }
     try:
+        # Fetch more than needed since we'll filter out sports
         r = requests.get(
             KALSHI_BASE + path,
             headers=headers,
-            params={"limit": limit, "status": "open"},
+            params={"limit": min(limit * 3, 200), "status": "open"},
             timeout=15,
         )
         if r.status_code == 200:
-            markets = r.json().get("markets", [])
-            # Sort by volume descending
+            raw_markets = r.json().get("markets", [])
+            # Filter out sports/player props
+            markets = [m for m in raw_markets
+                       if not _is_kalshi_sports(m) and not is_sports_or_junk(m.get("title", ""))]
             markets.sort(key=lambda m: float(m.get("volume", 0) or 0), reverse=True)
-            return markets
+            log.info("KALSHI: %d/%d markets after sports filter", len(markets), len(raw_markets))
+            return markets[:limit]
         else:
             log.warning("Kalshi active markets: HTTP %d", r.status_code)
     except Exception as exc:
@@ -1123,6 +1154,10 @@ def find_kalshi_opportunities():
             title  = event.get("title", ticker)
             markets = get_kalshi_markets_for_event(ticker)
             for mkt in markets:
+                # Sports/player-prop filter first
+                if _is_kalshi_sports(mkt) or is_sports_or_junk(mkt.get("title", "")):
+                    continue
+
                 yes_price = mkt.get("yes_ask", 0) / 100.0 if mkt.get("yes_ask") else 0
                 no_price  = mkt.get("no_ask", 0)  / 100.0 if mkt.get("no_ask") else 0
                 yes_bid   = mkt.get("yes_bid", 0)  / 100.0 if mkt.get("yes_bid") else 0
