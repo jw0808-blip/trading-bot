@@ -11359,7 +11359,10 @@ async def run_exit_manager(channel=None):
                 _src_mkt = pos.get("source_market", "")
                 _sig_thresh = pos.get("signal_threshold", 0.65)
                 _current_prob = 0.0
-                if _src_mkt:
+                _is_inverse_pos = "GEO-ONLY" in _src_mkt or any(
+                    s.get("name") == market.replace("ORACLE:", "") and s.get("inverse")
+                    for s in ORACLE_SIGNALS)
+                if _src_mkt and not _src_mkt.startswith("GEO-ONLY"):
                     _all_px = _oracle_get_all_prices() if not _ORACLE_PRICE_HISTORY else {}
                     # Check price history first (populated by scan_oracle_signals)
                     _hkey = _src_mkt.lower()
@@ -11368,8 +11371,12 @@ async def run_exit_manager(channel=None):
                         _current_prob = _hist[-1][1]
                     else:
                         _current_prob = _all_px.get(_src_mkt, 0)
-                # Signal invalidated — probability dropped below threshold
-                if _current_prob > 0 and _current_prob < _sig_thresh:
+                # Signal invalidated check — direction depends on inverse vs normal
+                if _is_inverse_pos:
+                    # Inverse: invalidated when prob RISES ABOVE threshold (ceasefire restored)
+                    if _current_prob > 0 and _current_prob > _sig_thresh:
+                        exit_reason = f"ORACLE INV INVALIDATED: prob={_current_prob:.2f} > {_sig_thresh:.2f} (ceasefire restored)"
+                elif _current_prob > 0 and _current_prob < _sig_thresh:
                     exit_reason = f"ORACLE INVALIDATED: prob={_current_prob:.2f} < {_sig_thresh:.2f}"
                 # TTL
                 elif age_hours > ORACLE_CONFIG["ttl_hours"]:
