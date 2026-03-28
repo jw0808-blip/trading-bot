@@ -443,35 +443,36 @@ def _is_kalshi_sports(market):
 
 
 def get_kalshi_active_markets(limit=50):
-    """Fetch active Kalshi markets directly, filtered to exclude sports. Sorted by volume."""
+    """Fetch active Kalshi markets via events endpoint (financial/political markets).
+    The /markets endpoint returns mostly sports; /events returns catalyst markets."""
     if not KALSHI_API_KEY_ID or not KALSHI_PRIVATE_KEY:
         return []
-    path = "/markets"
-    ts, sig = kalshi_sign("GET", path)
-    headers = {
-        "KALSHI-ACCESS-KEY": KALSHI_API_KEY_ID,
-        "KALSHI-ACCESS-TIMESTAMP": ts,
-        "KALSHI-ACCESS-SIGNATURE": sig,
-        "Content-Type": "application/json",
-    }
     try:
-        # Fetch more than needed since we'll filter out sports
-        r = requests.get(
-            KALSHI_BASE + path,
-            headers=headers,
-            params={"limit": min(limit * 3, 200), "status": "open"},
-            timeout=15,
-        )
-        if r.status_code == 200:
-            raw_markets = r.json().get("markets", [])
-            # Filter out sports/player props
-            markets = [m for m in raw_markets
-                       if not _is_kalshi_sports(m) and not is_sports_or_junk(m.get("title", ""))]
-            markets.sort(key=lambda m: float(m.get("volume", 0) or 0), reverse=True)
-            log.info("KALSHI: %d/%d markets after sports filter", len(markets), len(raw_markets))
-            return markets[:limit]
-        else:
-            log.warning("Kalshi active markets: HTTP %d", r.status_code)
+        events = get_kalshi_events(limit=20)
+        all_markets = []
+        for event in events:
+            # Get nested markets from event (if with_nested_markets=true worked)
+            nested = event.get("markets", [])
+            if nested:
+                for m in nested:
+                    m["_event_title"] = event.get("title", "")
+                    m["_event_category"] = event.get("category", "")
+                all_markets.extend(nested)
+            else:
+                # Fallback: fetch markets for this event
+                ticker = event.get("event_ticker", "")
+                if ticker:
+                    mkts = get_kalshi_markets_for_event(ticker)
+                    for m in mkts:
+                        m["_event_title"] = event.get("title", "")
+                        m["_event_category"] = event.get("category", "")
+                    all_markets.extend(mkts)
+        # Filter sports that snuck through events
+        filtered = [m for m in all_markets
+                    if not _is_kalshi_sports(m) and not is_sports_or_junk(m.get("title", ""))]
+        filtered.sort(key=lambda m: float(m.get("volume", 0) or 0), reverse=True)
+        log.info("KALSHI: %d events → %d markets → %d after filter", len(events), len(all_markets), len(filtered))
+        return filtered[:limit]
     except Exception as exc:
         log.warning("Kalshi active markets error: %s", exc)
     return []
@@ -3872,21 +3873,22 @@ async def kalshi_status_cmd(ctx):
     msg += f"Min Volume: ${KALSHI_MIN_VOLUME:,}\n\n"
 
     if connected:
-        # Fetch markets directly (more reliable than events→markets)
+        # Fetch via events endpoint (financial/political markets)
         markets = get_kalshi_active_markets(limit=50)
-        msg += f"**Markets Fetched: {len(markets)}**\n"
-        msg += "\n**Top 5 Markets by Volume:**\n```\n"
+        msg += f"**Financial Markets: {len(markets)}** (via events endpoint)\n"
+        msg += "\n**Top 5 Markets:**\n```\n"
         for m in markets[:5]:
             vol = float(m.get("volume", 0) or 0)
             yes_ask = m.get("yes_ask", 0)
             no_ask = m.get("no_ask", 0)
             yes_p = yes_ask / 100 if yes_ask else 0
             no_p = no_ask / 100 if no_ask else 0
-            msg += (f"  {m.get('title', '?')[:40]:40s} Vol: ${vol:>8,.0f} "
-                    f"YES: ${yes_p:.2f} NO: ${no_p:.2f}\n")
+            cat = m.get("_event_category", "?")[:12]
+            title = m.get("title", m.get("_event_title", "?"))[:35]
+            msg += (f"  [{cat:12s}] {title:35s} YES:${yes_p:.2f} NO:${no_p:.2f}\n")
         msg += "```"
         if not markets:
-            msg += "No markets found\n"
+            msg += "No financial markets found (events endpoint may only have long-term markets)\n"
         qualifying = sum(1 for m in markets if float(m.get("volume", 0) or 0) >= KALSHI_MIN_VOLUME)
         msg += f"\n{qualifying}/{len(markets)} markets pass volume filter (>= ${KALSHI_MIN_VOLUME:,})"
     else:
