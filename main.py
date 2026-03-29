@@ -1614,6 +1614,8 @@ async def on_ready():
         regime_snapshot_task.start()
     # Initialize ChromaDB causal memory
     _init_chromadb()
+    # Re-queue cascades for open oracle trades that lost queue on restart
+    cascade_requeue_on_startup()
 
 
 @bot.command()
@@ -9920,6 +9922,41 @@ CASCADE_CHAINS = {
 
 # Pending cascade queue: [(fire_at_utc, primary_signal, chain_entry, leg_size, geo_elevated)]
 _CASCADE_PENDING = []
+
+def cascade_requeue_on_startup():
+    """Re-queue cascades for open oracle trades that lost their queue on restart.
+    Called once on startup — immediately fires cascades (no delay) for trades
+    that are already old enough."""
+    for pos in PAPER_PORTFOLIO.get("positions", []):
+        if pos.get("strategy") != "oracle_trade":
+            continue
+        signal_name = pos.get("market", "").replace("ORACLE:", "")
+        chains = CASCADE_CHAINS.get(signal_name, [])
+        if not chains:
+            continue
+        # Check if cascade already exists for this signal
+        for chain in chains:
+            cascade_id = f"CASCADE:{chain['name']}"
+            already_open = any(p.get("market") == cascade_id for p in PAPER_PORTFOLIO.get("positions", []))
+            already_in_db = False
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("SELECT COUNT(*) FROM positions WHERE market_id=? AND status IN ('open','closed')", (cascade_id,))
+                already_in_db = c.fetchone()[0] > 0
+                conn.close()
+            except Exception:
+                pass
+            if already_open or already_in_db:
+                continue
+            # Queue with 1-minute delay (not 15 min — the primary is already old)
+            leg_size = pos.get("cost", 0) / 2  # Approximate leg size from total cost
+            import datetime as _dt_rq
+            fire_at = datetime.now(timezone.utc) + _dt_rq.timedelta(minutes=1)
+            _CASCADE_PENDING.append((fire_at, signal_name, chain, leg_size, False))
+            log.info("CASCADE REQUEUE: %s → %s (from open ORACLE:%s, fires in 1min)",
+                     signal_name, chain["name"], signal_name)
+
 
 def cascade_queue_add(primary_signal, leg_size, geo_elevated):
     """Queue cascade trades for a primary signal with 15-min delay."""
