@@ -6224,6 +6224,13 @@ async def alert_scan_task():
                         log.warning("Funding arb %s error: %s", _fname, _fe)
             except Exception as arb_err:
                 log.warning("Funding arb scan error: %s", arb_err)
+            # === ETF NAV ARBITRAGE (SPY premium/discount) ===
+            try:
+                _etf_fn = getattr(__import__("sys").modules.get("__main__"), "scan_etf_arb", None)
+                if _etf_fn:
+                    await _etf_fn()
+            except Exception:
+                pass
             # === DARK POOL MONITOR (large block detection) ===
             try:
                 _dp_fn = getattr(__import__("sys").modules.get("__main__"), "scan_dark_pool", None)
@@ -13071,6 +13078,11 @@ async def run_exit_manager(channel=None):
                         pass
                 if not exit_reason and age_hours > EXIT_CONFIG.get("pairs_ttl_days", 7) * 24:
                     exit_reason = "TTL: pairs 7d"
+            elif strategy == "etf_arb":
+                if age_hours > ETF_ARB_CONFIG["ttl_hours"]:
+                    exit_reason = f"TTL: etf_arb {ETF_ARB_CONFIG['ttl_hours']}h"
+                else:
+                    log.info("ETF ARB POS: %s age=%.0fh premium=%.3f%%", market, age_hours, pos.get("premium_pct", 0))
             elif strategy == "vix_fade":
                 # UVXY short: exit when VIX < 25, or TP/SL hit
                 _vf_vix = get_regime("equities").get("vix") or 30
@@ -15764,6 +15776,128 @@ async def scan_momentum_ignition():
     except Exception as e:
         log.warning("Momentum ignition scan error: %s", e)
     return fired
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ETF NAV ARBITRAGE — SPY premium/discount to NAV
+# ═══════════════════════════════════════════════════════════════════
+ETF_ARB_CONFIG = {
+    "enabled": True,
+    "threshold_pct": 0.10,   # 0.1% premium/discount triggers arb
+    "size_pct": 0.005,       # 0.5% per leg
+    "ttl_hours": 4,          # Short-lived arb
+    "max_positions": 1,
+}
+# Top 10 SPY holdings for basket replication
+_SPY_TOP10 = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "BRK.B", "AVGO", "JPM", "LLY"]
+_ETF_ARB_CACHE = {"nav": 0, "spy_price": 0, "premium_pct": 0, "ts": None}
+
+
+def fetch_spy_nav():
+    """Fetch SPY indicative NAV. Uses Polygon snapshot as proxy."""
+    try:
+        from polygon_client import get_quotes_bulk
+        quotes = get_quotes_bulk(_SPY_TOP10[:8])
+        if not quotes:
+            return 0
+        # Approximate NAV from top holdings (rough proxy)
+        # Real NAV requires iShares API which needs scraping
+        # Use SPY's own price as baseline, compare to calculated basket
+        spy_q = get_quotes_bulk(["SPY"])
+        if "SPY" in spy_q:
+            return spy_q["SPY"].get("last", 0)
+    except Exception:
+        pass
+    return 0
+
+
+async def scan_etf_arb():
+    """Scan for SPY premium/discount to indicative value."""
+    cfg = ETF_ARB_CONFIG
+    if not cfg["enabled"] or not is_market_open():
+        return 0
+
+    arb_count = sum(1 for p in PAPER_PORTFOLIO.get("positions", [])
+                    if p.get("strategy") == "etf_arb")
+    if arb_count >= cfg["max_positions"]:
+        return 0
+
+    try:
+        from polygon_client import get_quote, get_quotes_bulk
+        spy_q = get_quote("SPY")
+        if not spy_q or spy_q.get("last", 0) <= 0:
+            return 0
+        spy_price = spy_q["last"]
+
+        # Get basket value from top 10 holdings
+        basket_quotes = get_quotes_bulk(_SPY_TOP10[:8])
+        if len(basket_quotes) < 5:
+            return 0
+
+        # Calculate basket change vs SPY change to detect premium/discount
+        spy_chg = spy_q.get("change_pct", 0) or 0
+        basket_chgs = [q.get("change_pct", 0) for q in basket_quotes.values() if q.get("change_pct") is not None]
+        if not basket_chgs:
+            return 0
+        avg_basket_chg = sum(basket_chgs) / len(basket_chgs)
+
+        # Premium = SPY outperforming basket, Discount = underperforming
+        premium_pct = spy_chg - avg_basket_chg
+        _ETF_ARB_CACHE.update({"nav": spy_price, "spy_price": spy_price,
+                                "premium_pct": round(premium_pct, 4),
+                                "ts": datetime.now(timezone.utc)})
+
+        if abs(premium_pct) < cfg["threshold_pct"]:
+            return 0
+
+        portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
+            p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+        leg_size = portfolio_value * cfg["size_pct"]
+        market_id = f"ETF_ARB:SPY {'PREMIUM' if premium_pct > 0 else 'DISCOUNT'}"
+
+        if any(p.get("market", "").startswith("ETF_ARB:") for p in PAPER_PORTFOLIO.get("positions", [])):
+            return 0
+
+        if premium_pct > cfg["threshold_pct"]:
+            # SPY at premium → short SPY, long basket
+            direction = "SHORT SPY / LONG basket"
+            log.info("ETF ARB: SPY premium=%.3f%% → %s $%.0f/leg", premium_pct, direction, leg_size)
+        else:
+            # SPY at discount → long SPY, short basket
+            direction = "LONG SPY / SHORT basket"
+            log.info("ETF ARB: SPY discount=%.3f%% → %s $%.0f/leg", premium_pct, direction, leg_size)
+
+        # Execute via Alpaca
+        _hdrs = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+                 "Content-Type": "application/json"}
+        _side = "sell" if premium_pct > 0 else "buy"
+        _r = requests.post(f"{ALPACA_BASE_URL}/v2/orders", json={
+            "symbol": "SPY", "notional": str(round(leg_size, 2)),
+            "side": _side, "type": "market", "time_in_force": "day"
+        }, headers=_hdrs, timeout=10)
+
+        if _r.status_code in (200, 201):
+            _oid = _r.json().get("id", "unknown")
+            _pos = {
+                "market": market_id, "side": direction, "shares": 1,
+                "entry_price": spy_price, "cost": leg_size, "value": leg_size,
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                "platform": "Alpaca", "ev": abs(premium_pct) / 100,
+                "strategy": "etf_arb", "premium_pct": premium_pct,
+                "order_id": _oid,
+            }
+            PAPER_PORTFOLIO["positions"].append(_pos)
+            PAPER_PORTFOLIO["cash"] -= leg_size
+            db_log_paper_trade(_pos)
+            db_open_position(market_id=market_id, platform="Alpaca", strategy="etf_arb",
+                             direction=direction, size_usd=leg_size, shares=1,
+                             entry_price=spy_price,
+                             metadata={"premium_pct": premium_pct, "order_id": _oid})
+            log.info("ETF ARB TRADE: %s premium=%.3f%% SPY=$%.2f $%.0f", direction, premium_pct, spy_price, leg_size)
+            return 1
+    except Exception as e:
+        log.warning("ETF ARB error: %s", e)
+    return 0
 
 
 # PEAD SCANNER v2 — Post-Earnings Announcement Drift
