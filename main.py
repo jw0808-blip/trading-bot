@@ -1665,6 +1665,8 @@ async def on_ready():
         sector_rotation_task.start()
     if not earnings_calendar_task.is_running():
         earnings_calendar_task.start()
+    if not weekly_email_task.is_running():
+        weekly_email_task.start()
     # Initialize ChromaDB causal memory
     _init_chromadb()
     # Sync Alpaca positions into portfolio — add any tracked positions missing from ledger
@@ -2792,6 +2794,98 @@ async def before_earnings_calendar():
     if wait_secs < 0:
         wait_secs += 7 * 86400
     log.info("Earnings calendar scheduled in %.0f minutes", wait_secs / 60)
+    await asyncio.sleep(wait_secs)
+
+
+@tasks.loop(hours=168)  # Weekly
+async def weekly_email_task():
+    """Send weekly HTML email report every Sunday at 6 PM ET."""
+    if not SMTP_EMAIL or not SMTP_PASSWORD:
+        return
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        # Weekly stats
+        c.execute("""SELECT COUNT(*), COALESCE(SUM(realized_pnl),0),
+            SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END)
+            FROM positions WHERE status='closed' AND strategy != 'pairs_legacy'
+            AND closed_at >= datetime('now', '-7 days')""")
+        wk_trades, wk_pnl, wk_wins = c.fetchone()
+        wk_wr = (wk_wins / wk_trades * 100) if wk_trades > 0 else 0
+        # Top 3 trades
+        c.execute("""SELECT market_id, realized_pnl, strategy FROM positions
+            WHERE status='closed' AND closed_at >= datetime('now', '-7 days')
+            ORDER BY realized_pnl DESC LIMIT 3""")
+        top3 = c.fetchall()
+        # Worst trade
+        c.execute("""SELECT market_id, realized_pnl, strategy FROM positions
+            WHERE status='closed' AND closed_at >= datetime('now', '-7 days')
+            ORDER BY realized_pnl ASC LIMIT 1""")
+        worst = c.fetchone()
+        # Strategy breakdown
+        c.execute("""SELECT strategy, COUNT(*), COALESCE(SUM(realized_pnl),0)
+            FROM positions WHERE status='closed' AND closed_at >= datetime('now', '-7 days')
+            AND strategy != 'pairs_legacy' GROUP BY strategy""")
+        strats = c.fetchall()
+        # Portfolio
+        cash = PAPER_PORTFOLIO.get("cash", 25000)
+        equity = cash + sum(p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+        conn.close()
+
+        # Build HTML
+        html = f"""<html><body style="font-family:Courier,monospace;background:#0a0e17;color:#c8d6e5;padding:20px;">
+<h2 style="color:#58a6ff;">TraderJoes Weekly Report</h2>
+<table style="border-collapse:collapse;width:100%;">
+<tr><td style="padding:4px;color:#8b949e;">Equity:</td><td style="padding:4px;color:#22c55e;font-size:18px;">${equity:,.2f}</td></tr>
+<tr><td style="padding:4px;color:#8b949e;">Cash:</td><td style="padding:4px;">${cash:,.2f}</td></tr>
+<tr><td style="padding:4px;color:#8b949e;">Week Trades:</td><td style="padding:4px;">{wk_trades}</td></tr>
+<tr><td style="padding:4px;color:#8b949e;">Week P&L:</td><td style="padding:4px;color:{'#22c55e' if wk_pnl>=0 else '#ef4444'};">${wk_pnl:+,.2f}</td></tr>
+<tr><td style="padding:4px;color:#8b949e;">Win Rate:</td><td style="padding:4px;">{wk_wr:.0f}%</td></tr>
+</table>
+<h3 style="color:#58a6ff;margin-top:16px;">Top 3 Trades</h3>
+<table style="border-collapse:collapse;width:100%;">"""
+        for t in top3:
+            html += f'<tr><td style="padding:4px;">{t[0][:30]}</td><td style="padding:4px;color:#22c55e;">${t[1]:+,.2f}</td><td style="padding:4px;color:#8b949e;">{t[2]}</td></tr>'
+        html += "</table>"
+        if worst:
+            html += f'<h3 style="color:#ef4444;margin-top:16px;">Worst Trade</h3><p>{worst[0][:30]} ${worst[1]:+,.2f} ({worst[2]})</p>'
+        html += '<h3 style="color:#58a6ff;margin-top:16px;">Strategy Breakdown</h3><table style="border-collapse:collapse;width:100%;">'
+        html += '<tr><th style="padding:4px;color:#8b949e;text-align:left;">Strategy</th><th style="padding:4px;color:#8b949e;">Trades</th><th style="padding:4px;color:#8b949e;">P&L</th></tr>'
+        for s in strats:
+            html += f'<tr><td style="padding:4px;">{s[0]}</td><td style="padding:4px;text-align:center;">{s[1]}</td><td style="padding:4px;text-align:right;color:{"#22c55e" if s[2]>=0 else "#ef4444"};">${s[2]:+,.2f}</td></tr>'
+        html += '</table></body></html>'
+
+        # Send email
+        import smtplib
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = f"[TraderJoes] Weekly Report — ${wk_pnl:+,.2f} ({wk_trades} trades)"
+        msg["From"] = SMTP_EMAIL
+        msg["To"] = SMTP_TO or SMTP_EMAIL
+        msg.attach(MIMEText(html, "html"))
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as server:
+            server.login(SMTP_EMAIL, SMTP_PASSWORD)
+            server.send_message(msg)
+        log.info("WEEKLY EMAIL: sent to %s — $%+.2f (%d trades)", SMTP_TO or SMTP_EMAIL, wk_pnl, wk_trades)
+    except Exception as e:
+        log.warning("Weekly email error: %s", e)
+
+@weekly_email_task.before_loop
+async def before_weekly_email():
+    await bot.wait_until_ready()
+    import asyncio
+    from zoneinfo import ZoneInfo
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    target = now_et.replace(hour=18, minute=0, second=0, microsecond=0)
+    days_to_sunday = (6 - now_et.weekday()) % 7
+    if days_to_sunday == 0 and now_et.hour >= 18:
+        days_to_sunday = 7
+    target += __import__("datetime").timedelta(days=days_to_sunday)
+    wait_secs = (target - now_et).total_seconds()
+    if wait_secs < 0:
+        wait_secs += 7 * 86400
+    log.info("Weekly email scheduled in %.0f minutes", wait_secs / 60)
     await asyncio.sleep(wait_secs)
 
 
