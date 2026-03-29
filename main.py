@@ -1663,6 +1663,8 @@ async def on_ready():
         pairs_scan_task.start()
     if not sector_rotation_task.is_running():
         sector_rotation_task.start()
+    if not crypto_pairs_task.is_running():
+        crypto_pairs_task.start()
     # Initialize ChromaDB causal memory
     _init_chromadb()
     # Sync Alpaca positions into portfolio — add any tracked positions missing from ledger
@@ -2705,6 +2707,23 @@ async def before_pairs_scan():
     import asyncio
     # Wait 15 minutes to offset from the main 10-min loop
     await asyncio.sleep(900)
+
+
+@tasks.loop(minutes=5)
+async def crypto_pairs_task():
+    """Crypto pairs stat arb scanner — runs every 5 minutes 24/7."""
+    try:
+        fired = await scan_crypto_pairs()
+        if fired > 0:
+            log.info("CRYPTO PAIRS: %d trades fired this cycle", fired)
+    except Exception as e:
+        log.warning("CRYPTO PAIRS task error: %s", e)
+
+@crypto_pairs_task.before_loop
+async def before_crypto_pairs():
+    await bot.wait_until_ready()
+    import asyncio
+    await asyncio.sleep(120)  # 2-min startup delay
 
 
 # ============================================================================
@@ -4209,6 +4228,40 @@ async def next_trades_cmd(ctx):
     else:
         msg += "\nNo opportunities above threshold right now.\n"
     msg += f"\n*Strategies: Pairs, Oracle, Crypto, Funding, Kalshi*"
+    await ctx.send(msg[:1900])
+
+
+@bot.command(name="crypto-pairs")
+async def crypto_pairs_cmd(ctx):
+    """Show crypto pairs Z-scores and open positions."""
+    cfg = CRYPTO_PAIRS_CONFIG
+    msg = f"**CRYPTO PAIRS STAT ARB** (scan every {cfg['scan_interval_min']}min, 24/7)\n"
+    msg += f"Entry: |Z| >= {cfg['zscore_entry']} | Exit: Z cross 0 or {cfg['ttl_hours']}h TTL\n\n"
+    msg += "**Current Z-Scores:**\n```\n"
+    msg += f"{'Pair':10s} {'Corr':>6s} {'Z-Score':>8s} {'Status':>10s}\n"
+    msg += f"{'-'*38}\n"
+    for sym_a, sym_b in cfg["seed"]:
+        cache_key = f"{sym_a}/{sym_b}"
+        cached = _CRYPTO_PAIRS_CACHE.get(cache_key)
+        if cached:
+            corr, z = cached["corr"], cached["zscore"]
+            status = "SIGNAL" if abs(z) >= cfg["zscore_entry"] and corr >= 0.5 else "watching"
+        else:
+            corr, z, _ = calculate_crypto_pair_zscore(sym_a, sym_b, cfg["lookback_days"])
+            if corr is None:
+                msg += f"{sym_a}/{sym_b:4s}   {'—':>6s} {'—':>8s} {'no data':>10s}\n"
+                continue
+            status = "SIGNAL" if abs(z) >= cfg["zscore_entry"] and corr >= 0.5 else "watching"
+        msg += f"{sym_a}/{sym_b:4s}   {corr:>6.3f} {z:>+8.3f} {status:>10s}\n"
+    msg += "```\n"
+    # Open positions
+    cp_positions = [p for p in PAPER_PORTFOLIO.get("positions", []) if p.get("strategy") == "crypto_pairs"]
+    if cp_positions:
+        msg += f"**Open Positions ({len(cp_positions)}/{cfg['max_positions']}):**\n"
+        for p in cp_positions:
+            msg += f"  {p.get('market')} | {p.get('side')} | ${p.get('cost', 0):.0f} | entry_z={p.get('entry_zscore', 0):.2f}\n"
+    else:
+        msg += f"No open crypto pairs (0/{cfg['max_positions']})\n"
     await ctx.send(msg[:1900])
 
 
@@ -12445,6 +12498,21 @@ async def run_exit_manager(channel=None):
                         pass
                 if not exit_reason and age_hours > EXIT_CONFIG.get("pairs_ttl_days", 7) * 24:
                     exit_reason = "TTL: pairs 7d"
+            elif strategy == "crypto_pairs":
+                # Z-score reversion exit or TTL
+                _cp_a = pos.get("long_leg", "")
+                _cp_b = pos.get("short_leg", "")
+                if _cp_a and _cp_b:
+                    _cp_corr, _cp_z, _ = calculate_crypto_pair_zscore(_cp_a, _cp_b, 30)
+                    if _cp_z is not None:
+                        _entry_z = pos.get("entry_zscore", 0)
+                        if (_entry_z > 0 and _cp_z <= CRYPTO_PAIRS_CONFIG["zscore_exit"]) or \
+                           (_entry_z < 0 and _cp_z >= -CRYPTO_PAIRS_CONFIG["zscore_exit"]):
+                            exit_reason = f"REVERSION: z={_cp_z:.2f} (entry={_entry_z:.2f})"
+                        else:
+                            log.info("CRYPTO PAIRS POS: %s/%s entry_z=%.2f current_z=%.2f", _cp_a, _cp_b, _entry_z, _cp_z)
+                if not exit_reason and age_hours > CRYPTO_PAIRS_CONFIG["ttl_hours"]:
+                    exit_reason = f"TTL: crypto_pairs {CRYPTO_PAIRS_CONFIG['ttl_hours']}h"
             elif strategy == "pead":
                 if age_hours > EXIT_CONFIG["pead_ttl_hours"]:
                     exit_reason = "TTL: PEAD 72h limit"
@@ -14699,6 +14767,202 @@ import statistics as _stats
 
 REGIME_CACHE = {}
 REGIME_CACHE_TTL = 300
+
+# ═══════════════════════════════════════════════════════════════════
+# CRYPTO PAIRS STAT ARB — Z-score mean reversion on crypto pairs 24/7
+# ═══════════════════════════════════════════════════════════════════
+CRYPTO_PAIRS_CONFIG = {
+    "enabled": True,
+    "seed": [("BTC", "ETH"), ("SOL", "AVAX"), ("BNB", "ETH")],
+    "lookback_days": 30,
+    "zscore_entry": 1.1,
+    "zscore_exit": 0.0,
+    "mc_min_prob": 0.60,
+    "ttl_hours": 48,
+    "size_pct": 0.015,       # 1.5% of portfolio per leg
+    "max_positions": 2,
+    "scan_interval_min": 5,
+}
+_CRYPTO_PAIRS_CACHE = {}  # {pair_key: {"corr": x, "zscore": y, "prices_a": [...], "prices_b": [...], "ts": datetime}}
+
+
+def _fetch_crypto_price_history(symbol, days=30):
+    """Fetch daily close prices for a crypto symbol from Binance klines. Returns list of floats."""
+    try:
+        interval = "1d"
+        limit = days + 5
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit={limit}"
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            klines = r.json()
+            closes = [float(k[4]) for k in klines]  # Close price is index 4
+            return closes[-days:] if len(closes) >= days else closes
+    except Exception:
+        pass
+    return []
+
+
+def _fetch_crypto_spot_price(symbol):
+    """Get current spot price from Coinbase, Binance fallback. Returns float or 0."""
+    try:
+        r = requests.get(f"https://api.coinbase.com/v2/prices/{symbol}-USD/spot", timeout=5)
+        if r.status_code == 200:
+            return float(r.json().get("data", {}).get("amount", 0))
+    except Exception:
+        pass
+    try:
+        r = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT", timeout=5)
+        if r.status_code == 200:
+            return float(r.json().get("price", 0))
+    except Exception:
+        pass
+    return 0
+
+
+def calculate_crypto_pair_zscore(sym_a, sym_b, lookback=30):
+    """Calculate Z-score and correlation for a crypto pair using Binance daily data.
+    Returns (correlation, zscore, mean_ratio) or (None, None, None)."""
+    try:
+        import numpy as np
+        prices_a = _fetch_crypto_price_history(sym_a, lookback)
+        prices_b = _fetch_crypto_price_history(sym_b, lookback)
+        if len(prices_a) < 15 or len(prices_b) < 15:
+            return None, None, None
+        min_len = min(len(prices_a), len(prices_b))
+        pa = np.array(prices_a[-min_len:])
+        pb = np.array(prices_b[-min_len:])
+        ratio = pa / pb
+        corr = float(np.corrcoef(pa, pb)[0, 1])
+        if np.isnan(corr):
+            return None, None, None
+        mean_r = float(np.mean(ratio))
+        std_r = float(np.std(ratio))
+        if std_r == 0:
+            return corr, 0.0, mean_r
+        # Current ratio from live prices
+        live_a = _fetch_crypto_spot_price(sym_a)
+        live_b = _fetch_crypto_spot_price(sym_b)
+        if live_a <= 0 or live_b <= 0:
+            return corr, 0.0, mean_r
+        current_ratio = live_a / live_b
+        zscore = (current_ratio - mean_r) / std_r
+        return round(corr, 3), round(zscore, 3), round(mean_r, 6)
+    except Exception as e:
+        log.warning("CRYPTO PAIRS calc %s/%s: %s", sym_a, sym_b, e)
+        return None, None, None
+
+
+async def scan_crypto_pairs():
+    """Scan crypto pairs for Z-score entry signals. Runs every 5 minutes 24/7."""
+    cfg = CRYPTO_PAIRS_CONFIG
+    if not cfg["enabled"]:
+        return 0
+
+    now = datetime.now(timezone.utc)
+    fired = 0
+
+    # Count open crypto pairs
+    cp_count = sum(1 for p in PAPER_PORTFOLIO.get("positions", [])
+                   if p.get("strategy") == "crypto_pairs")
+    if cp_count >= cfg["max_positions"]:
+        return 0
+
+    portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
+        p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+
+    for sym_a, sym_b in cfg["seed"]:
+        if cp_count + fired >= cfg["max_positions"]:
+            break
+
+        pair_id = f"CRYPTO_PAIRS:{sym_a}/{sym_b}"
+        # Dedup
+        if any(p.get("market") == pair_id for p in PAPER_PORTFOLIO.get("positions", [])):
+            continue
+
+        corr, zscore, mean_ratio = calculate_crypto_pair_zscore(sym_a, sym_b, cfg["lookback_days"])
+        if corr is None:
+            continue
+
+        _CRYPTO_PAIRS_CACHE[f"{sym_a}/{sym_b}"] = {
+            "corr": corr, "zscore": zscore, "mean_ratio": mean_ratio, "ts": now}
+
+        log.info("CRYPTO PAIRS: %s/%s corr=%.3f z=%.3f", sym_a, sym_b, corr, zscore)
+
+        if abs(zscore) < cfg["zscore_entry"] or corr < 0.5:
+            continue
+
+        # Monte Carlo validation
+        mc_prob = 0.65  # Default — crypto MC uses simpler model
+        try:
+            _mc = montecarlo_simulate(f"{sym_a}USD", f"{sym_b}USD", horizon_days=5)
+            if _mc.get("available"):
+                mc_prob = _mc["prob_profit"]
+                if mc_prob < cfg["mc_min_prob"]:
+                    log.info("CRYPTO PAIRS MC SKIP: %s/%s prob=%.0f%%", sym_a, sym_b, mc_prob * 100)
+                    continue
+        except Exception:
+            pass
+
+        direction = "short_a_long_b" if zscore > 0 else "long_a_short_b"
+        long_sym = sym_b if zscore > 0 else sym_a
+        short_sym = sym_a if zscore > 0 else sym_b
+
+        leg_size = portfolio_value * cfg["size_pct"]
+        log.info("CRYPTO PAIRS SIGNAL: %s/%s z=%.2f corr=%.2f → Long %s / Short %s | $%.0f/leg",
+                 sym_a, sym_b, zscore, corr, long_sym, short_sym, leg_size)
+
+        # Execute: Coinbase spot for long leg, Phemex perp for short leg
+        try:
+            _spot_ok, _spot_msg = await execute_coinbase_order("BUY", long_sym, leg_size)
+            if not _spot_ok:
+                log.warning("CRYPTO PAIRS LONG FAILED: %s %s", long_sym, _spot_msg[:80])
+                continue
+            import re as _cp_re
+            _spot_oid = ""
+            _m = _cp_re.search(r"ID: ([^\)]+)", _spot_msg)
+            if _m:
+                _spot_oid = _m.group(1)
+
+            _perp_ok, _perp_msg, _perp_oid = await execute_phemex_perp_short(short_sym, leg_size)
+            if not _perp_ok:
+                log.warning("CRYPTO PAIRS SHORT FAILED: %s — unwinding spot", short_sym)
+                try:
+                    await execute_coinbase_order("SELL", long_sym, leg_size)
+                except Exception:
+                    pass
+                continue
+
+            total_cost = leg_size * 2
+            PAPER_PORTFOLIO["cash"] -= total_cost
+            _pos = {
+                "market": pair_id,
+                "side": f"Long {long_sym} / Short {short_sym}",
+                "shares": 1, "entry_price": zscore, "cost": total_cost, "value": total_cost,
+                "timestamp": now.strftime("%Y-%m-%d %H:%M UTC"),
+                "platform": "Coinbase+Phemex", "ev": abs(zscore) / 10,
+                "strategy": "crypto_pairs",
+                "long_leg": long_sym, "short_leg": short_sym,
+                "entry_zscore": zscore, "entry_corr": corr,
+                "spot_order_id": _spot_oid, "perp_order_id": _perp_oid or "",
+            }
+            PAPER_PORTFOLIO["positions"].append(_pos)
+            db_log_paper_trade(_pos)
+            db_open_position(
+                market_id=pair_id, platform="Coinbase+Phemex", strategy="crypto_pairs",
+                direction=f"Long {long_sym} / Short {short_sym}",
+                size_usd=total_cost, shares=1, entry_price=zscore,
+                long_leg=long_sym, short_leg=short_sym, entry_zscore=zscore,
+                metadata={"corr": corr, "zscore": zscore, "mc_prob": mc_prob,
+                          "spot_oid": _spot_oid, "perp_oid": _perp_oid or ""},
+            )
+            fired += 1
+            log.info("CRYPTO PAIRS TRADE: %s/%s z=%.2f Long %s / Short %s $%.0f",
+                     sym_a, sym_b, zscore, long_sym, short_sym, total_cost)
+        except Exception as e:
+            log.warning("CRYPTO PAIRS execution error %s/%s: %s", sym_a, sym_b, e)
+
+    return fired
+
 
 # PEAD SCANNER v2 — Post-Earnings Announcement Drift
 # 5% EPS surprise + 2.0x volume + 15-min candle confirmation
