@@ -1663,6 +1663,8 @@ async def on_ready():
         pairs_scan_task.start()
     if not sector_rotation_task.is_running():
         sector_rotation_task.start()
+    if not earnings_calendar_task.is_running():
+        earnings_calendar_task.start()
     # Initialize ChromaDB causal memory
     _init_chromadb()
     # Sync Alpaca positions into portfolio — add any tracked positions missing from ledger
@@ -2682,6 +2684,114 @@ async def before_sector_rotation():
         target += __import__("datetime").timedelta(days=1)
     wait_secs = (target - now_et).total_seconds()
     log.info("Sector rotation scheduled in %.0f minutes", wait_secs / 60)
+    await asyncio.sleep(wait_secs)
+
+
+# ---------------------------------------------------------------------------
+# EARNINGS CALENDAR — Sunday 8 PM ET, fetch next week's earnings
+# ---------------------------------------------------------------------------
+_EARNINGS_WEEK = {"tickers": [], "dates": {}, "last_scan": None}
+
+
+def fetch_earnings_calendar():
+    """Fetch next week's earnings from Polygon. Returns list of (ticker, date) tuples."""
+    import datetime as _dt_earn
+    now = datetime.now(timezone.utc)
+    # Next Monday through Friday
+    days_to_monday = (7 - now.weekday()) % 7
+    if days_to_monday == 0:
+        days_to_monday = 7
+    monday = (now + _dt_earn.timedelta(days=days_to_monday)).strftime("%Y-%m-%d")
+    friday = (now + _dt_earn.timedelta(days=days_to_monday + 4)).strftime("%Y-%m-%d")
+    earnings = []
+    try:
+        from polygon_client import _get_client
+        c = _get_client()
+        if c:
+            for ticker_event in c.vx.list_stock_financials(
+                    filing_date_gte=monday, filing_date_lte=friday, limit=50):
+                earnings.append((ticker_event.tickers[0] if ticker_event.tickers else "?",
+                                 ticker_event.filing_date))
+    except Exception:
+        pass
+    # Fallback: yfinance calendar for our pairs universe
+    if not earnings:
+        try:
+            import yfinance as _yf_earn
+            _eq_cfg = globals().get("EQUITIES_CONFIG", {})
+            _seed = _eq_cfg.get("pairs", {}).get("seed", [])
+            _all_tickers = set()
+            for a, b in _seed:
+                _all_tickers.add(a)
+                _all_tickers.add(b)
+            for ticker in list(_all_tickers)[:30]:
+                try:
+                    t = _yf_earn.Ticker(ticker)
+                    cal = t.calendar
+                    if cal is not None and not cal.empty:
+                        if hasattr(cal, 'iloc') and len(cal.columns) > 0:
+                            _ed = str(cal.iloc[0, 0]) if cal.shape[0] > 0 else ""
+                            if monday <= _ed[:10] <= friday:
+                                earnings.append((ticker, _ed[:10]))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    # Update state
+    _EARNINGS_WEEK["tickers"] = [e[0] for e in earnings]
+    _EARNINGS_WEEK["dates"] = {e[0]: e[1] for e in earnings}
+    _EARNINGS_WEEK["last_scan"] = now.strftime("%Y-%m-%d %H:%M UTC")
+    log.info("EARNINGS CALENDAR: %d tickers reporting next week (%s–%s)", len(earnings), monday, friday)
+    return earnings
+
+
+def is_earnings_week(ticker):
+    """Check if a ticker has earnings this week. Used to tighten pairs sizing."""
+    return ticker.upper() in _EARNINGS_WEEK.get("tickers", [])
+
+
+@tasks.loop(hours=168)  # Weekly
+async def earnings_calendar_task():
+    """Fetch earnings calendar every Sunday at 8 PM ET."""
+    try:
+        earnings = fetch_earnings_calendar()
+        if earnings and DISCORD_CHANNEL_ID:
+            ch = bot.get_channel(int(DISCORD_CHANNEL_ID))
+            if ch:
+                msg = f"**EARNINGS CALENDAR — Next Week**\n"
+                msg += f"```\n{'Ticker':8s} {'Date':12s} {'In Pairs?':10s}\n{'-'*32}\n"
+                _eq_cfg = globals().get("EQUITIES_CONFIG", {})
+                _seed = _eq_cfg.get("pairs", {}).get("seed", [])
+                _pairs_tickers = set()
+                for a, b in _seed:
+                    _pairs_tickers.add(a)
+                    _pairs_tickers.add(b)
+                for tk, dt in earnings[:15]:
+                    in_pairs = "YES" if tk in _pairs_tickers else ""
+                    msg += f"{tk:8s} {dt:12s} {in_pairs:10s}\n"
+                msg += "```"
+                if any(tk in _pairs_tickers for tk, _ in earnings):
+                    msg += "\nPairs with earnings this week will be sized at 0.5x"
+                await ch.send(msg[:1900])
+    except Exception as e:
+        log.warning("Earnings calendar task error: %s", e)
+
+@earnings_calendar_task.before_loop
+async def before_earnings_calendar():
+    await bot.wait_until_ready()
+    import asyncio
+    from zoneinfo import ZoneInfo
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    target = now_et.replace(hour=20, minute=0, second=0, microsecond=0)
+    # Next Sunday
+    days_to_sunday = (6 - now_et.weekday()) % 7
+    if days_to_sunday == 0 and now_et.hour >= 20:
+        days_to_sunday = 7
+    target += __import__("datetime").timedelta(days=days_to_sunday)
+    wait_secs = (target - now_et).total_seconds()
+    if wait_secs < 0:
+        wait_secs += 7 * 86400
+    log.info("Earnings calendar scheduled in %.0f minutes", wait_secs / 60)
     await asyncio.sleep(wait_secs)
 
 
@@ -4212,6 +4322,33 @@ async def next_trades_cmd(ctx):
     else:
         msg += "\nNo opportunities above threshold right now.\n"
     msg += f"\n*Strategies: Pairs, Oracle, Crypto, Funding, Kalshi*"
+    await ctx.send(msg[:1900])
+
+
+@bot.command(name="earnings")
+async def earnings_cmd(ctx):
+    """Show next 5 days of relevant earnings."""
+    if not _EARNINGS_WEEK.get("tickers"):
+        fetch_earnings_calendar()
+    tickers = _EARNINGS_WEEK.get("tickers", [])
+    dates = _EARNINGS_WEEK.get("dates", {})
+    last = _EARNINGS_WEEK.get("last_scan", "Never")
+    msg = f"**EARNINGS CALENDAR** (last scan: {last})\n"
+    if tickers:
+        msg += "```\n"
+        _eq_cfg = globals().get("EQUITIES_CONFIG", {})
+        _seed = _eq_cfg.get("pairs", {}).get("seed", [])
+        _pairs_tickers = set()
+        for a, b in _seed:
+            _pairs_tickers.add(a)
+            _pairs_tickers.add(b)
+        for tk in tickers[:20]:
+            dt = dates.get(tk, "?")
+            in_pairs = "IN PAIRS" if tk in _pairs_tickers else ""
+            msg += f"  {tk:8s} {dt:12s} {in_pairs}\n"
+        msg += "```"
+    else:
+        msg += "No earnings data available. Scans Sunday 8 PM ET.\n"
     await ctx.send(msg[:1900])
 
 
@@ -14592,6 +14729,11 @@ def scan_pairs_opportunities():
                                  ticker_a, ticker_b, _cm_mult, _pair_size, _cm_details)
                 except Exception:
                     pass
+
+                # Earnings guard: tighten sizing if either ticker reports this week
+                if is_earnings_week(ticker_a) or is_earnings_week(ticker_b):
+                    _pair_size *= 0.5
+                    log.info("EARNINGS GUARD: %s/%s sized 0.5x (earnings this week)", ticker_a, ticker_b)
 
                 if direction == "short_a_long_b":
                     _long_tk, _short_tk = ticker_b, ticker_a
