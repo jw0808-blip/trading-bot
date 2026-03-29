@@ -5794,33 +5794,48 @@ async def auto_paper_execute(channel, opp):
     # === SQLITE DEDUP (1 per market, survives restarts) ===
     _raw_mkt = opp.get("market", "")[:60]
     _mkey = _raw_mkt
+    # Normalize: strip YES:/NO: prefixes for prediction market dedup
+    import re as _dedup_re
+    _normalized_mkey = _dedup_re.sub(r'^(YES:|NO:|yes:|no:)\s*', '', _mkey).strip()
     # Crypto: dedup by ticker symbol, not the full market string (which includes price)
     if opp.get("platform", "").lower() == "crypto" and opp.get("ticker"):
         _mkey = "CRYPTO:" + opp["ticker"].upper()
+        _normalized_mkey = _mkey
     elif opp.get("ticker"):
-        # Fallback: check if ticker looks like a known crypto symbol
         _tk_upper = opp["ticker"].upper()
         if any(k == _tk_upper for k in ["BTC","ETH","SOL","DOGE","ZEC","XLM","XRP","HBAR","SHIB","ALGO","ADA","AVAX","MATIC","LINK","TAO","SUI","HYPE","WBT"]):
             _mkey = "CRYPTO:" + _tk_upper
+            _normalized_mkey = _mkey
+
+    # Hard cap: max 1 position per normalized market title (regardless of YES/NO side)
+    # Check in-memory portfolio first (fastest)
+    for _ep in PAPER_PORTFOLIO.get("positions", []):
+        _ep_mkt = _ep.get("market", "")
+        _ep_norm = _dedup_re.sub(r'^(YES:|NO:|yes:|no:)\s*', '', _ep_mkt).strip()
+        if _ep_norm and _normalized_mkey and _ep_norm[:40].lower() == _normalized_mkey[:40].lower():
+            log.info("DEDUP-MEM: %s matches existing %s", _mkey[:40], _ep_mkt[:40])
+            return False
+
     try:
         _dconn = sqlite3.connect(DB_PATH)
         _dc = _dconn.cursor()
-        # Check both paper_trades and positions tables, exact and LIKE match for crypto
-        _dc.execute("SELECT COUNT(*) FROM paper_trades WHERE market = ? AND status = 'open'", (_mkey,))
+        # Check normalized key against both tables using LIKE for fuzzy match
+        _norm_pattern = f"%{_normalized_mkey[:35]}%" if _normalized_mkey else _mkey
+        _dc.execute("SELECT COUNT(*) FROM paper_trades WHERE market LIKE ? AND status = 'open'", (_norm_pattern,))
         _dcount = _dc.fetchone()[0]
+        if _dcount == 0:
+            _dc.execute("SELECT COUNT(*) FROM positions WHERE market_id LIKE ? AND status = 'open'", (_norm_pattern,))
+            _dcount = _dc.fetchone()[0]
         if _dcount == 0 and _mkey.startswith("CRYPTO:"):
             _tk_pattern = f"%{_mkey.replace('CRYPTO:', '')}%"
             _dc.execute("SELECT COUNT(*) FROM paper_trades WHERE market LIKE ? AND status = 'open'", (_tk_pattern,))
             _dcount = _dc.fetchone()[0]
-        if _dcount == 0:
-            _dc.execute("SELECT COUNT(*) FROM positions WHERE market_id = ? AND status = 'open'", (_mkey,))
-            _dcount = _dc.fetchone()[0]
-        if _dcount == 0 and _mkey.startswith("CRYPTO:"):
-            _dc.execute("SELECT COUNT(*) FROM positions WHERE market_id LIKE ? AND status = 'open'", (_tk_pattern,))
-            _dcount = _dc.fetchone()[0]
+            if _dcount == 0:
+                _dc.execute("SELECT COUNT(*) FROM positions WHERE market_id LIKE ? AND status = 'open'", (_tk_pattern,))
+                _dcount = _dc.fetchone()[0]
         _dconn.close()
         if _dcount > 0:
-            log.info("DEDUP-SQL: %s already traded %d times", _mkey, _dcount)
+            log.info("DEDUP-SQL: %s already traded %d times (normalized: %s)", _mkey[:40], _dcount, _normalized_mkey[:40])
             return False
     except Exception:
         pass
