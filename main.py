@@ -4134,6 +4134,16 @@ async def status_cmd(ctx):
         await ctx.send(m2)
 
 
+@bot.command(name="sms-test")
+async def sms_test_cmd(ctx):
+    """Send a test SMS to verify Twilio is working."""
+    if not all([TWILIO_SID, TWILIO_TOKEN, TWILIO_FROM, TWILIO_TO]):
+        await ctx.send("SMS not configured. Set TWILIO_SID, TWILIO_TOKEN, TWILIO_FROM, TWILIO_TO in .env")
+        return
+    ok = send_sms("Test alert from TraderJoes War Room — SMS is working!")
+    await ctx.send(f"SMS test: {'Sent successfully' if ok else 'FAILED — check Twilio credentials'}")
+
+
 @bot.command(name="journal")
 async def journal_cmd(ctx, count: int = 10):
     """Show last N trade journal entries. Usage: !journal or !journal 5"""
@@ -9677,6 +9687,7 @@ def check_factor_alerts(channel_notify=None):
                         factor, data["pct"], data["net"])
     if alerts:
         _agent_log_event("risk", f"Factor concentration: {', '.join(alerts)}")
+        send_critical_alert("Factor Alert", f"Concentration: {', '.join(alerts)}")
     return alerts
 
 
@@ -11711,6 +11722,7 @@ async def scan_oracle_signals(channel=None):
                 fired += 1
                 log.info("ORACLE TRADE: %s | YES=$%.2f | %s | $%.0f",
                          signal_name, yes_price, _legs_str, total_cost)
+                send_critical_alert("Oracle Trade", f"{signal_name} fired: {_legs_str} ${total_cost:.0f}")
                 # Queue cascade chain-reaction trades (15-min delayed)
                 cascade_queue_add(signal_name, leg_size, geo_elevated)
 
@@ -12716,6 +12728,7 @@ async def check_crash_hedges(channel):
                                           "order_id": _uvxy_oid})
                             log.info("VIX FADE: SHORT UVXY %d shares at $%.2f (VIX=%.1f) stop=$%.2f tp=$%.2f",
                                      _uvxy_shares, _uvxy_px, vix, _uvxy_stop, _uvxy_tp)
+                            send_critical_alert("VIX Fade", f"SHORT UVXY {_uvxy_shares}sh at ${_uvxy_px:.2f} VIX={vix:.1f}")
                             if channel:
                                 try:
                                     await channel.send(
