@@ -11259,6 +11259,34 @@ CASCADE_CHAINS = {
         {"name": "taiwan_cascade_onshore", "long": "SOXX", "short": "SMH", "delay_min": 15,
          "description": "Onshoring premium → US semis (SOXX) up, broad semis down"},
     ],
+    # Tariff chain: trade war escalation
+    "tariff": [
+        {"name": "tariff_cascade_em", "long": "UUP", "short": "EEM", "delay_min": 15,
+         "description": "Tariff escalation → USD strong, emerging markets weak"},
+        {"name": "tariff_cascade_china", "long": "UUP", "short": "FXI", "delay_min": 15,
+         "description": "Trade war → USD up, China equities down"},
+    ],
+    # Recession chain: risk-off across asset classes
+    "recession": [
+        {"name": "recession_cascade_bonds", "long": "TLT", "short": "SPY", "delay_min": 15,
+         "description": "Recession signal → bonds up, equities down"},
+        {"name": "recession_cascade_gold", "long": "GLD", "short": "XLF", "delay_min": 15,
+         "description": "Recession → gold safe haven, financials hurt"},
+    ],
+    # Fed hike chain: rates rising
+    "fed_hike": [
+        {"name": "fed_hike_cascade_banks", "long": "XLF", "short": "TLT", "delay_min": 15,
+         "description": "Rate hike → bank margins up, bonds down"},
+        {"name": "fed_hike_cascade_growth", "long": "XLV", "short": "QQQ", "delay_min": 15,
+         "description": "Higher rates → value (healthcare) over growth (tech)"},
+    ],
+    # Fed cut chain: rates falling
+    "fed_cut": [
+        {"name": "fed_cut_cascade_tech", "long": "QQQ", "short": "XLF", "delay_min": 15,
+         "description": "Rate cut → growth tech up, bank margins compressed"},
+        {"name": "fed_cut_cascade_re", "long": "XLRE", "short": "TBT", "delay_min": 15,
+         "description": "Lower rates → real estate up, short bonds ETF down"},
+    ],
 }
 
 # Pending cascade queue: [(fire_at_utc, primary_signal, chain_entry, leg_size, geo_elevated)]
