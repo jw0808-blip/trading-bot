@@ -2879,19 +2879,102 @@ async def weekly_email_task():
             html += f'<tr><td style="padding:4px;">{s[0]}</td><td style="padding:4px;text-align:center;">{s[1]}</td><td style="padding:4px;text-align:right;color:{"#22c55e" if s[2]>=0 else "#ef4444"};">${s[2]:+,.2f}</td></tr>'
         html += '</table></body></html>'
 
-        # Send email
+        # Generate PDF report
+        _pdf_path = None
+        try:
+            import os as _pdf_os
+            _pdf_os.makedirs("/app/data/reports", exist_ok=True)
+            _pdf_date = datetime.now(timezone.utc).strftime("%Y%m%d")
+            _pdf_path = f"/app/data/reports/weekly_{_pdf_date}.pdf"
+            from reportlab.lib.pagesizes import letter
+            from reportlab.lib import colors
+            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+            from reportlab.lib.styles import getSampleStyleSheet
+            doc = SimpleDocTemplate(_pdf_path, pagesize=letter)
+            styles = getSampleStyleSheet()
+            elements = []
+            # Title
+            elements.append(Paragraph("<b>TraderJoes Weekly Report</b>", styles["Title"]))
+            elements.append(Spacer(1, 12))
+            # Summary table
+            summary_data = [
+                ["Metric", "Value"],
+                ["Equity", f"${equity:,.2f}"],
+                ["Cash", f"${cash:,.2f}"],
+                ["Week Trades", str(wk_trades)],
+                ["Week P&L", f"${wk_pnl:+,.2f}"],
+                ["Win Rate", f"{wk_wr:.0f}%"],
+            ]
+            t = Table(summary_data, colWidths=[200, 200])
+            t.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a1f2e')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ]))
+            elements.append(t)
+            elements.append(Spacer(1, 16))
+            # Top trades
+            elements.append(Paragraph("<b>Top 3 Trades</b>", styles["Heading2"]))
+            trade_data = [["Market", "P&L", "Strategy"]]
+            for tr in top3:
+                trade_data.append([tr[0][:30], f"${tr[1]:+,.2f}", tr[2]])
+            if worst:
+                trade_data.append([f"WORST: {worst[0][:25]}", f"${worst[1]:+,.2f}", worst[2]])
+            t2 = Table(trade_data, colWidths=[200, 100, 100])
+            t2.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a1f2e')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ]))
+            elements.append(t2)
+            elements.append(Spacer(1, 16))
+            # Strategy breakdown
+            elements.append(Paragraph("<b>Strategy Breakdown</b>", styles["Heading2"]))
+            strat_data = [["Strategy", "Trades", "P&L"]]
+            for s in strats:
+                strat_data.append([s[0], str(s[1]), f"${s[2]:+,.2f}"])
+            t3 = Table(strat_data, colWidths=[200, 80, 120])
+            t3.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a1f2e')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ]))
+            elements.append(t3)
+            doc.build(elements)
+            log.info("WEEKLY PDF: generated %s", _pdf_path)
+        except Exception as _pdf_err:
+            log.warning("Weekly PDF error: %s", _pdf_err)
+            _pdf_path = None
+
+        # Send email with PDF attachment
         import smtplib
         from email.mime.text import MIMEText
         from email.mime.multipart import MIMEMultipart
-        msg = MIMEMultipart("alternative")
+        from email.mime.base import MIMEBase
+        from email import encoders
+        msg = MIMEMultipart("mixed")
         msg["Subject"] = f"[TraderJoes] Weekly Report — ${wk_pnl:+,.2f} ({wk_trades} trades)"
         msg["From"] = SMTP_EMAIL
         msg["To"] = SMTP_TO or SMTP_EMAIL
         msg.attach(MIMEText(html, "html"))
+        if _pdf_path:
+            try:
+                with open(_pdf_path, "rb") as _pf:
+                    _att = MIMEBase("application", "pdf")
+                    _att.set_payload(_pf.read())
+                    encoders.encode_base64(_att)
+                    _att.add_header("Content-Disposition", f"attachment; filename=weekly_{_pdf_date}.pdf")
+                    msg.attach(_att)
+            except Exception:
+                pass
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as server:
             server.login(SMTP_EMAIL, SMTP_PASSWORD)
             server.send_message(msg)
-        log.info("WEEKLY EMAIL: sent to %s — $%+.2f (%d trades)", SMTP_TO or SMTP_EMAIL, wk_pnl, wk_trades)
+        log.info("WEEKLY EMAIL: sent to %s — $%+.2f (%d trades)%s",
+                 SMTP_TO or SMTP_EMAIL, wk_pnl, wk_trades, " +PDF" if _pdf_path else "")
     except Exception as e:
         log.warning("Weekly email error: %s", e)
 
