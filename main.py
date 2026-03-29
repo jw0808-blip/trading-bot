@@ -133,18 +133,62 @@ def db_close_position(market_id, exit_price, exit_reason, realized_pnl=0):
         import sqlite3 as _sq
         conn = _sq.connect(DB_PATH)
         c = conn.cursor()
+        # Fetch position details before closing for journal
+        c.execute("SELECT strategy, direction, size_usd, created_at, regime, metadata FROM positions WHERE market_id=? AND status='open'", (market_id,))
+        _pos_row = c.fetchone()
         c.execute("""UPDATE positions SET status='closed', current_price=?,
             closed_at=datetime('now'), exit_reason=?, realized_pnl=?
             WHERE market_id=? AND status='open'""",
             (exit_price, exit_reason, realized_pnl, market_id))
         rows = c.rowcount
-        conn.commit(); conn.close()
+        conn.commit()
         if rows > 0:
             log.info("DB-CLOSE: %s | %s | pnl=$%.2f", market_id, exit_reason, realized_pnl)
+            # Auto-generate trade journal entry
+            try:
+                _strat = _pos_row[0] if _pos_row else "?"
+                _dir = _pos_row[1] if _pos_row else "?"
+                _size = _pos_row[2] if _pos_row else 0
+                _entry_dt = _pos_row[3] if _pos_row else ""
+                _regime = _pos_row[4] if _pos_row else "normal"
+                _meta = _pos_row[5] if _pos_row else "{}"
+                # Calculate hold time
+                _hold = 0
+                if _entry_dt:
+                    try:
+                        _edt = datetime.fromisoformat(_entry_dt.replace(" UTC", "+00:00")) if "UTC" in str(_entry_dt) else datetime.fromisoformat(str(_entry_dt))
+                        _hold = (datetime.now(timezone.utc) - _edt.replace(tzinfo=timezone.utc)).total_seconds() / 3600
+                    except Exception:
+                        pass
+                # Generate lesson
+                _outcome = "WIN" if realized_pnl > 0 else "LOSS" if realized_pnl < 0 else "FLAT"
+                _lesson = f"{_outcome}: {_strat} trade {market_id[:30]} exited via {exit_reason[:30]}"
+                if realized_pnl > 0:
+                    _lesson += f" — regime={_regime} worked for {_strat}"
+                elif realized_pnl < 0:
+                    _lesson += f" — regime={_regime} unfavorable for {_strat}"
+                # Parse signal trigger from metadata
+                _signal = ""
+                try:
+                    import json as _jj
+                    _md = _jj.loads(_meta) if isinstance(_meta, str) else {}
+                    _signal = _md.get("signal", _md.get("ticker", ""))
+                except Exception:
+                    pass
+                c.execute("""INSERT INTO trade_journal
+                    (market_id, strategy, direction, entry_date, exit_date, hold_hours,
+                     entry_regime, exit_reason, realized_pnl, size_usd, signal_trigger, lesson)
+                    VALUES (?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?)""",
+                    (market_id, _strat, _dir, _entry_dt, round(_hold, 1), _regime,
+                     exit_reason, realized_pnl, _size, _signal, _lesson))
+                conn.commit()
+            except Exception as _je:
+                log.warning("Trade journal error: %s", _je)
             try:
                 shadow_close_position(market_id, realized_pnl, exit_reason)
             except Exception:
                 pass
+        conn.close()
         return rows > 0
     except Exception as e:
         log.warning("db_close_position error: %s", e)
@@ -3774,6 +3818,40 @@ async def status_cmd(ctx):
     await ctx.send(m1)
     if m2.strip():
         await ctx.send(m2)
+
+
+@bot.command(name="journal")
+async def journal_cmd(ctx, count: int = 10):
+    """Show last N trade journal entries. Usage: !journal or !journal 5"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""SELECT market_id, strategy, hold_hours, entry_regime, exit_reason,
+            realized_pnl, lesson, exit_date FROM trade_journal
+            ORDER BY created_at DESC LIMIT ?""", (min(count, 20),))
+        rows = c.fetchall()
+        conn.close()
+        if not rows:
+            await ctx.send("**Trade Journal**: No entries yet. Journal entries are created automatically when trades close.")
+            return
+        msg = f"**TRADE JOURNAL** (last {len(rows)} entries)\n```\n"
+        for r in rows:
+            mkt = (r[0] or "?")[:25]
+            strat = (r[1] or "?")[:8]
+            hold = r[2] or 0
+            regime = (r[3] or "?")[:8]
+            reason = (r[4] or "?")[:15]
+            pnl = r[5] or 0
+            lesson = (r[6] or "")[:50]
+            dt = (r[7] or "?")[:10]
+            pnl_str = f"${pnl:+.2f}"
+            msg += f"{dt} {strat:8s} {mkt:25s} {pnl_str:>8s} {hold:>5.0f}h {regime:8s} {reason}\n"
+            if lesson:
+                msg += f"  > {lesson}\n"
+        msg += "```"
+        await ctx.send(msg[:1900])
+    except Exception as e:
+        await ctx.send(f"Journal error: {e}")
 
 
 @bot.command(name="firm-stats")
@@ -9755,6 +9833,15 @@ def init_db():
             probability REAL, geo_level TEXT, headline TEXT,
             trade_outcome TEXT, realized_pnl REAL,
             context TEXT, created_at TEXT DEFAULT (datetime('now'))
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS trade_journal (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            market_id TEXT, strategy TEXT, direction TEXT,
+            entry_date TEXT, exit_date TEXT, hold_hours REAL,
+            entry_regime TEXT, exit_reason TEXT,
+            realized_pnl REAL, size_usd REAL,
+            signal_trigger TEXT, lesson TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
         )""")
         c.execute("""CREATE TABLE IF NOT EXISTS ib_orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
