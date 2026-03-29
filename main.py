@@ -3788,14 +3788,21 @@ async def firm_stats_cmd(ctx):
             std_d = statistics.stdev(daily_pnls) if len(daily_pnls) > 1 else 1
             sharpe = (mean_d / std_d) * (252 ** 0.5) if std_d > 0 else 0
 
-        # Win rate by strategy
+        # Win rate + avg hold time by strategy
         c.execute("""SELECT strategy,
             COUNT(*) as total,
             SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins,
-            COALESCE(SUM(realized_pnl), 0) as pnl
+            COALESCE(SUM(realized_pnl), 0) as pnl,
+            AVG(CASE WHEN created_at IS NOT NULL AND closed_at IS NOT NULL
+                THEN (julianday(closed_at) - julianday(created_at)) * 24
+                ELSE NULL END) as avg_hold_hours
             FROM positions WHERE status='closed' AND strategy != 'pairs_legacy' AND realized_pnl IS NOT NULL
             GROUP BY strategy ORDER BY pnl DESC""")
         strat_rows = c.fetchall()
+
+        # Open position count and exposure
+        c.execute("SELECT COUNT(*), COALESCE(SUM(size_usd), 0) FROM positions WHERE status='open'")
+        open_count, open_exposure = c.fetchone()
         conn.close()
 
         msg = "**TRADERJOES FIRM STATISTICS**\n"
@@ -3812,11 +3819,15 @@ async def firm_stats_cmd(ctx):
         msg += f"Current Streak:  {current_streak} days\n"
         msg += f"Sharpe Ratio:    {sharpe:.2f} (annualized)\n"
         msg += f"Trading Days:    {len(daily_pnls)}\n"
-        msg += f"\n{'Strategy':20s} {'Trades':>6s} {'Wins':>5s} {'WR%':>5s} {'P&L':>10s}\n"
+        msg += f"Open Positions:  {open_count} (${open_exposure:,.0f})\n"
+        msg += f"\n{'Strategy':16s} {'Tr':>4s} {'W':>3s} {'WR%':>5s} {'AvgHold':>8s} {'P&L':>10s}\n"
         msg += f"{'-'*50}\n"
-        for strat, total, wins, pnl in strat_rows:
+        for row in strat_rows:
+            strat, total, wins, pnl = row[0], row[1], row[2], row[3]
+            avg_hold = row[4] if len(row) > 4 and row[4] else 0
             wr = (wins / total * 100) if total > 0 else 0
-            msg += f"{strat[:20]:20s} {total:>6d} {wins:>5d} {wr:>4.0f}% ${pnl:>+9,.2f}\n"
+            hold_str = f"{avg_hold:.0f}h" if avg_hold else "—"
+            msg += f"{strat[:16]:16s} {total:>4d} {wins:>3d} {wr:>4.0f}% {hold_str:>8s} ${pnl:>+9,.2f}\n"
         msg += "```"
         await ctx.send(msg[:1900])
     except Exception as e:
