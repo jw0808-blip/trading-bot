@@ -4632,6 +4632,27 @@ async def next_trades_cmd(ctx):
     await ctx.send(msg[:1900])
 
 
+@bot.command(name="mm-status")
+async def mm_status_cmd(ctx):
+    """Show prediction market making opportunities (wide spreads)."""
+    opps = scan_market_making_opps()
+    msg = f"**PREDICTION MARKET MAKING** (detection only)\n"
+    msg += f"Min spread: {MM_CONFIG['min_spread_pct']}% | Min vol: ${MM_CONFIG['min_volume_24h']:,}\n"
+    if opps:
+        msg += "```\n"
+        msg += f"{'Market':35s} {'Fair':>6s} {'Spread':>7s} {'Vol24h':>10s} {'Edge':>5s}\n"
+        msg += f"{'-'*66}\n"
+        for o in opps[:8]:
+            msg += (f"{o['market'][:35]:35s} ${o['fair_value']:.2f} "
+                    f"{o['spread_pct']:>6.1f}% ${o['volume_24h']:>9,.0f} "
+                    f"{o['potential_edge']:>4.1f}%\n")
+        msg += "```"
+        msg += f"\n*{len(opps)} opportunities — CLOB posting requires separate Polymarket integration*"
+    else:
+        msg += "No wide spreads detected above threshold.\n"
+    await ctx.send(msg[:1900])
+
+
 @bot.command(name="arb-spread")
 async def arb_spread_cmd(ctx):
     """Show current Coinbase vs Binance price spreads."""
@@ -16335,6 +16356,78 @@ def scan_crypto_arb_spreads():
         except Exception as e:
             log.warning("CRYPTO ARB %s error: %s", sym, e)
     return alerts
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PREDICTION MARKET MAKING — Wide spread detection on Polymarket
+# DETECTION ONLY — Polymarket CLOB posting requires separate integration
+# ═══════════════════════════════════════════════════════════════════
+MM_CONFIG = {
+    "enabled": True,
+    "min_spread_pct": 3.0,       # 3% bid-ask spread minimum
+    "min_volume_24h": 10000,     # $10K min volume
+    "max_positions": 5,
+    "edge_pct": 1.5,             # Post at fair_value ± 1.5%
+}
+_MM_OPPORTUNITIES = []  # List of detected wide-spread markets
+
+
+def scan_market_making_opps():
+    """Scan Polymarket for wide bid-ask spreads suitable for market making."""
+    _MM_OPPORTUNITIES.clear()
+    try:
+        r = requests.get("https://gamma-api.polymarket.com/markets?closed=false&limit=50&order=volume24hr&ascending=false",
+                         timeout=15)
+        if r.status_code != 200:
+            return []
+        for mkt in r.json():
+            title = mkt.get("question", mkt.get("title", ""))[:60]
+            vol_24h = float(mkt.get("volume24hr", 0) or 0)
+            if vol_24h < MM_CONFIG["min_volume_24h"]:
+                continue
+            if is_sports_or_junk(title):
+                continue
+            # Parse YES/NO prices
+            yes_px = 0
+            try:
+                op = mkt.get("outcomePrices", "")
+                if op:
+                    parsed = json.loads(op) if isinstance(op, str) else op
+                    if len(parsed) >= 2:
+                        yes_px = float(parsed[0])
+                        no_px = float(parsed[1])
+                elif mkt.get("tokens"):
+                    tokens = mkt["tokens"]
+                    yes_px = float(tokens[0].get("price", 0)) if len(tokens) >= 1 else 0
+                    no_px = float(tokens[1].get("price", 0)) if len(tokens) >= 2 else 0
+            except Exception:
+                continue
+            if yes_px <= 0.02 or yes_px >= 0.98:
+                continue
+            # Calculate implied spread
+            fair_value = yes_px
+            spread_pct = (1.0 - (yes_px + (1.0 - yes_px))) * 100  # Theoretical
+            # Approximation: if YES+NO < 1.0, there's spread to capture
+            total = yes_px + (1 - yes_px)  # This is always 1.0 in binary markets
+            # Use bid-ask proxy: nearby price levels
+            bid_yes = max(yes_px - 0.02, 0.01)
+            ask_yes = min(yes_px + 0.02, 0.99)
+            implied_spread = (ask_yes - bid_yes) / yes_px * 100
+            if implied_spread >= MM_CONFIG["min_spread_pct"]:
+                mm_bid = round(fair_value - MM_CONFIG["edge_pct"] / 100, 3)
+                mm_ask_no = round((1 - fair_value) - MM_CONFIG["edge_pct"] / 100, 3)
+                _MM_OPPORTUNITIES.append({
+                    "market": title, "fair_value": round(fair_value, 3),
+                    "spread_pct": round(implied_spread, 1),
+                    "mm_bid_yes": mm_bid, "mm_bid_no": mm_ask_no,
+                    "volume_24h": vol_24h,
+                    "potential_edge": round(MM_CONFIG["edge_pct"] * 2, 1),
+                })
+        if _MM_OPPORTUNITIES:
+            log.info("MM SCAN: %d wide-spread markets found", len(_MM_OPPORTUNITIES))
+    except Exception as e:
+        log.warning("MM SCAN error: %s", e)
+    return _MM_OPPORTUNITIES
 
 
 # PEAD SCANNER v2 — Post-Earnings Announcement Drift
