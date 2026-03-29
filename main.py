@@ -4134,6 +4134,36 @@ async def status_cmd(ctx):
         await ctx.send(m2)
 
 
+@bot.command(name="risk-status")
+async def risk_status_cmd(ctx):
+    """Show factor exposure map, neutrality score, and risk alerts."""
+    exposure, neutrality = calculate_factor_exposure()
+    total_deployed = sum(p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+    msg = f"**RISK STATUS — Factor Exposure Map**\n"
+    msg += f"Deployed: ${total_deployed:,.0f} | Neutrality: {neutrality}/100\n"
+    msg += "```\n"
+    msg += f"{'Factor':10s} {'Long':>8s} {'Short':>8s} {'Net':>9s} {'%':>6s} {'Status'}\n"
+    msg += f"{'-'*50}\n"
+    for factor in FACTOR_MAP:
+        data = exposure.get(factor, {"long": 0, "short": 0, "net": 0, "pct": 0})
+        status = "ALERT" if data["pct"] > 30 else "watch" if data["pct"] > 20 else "ok"
+        msg += (f"{factor:10s} ${data['long']:>7,.0f} ${data['short']:>7,.0f} "
+                f"${data['net']:>+8,.0f} {data['pct']:>5.1f}% {status}\n")
+    msg += "```\n"
+    # Corr flags
+    corr_flags = _RISK_STATE.get("corr_flags", [])
+    if corr_flags:
+        msg += f"**Correlation Flags ({len(corr_flags)}):**\n"
+        for t1, t2, c in corr_flags[:5]:
+            msg += f"  {t1}/{t2} corr={c:.2f}\n"
+    # Strategy pauses
+    pauses = _RISK_STATE.get("strategy_pauses", {})
+    if pauses:
+        msg += f"\n**Paused Strategies:** {', '.join(pauses.keys())}"
+    msg += f"\n\n*Factor alert threshold: 30% of deployed capital*"
+    await ctx.send(msg[:1900])
+
+
 @bot.command(name="journal")
 async def journal_cmd(ctx, count: int = 10):
     """Show last N trade journal entries. Usage: !journal or !journal 5"""
@@ -6223,6 +6253,21 @@ async def alert_scan_task():
                             pass
             except Exception as _maerr:
                 log.warning("Meta-alloc error: %s", _maerr)
+            # === FACTOR EXPOSURE CHECK (every cycle) ===
+            try:
+                _factor_alerts = check_factor_alerts()
+                if _factor_alerts:
+                    _fch = bot.get_channel(int(DISCORD_CHANNEL_ID)) if DISCORD_CHANNEL_ID else None
+                    if _fch:
+                        try:
+                            await _fch.send(
+                                f"**FACTOR CONCENTRATION WARNING**\n" +
+                                "\n".join(f"  {a}" for a in _factor_alerts) +
+                                f"\n> Neutrality score: {_FACTOR_NEUTRALITY}/100")
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             # === PSYCHOLOGIST AGENT (every cycle) ===
             try:
                 _psych = psychologist_update()
@@ -9523,6 +9568,86 @@ def _build_api_charts():
                 "trade_freq": [], "launch_criteria": {}}
 
 
+# ---------------------------------------------------------------------------
+# FACTOR EXPOSURE MAP — Monitor concentration across 6 factors
+# ---------------------------------------------------------------------------
+FACTOR_MAP = {
+    "tech": ["NVDA", "AMD", "ADBE", "CRM", "AAPL", "MSFT", "GOOGL", "META", "INTC", "TXN", "SOXX", "SMH", "QQQ"],
+    "energy": ["XLE", "XOM", "CVX", "COP", "EOG", "USO"],
+    "defense": ["LMT", "RTX", "BA"],
+    "airlines": ["UAL", "AAL", "DAL", "JETS"],
+    "gold": ["GLD", "GDX"],
+    "rates": ["TLT", "XLF", "TBT"],
+}
+_FACTOR_EXPOSURE = {}  # {factor: {"long": $, "short": $, "net": $, "pct": %}}
+_FACTOR_LAST_SCAN = None
+_FACTOR_NEUTRALITY = 100  # 0-100 score, 100 = perfectly neutral
+
+
+def calculate_factor_exposure():
+    """Build factor exposure map from all open positions. Returns dict and neutrality score."""
+    global _FACTOR_EXPOSURE, _FACTOR_LAST_SCAN, _FACTOR_NEUTRALITY
+    positions = PAPER_PORTFOLIO.get("positions", [])
+    total_deployed = sum(p.get("cost", 0) for p in positions)
+    if total_deployed <= 0:
+        _FACTOR_EXPOSURE = {f: {"long": 0, "short": 0, "net": 0, "pct": 0} for f in FACTOR_MAP}
+        _FACTOR_NEUTRALITY = 100
+        _FACTOR_LAST_SCAN = datetime.now(timezone.utc)
+        return _FACTOR_EXPOSURE, 100
+
+    # Map each position's legs to factors
+    exposure = {f: {"long": 0.0, "short": 0.0} for f in FACTOR_MAP}
+    for pos in positions:
+        cost = pos.get("cost", 0)
+        leg_size = cost / 2 if cost > 0 else 0
+        for leg_key, direction in [("long_leg", "long"), ("short_leg", "short")]:
+            ticker = pos.get(leg_key, "").upper()
+            if not ticker:
+                continue
+            for factor, tickers in FACTOR_MAP.items():
+                if ticker in tickers:
+                    exposure[factor][direction] += leg_size
+                    break
+        # Extra long leg
+        _el = pos.get("extra_long_leg", "").upper()
+        if _el:
+            _el_side = pos.get("extra_long_side", "buy")
+            _el_dir = "short" if _el_side == "short" else "long"
+            for factor, tickers in FACTOR_MAP.items():
+                if _el in tickers:
+                    exposure[factor][_el_dir] += leg_size
+                    break
+
+    # Calculate net exposure and percentage
+    max_pct = 0
+    for factor in exposure:
+        net = exposure[factor]["long"] - exposure[factor]["short"]
+        pct = abs(net) / total_deployed * 100 if total_deployed > 0 else 0
+        exposure[factor]["net"] = round(net, 2)
+        exposure[factor]["pct"] = round(pct, 1)
+        max_pct = max(max_pct, pct)
+
+    # Neutrality score: 100 = no factor > 10%, 0 = one factor = 100%
+    _FACTOR_NEUTRALITY = max(0, int(100 - max_pct * 2))
+    _FACTOR_EXPOSURE = exposure
+    _FACTOR_LAST_SCAN = datetime.now(timezone.utc)
+    return exposure, _FACTOR_NEUTRALITY
+
+
+def check_factor_alerts(channel_notify=None):
+    """Check if any factor exceeds 30% of deployed capital. Log warnings."""
+    exposure, neutrality = calculate_factor_exposure()
+    alerts = []
+    for factor, data in exposure.items():
+        if data["pct"] > 30:
+            alerts.append(f"{factor}: {data['pct']:.0f}% (net ${data['net']:+,.0f})")
+            log.warning("FACTOR ALERT: %s at %.0f%% of deployed capital (net $%+.0f)",
+                        factor, data["pct"], data["net"])
+    if alerts:
+        _agent_log_event("risk", f"Factor concentration: {', '.join(alerts)}")
+    return alerts
+
+
 def _build_api_risk():
     """Build /api/risk response."""
     return {
@@ -9531,6 +9656,8 @@ def _build_api_risk():
         "pauses": {s: t.strftime("%Y-%m-%d %H:%M UTC") for s, t in _RISK_STATE.get("strategy_pauses", {}).items()},
         "meta_alloc": dict(_META_ALLOC),
         "meta_pnl": {k: v.get("pnl", 0) for k, v in _META_ALLOC_PNL.items()},
+        "factor_exposure": _FACTOR_EXPOSURE,
+        "factor_neutrality": _FACTOR_NEUTRALITY,
     }
 
 
