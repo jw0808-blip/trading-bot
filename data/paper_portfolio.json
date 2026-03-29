@@ -1,4 +1,6 @@
 {
   "cash": 25000.0,
-  "positions": []
+  "positions": [],
+  "trades": [],
+  "pnl": 0.0
 }
