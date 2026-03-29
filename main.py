@@ -4264,14 +4264,22 @@ async def hedge_status_cmd(ctx):
     hedge_positions = [p for p in PAPER_PORTFOLIO.get("positions", [])
                        if p.get("strategy") in ("crash_hedge_put", "crash_hedge_short", "crash_hedge_call_spread")]
 
+    # Options flow
+    _pc = _PUT_CALL_CACHE.get("SPY", {})
+    _pc_ratio = _pc.get("ratio", 0)
+    _pc_signal = _pc.get("signal", "unavailable")
+    _pc_str = f"P/C: {_pc_ratio:.2f} ({_pc_signal})" if _pc.get("available") else "P/C: unavailable"
+
     lines = [
         f"**HEDGE STATUS — VRP Regime Monitor**",
         f"VIX: {vix:.1f} | Market Regime: {regime.get('regime', 'normal').upper()}",
         f"VRP Regime: **{vrp_label}**",
+        f"Options Flow: {_pc_str}",
         f"Last Switch: {vrp.get('last_switch', 'N/A')} | Cycles: {vrp.get('cycle_count', 0)}",
         f"",
         f"**Thresholds:**",
         f"  VIX < 25 → Idle | 25-27 → Buy puts | >= 28 → Sell call spreads | >= 35 → Short SPY",
+        f"  P/C > 1.5 → Panic puts (boost hedge) | P/C < 0.5 → Complacency (market top)",
         f"",
         f"**Open Hedge Positions ({len(hedge_positions)}/{cfg['max_hedges']}):**",
     ]
@@ -11810,11 +11818,18 @@ async def check_crash_hedges(channel):
     if not vix:
         return
 
-    # --- Determine VRP regime ---
+    # --- Options flow: put/call ratio as additional trigger ---
+    _pc_data = options_put_call_ratio("SPY")
+    _pc_ratio = _pc_data.get("ratio", 0) if _pc_data.get("available") else 0
+    _pc_panic = _pc_ratio > 1.5  # Panic put buying → boost hedge urgency
+
+    # --- Determine VRP regime (VIX + options flow) ---
     if vix >= cfg["vrp_vix_threshold"]:
         vrp_regime = "sell_premium"
-    elif vix >= cfg["put_vix_threshold"]:
+    elif vix >= cfg["put_vix_threshold"] or _pc_panic:
         vrp_regime = "buy_puts"
+        if _pc_panic and vix < cfg["put_vix_threshold"]:
+            log.info("VRP: P/C ratio %.2f > 1.5 triggered buy_puts despite VIX=%.1f", _pc_ratio, vix)
     else:
         vrp_regime = "idle"
 
@@ -13255,6 +13270,100 @@ def causal_memory_asset_impact(theme, hours=48):
         pass
 
     return results
+
+
+# OPTIONS FLOW SCANNER — Put/Call ratio from Polygon options chain
+# ---------------------------------------------------------------------------
+_PUT_CALL_CACHE = {}  # {underlying: {"ratio": x, "put_vol": y, "call_vol": z, "signal": str, "ts": datetime}}
+
+
+def options_put_call_ratio(underlying="SPY"):
+    """Fetch options chain from Polygon and calculate put/call volume ratio.
+    Returns dict with ratio, volumes, and signal classification."""
+    now = datetime.now(timezone.utc)
+    cached = _PUT_CALL_CACHE.get(underlying)
+    if cached and (now - cached["ts"]).total_seconds() < 600:
+        return cached
+
+    result = {"ratio": 0, "put_vol": 0, "call_vol": 0, "signal": "unavailable",
+              "available": False, "ts": now}
+    try:
+        from polygon_client import _get_client
+        c = _get_client()
+        if not c:
+            _PUT_CALL_CACHE[underlying] = result
+            return result
+
+        import datetime as _dt_pc
+        # Get options contracts expiring in next 7 days
+        today = now.strftime("%Y-%m-%d")
+        exp_max = (now + _dt_pc.timedelta(days=7)).strftime("%Y-%m-%d")
+
+        put_volume = 0
+        call_volume = 0
+        try:
+            # Fetch put contracts
+            puts = list(c.list_options_contracts(
+                underlying_ticker=underlying, contract_type="put",
+                expiration_date_gte=today, expiration_date_lte=exp_max,
+                limit=100))
+            for p in puts[:50]:
+                try:
+                    snap = c.get_snapshot_option(underlying, p.ticker)
+                    if snap and snap.day:
+                        put_volume += snap.day.volume or 0
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            # Fetch call contracts
+            calls = list(c.list_options_contracts(
+                underlying_ticker=underlying, contract_type="call",
+                expiration_date_gte=today, expiration_date_lte=exp_max,
+                limit=100))
+            for ca in calls[:50]:
+                try:
+                    snap = c.get_snapshot_option(underlying, ca.ticker)
+                    if snap and snap.day:
+                        call_volume += snap.day.volume or 0
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        if call_volume > 0:
+            ratio = put_volume / call_volume
+            if ratio > 1.5:
+                signal = "PANIC_PUTS"
+            elif ratio > 1.2:
+                signal = "ELEVATED_FEAR"
+            elif ratio < 0.5:
+                signal = "EXTREME_COMPLACENCY"
+            elif ratio < 0.7:
+                signal = "COMPLACENT"
+            else:
+                signal = "NORMAL"
+            result = {"ratio": round(ratio, 3), "put_vol": put_volume, "call_vol": call_volume,
+                      "signal": signal, "available": True, "ts": now}
+            log.info("OPTIONS FLOW %s: P/C=%.3f put_vol=%d call_vol=%d → %s",
+                     underlying, ratio, put_volume, call_volume, signal)
+        else:
+            result["signal"] = "no_data"
+
+    except Exception as e:
+        log.warning("OPTIONS FLOW %s error: %s", underlying, e)
+
+    _PUT_CALL_CACHE[underlying] = result
+    return result
+
+
+def get_put_call_ratios():
+    """Get put/call ratios for SPY and QQQ. Returns dict."""
+    spy = options_put_call_ratio("SPY")
+    qqq = options_put_call_ratio("QQQ")
+    return {"SPY": spy, "QQQ": qqq}
 
 
 # VOLATILITY SKEW SCANNER — Put/Call IV analysis for options strategy
