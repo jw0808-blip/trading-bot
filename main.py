@@ -2709,17 +2709,25 @@ async def before_pairs_scan():
     await asyncio.sleep(900)
 
 
+_crypto_pairs_scan_fn = None  # Set after scan_crypto_pairs is defined
+
 @tasks.loop(minutes=5)
 async def crypto_pairs_task():
     """Crypto pairs stat arb scanner — runs every 5 minutes 24/7."""
+    global _crypto_pairs_scan_fn
     try:
-        _scan_fn = globals().get("scan_crypto_pairs")
-        if _scan_fn:
-            fired = await _scan_fn()
+        if _crypto_pairs_scan_fn is None:
+            # Lazy resolve on first call
+            import sys
+            _m = sys.modules.get("__main__")
+            if _m and hasattr(_m, "scan_crypto_pairs"):
+                _crypto_pairs_scan_fn = _m.scan_crypto_pairs
+        if _crypto_pairs_scan_fn:
+            fired = await _crypto_pairs_scan_fn()
             if fired > 0:
                 log.info("CRYPTO PAIRS: %d trades fired this cycle", fired)
         else:
-            log.warning("CRYPTO PAIRS: scan_crypto_pairs not in globals")
+            log.warning("CRYPTO PAIRS: awaiting scan_crypto_pairs init")
     except Exception as e:
         log.warning("CRYPTO PAIRS task error: %s", e)
 
