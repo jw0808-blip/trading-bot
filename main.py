@@ -4393,6 +4393,19 @@ async def next_trades_cmd(ctx):
     except Exception:
         pass
 
+    # 6. Dark pool smart money signals
+    try:
+        _dp_signals = get_darkpool_signals()
+        for s in _dp_signals[:3]:
+            candidates.append({
+                "strategy": "DarkPool",
+                "ticker": s["ticker"],
+                "confidence": s["confidence"],
+                "reason": s["reason"][:45],
+            })
+    except Exception:
+        pass
+
     # Sort by confidence, take top 5
     candidates.sort(key=lambda c: c["confidence"], reverse=True)
     top5 = candidates[:5]
@@ -4416,6 +4429,24 @@ async def next_trades_cmd(ctx):
     else:
         msg += "\nNo opportunities above threshold right now.\n"
     msg += f"\n*Strategies: Pairs, Oracle, Crypto, Funding, Kalshi*"
+    await ctx.send(msg[:1900])
+
+
+@bot.command(name="darkpool")
+async def darkpool_cmd(ctx):
+    """Show last 5 large block trades detected."""
+    blocks = scan_dark_pool()
+    msg = f"**DARK POOL MONITOR** ({len(blocks)} blocks tracked)\n"
+    if blocks:
+        msg += "```\n"
+        msg += f"{'Ticker':6s} {'Side':5s} {'Shares':>10s} {'Notional':>12s} {'Price':>8s}\n"
+        msg += f"{'-'*45}\n"
+        for b in blocks[-5:]:
+            msg += f"{b['ticker']:6s} {b['side']:5s} {b['size']:>10,d} ${b['notional']:>11,.0f} ${b['price']:>7.2f}\n"
+        msg += "```"
+    else:
+        msg += "No large blocks detected yet. Scans market hours.\n"
+    msg += f"\n*Threshold: >10K shares or >$500K notional*"
     await ctx.send(msg[:1900])
 
 
@@ -6193,6 +6224,13 @@ async def alert_scan_task():
                         log.warning("Funding arb %s error: %s", _fname, _fe)
             except Exception as arb_err:
                 log.warning("Funding arb scan error: %s", arb_err)
+            # === DARK POOL MONITOR (large block detection) ===
+            try:
+                _dp_fn = getattr(__import__("sys").modules.get("__main__"), "scan_dark_pool", None)
+                if _dp_fn:
+                    _dp_fn()
+            except Exception:
+                pass
             # === MOMENTUM IGNITION DETECTOR (pump & dump short) ===
             try:
                 _mig_fn = getattr(__import__("sys").modules.get("__main__"), "scan_momentum_ignition", None)
@@ -14162,6 +14200,82 @@ def get_put_call_ratios():
     spy = options_put_call_ratio("SPY")
     qqq = options_put_call_ratio("QQQ")
     return {"SPY": spy, "QQQ": qqq}
+
+
+# ---------------------------------------------------------------------------
+# DARK POOL MONITOR — Large block trade detection via Polygon
+# ---------------------------------------------------------------------------
+_DARKPOOL_TICKERS = ["SPY", "QQQ", "XLE", "UAL", "LMT", "GLD", "NVDA", "AMD", "ADBE", "CRM",
+                     "PFE", "MRK", "XOM", "CVX", "AAL", "RTX", "TLT", "XLF", "SOXX", "SMH"]
+_DARKPOOL_BLOCKS = []  # List of recent large block trades
+_DARKPOOL_LAST_SCAN = None
+
+
+def scan_dark_pool():
+    """Fetch recent large block trades from Polygon. Returns list of block dicts."""
+    global _DARKPOOL_LAST_SCAN
+    now = datetime.now(timezone.utc)
+    # Rate limit: scan every 10 minutes
+    if _DARKPOOL_LAST_SCAN and (now - _DARKPOOL_LAST_SCAN).total_seconds() < 600:
+        return _DARKPOOL_BLOCKS
+
+    try:
+        from polygon_client import _get_client
+        c = _get_client()
+        if not c:
+            return _DARKPOOL_BLOCKS
+
+        new_blocks = []
+        for ticker in _DARKPOOL_TICKERS[:10]:  # Limit API calls
+            try:
+                trades = list(c.list_trades(ticker, limit=20, order="desc",
+                                            sort="timestamp"))
+                for t in trades:
+                    size = t.size if hasattr(t, 'size') else 0
+                    price = t.price if hasattr(t, 'price') else 0
+                    notional = size * price
+                    # Large block: >10,000 shares or >$500K
+                    if size >= 10000 or notional >= 500000:
+                        block = {
+                            "ticker": ticker, "size": size, "price": round(price, 2),
+                            "notional": round(notional, 0),
+                            "side": "BUY" if hasattr(t, 'conditions') and t.conditions and 12 in t.conditions else "SELL",
+                            "ts": str(t.sip_timestamp)[:19] if hasattr(t, 'sip_timestamp') else "",
+                        }
+                        # Dedup by ticker+size+price
+                        if not any(b["ticker"] == ticker and b["size"] == size and b["price"] == price
+                                   for b in _DARKPOOL_BLOCKS):
+                            new_blocks.append(block)
+            except Exception:
+                pass
+
+        if new_blocks:
+            _DARKPOOL_BLOCKS.extend(new_blocks)
+            # Keep last 50
+            while len(_DARKPOOL_BLOCKS) > 50:
+                _DARKPOOL_BLOCKS.pop(0)
+            log.info("DARKPOOL: %d new large blocks detected", len(new_blocks))
+
+        _DARKPOOL_LAST_SCAN = now
+    except Exception as e:
+        log.warning("DARKPOOL scan error: %s", e)
+    return _DARKPOOL_BLOCKS
+
+
+def get_darkpool_signals():
+    """Get smart money signals from recent dark pool blocks for !next-trades."""
+    signals = []
+    for block in _DARKPOOL_BLOCKS[-10:]:
+        if block["notional"] >= 500000:
+            direction = "LONG" if block["side"] == "BUY" else "SHORT"
+            signals.append({
+                "ticker": block["ticker"],
+                "direction": direction,
+                "notional": block["notional"],
+                "confidence": 70,
+                "reason": f"Dark pool {block['side']} ${block['notional']:,.0f} ({block['size']:,} shares)",
+            })
+    return signals
 
 
 # VOLATILITY SKEW SCANNER — Put/Call IV analysis for options strategy
