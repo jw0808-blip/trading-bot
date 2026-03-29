@@ -5791,6 +5791,17 @@ async def auto_paper_execute(channel, opp):
         if not any(cat in opp.get("market","").lower() for cat in _cats):
             log.info("FILTERED: non-catalyst pred market (%s)", opp.get("market","")[:40])
             return False
+    # === PREDICTION MARKET EXPOSURE CAP (20% of cash) ===
+    _plat_lower = opp.get("platform", "").lower()
+    if _plat_lower in ("polymarket", "kalshi", "predictit"):
+        _pred_exposure = sum(p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", [])
+                            if p.get("strategy") == "prediction")
+        _pred_cap = PAPER_PORTFOLIO.get("cash", 25000) * 0.20
+        if _pred_exposure >= _pred_cap:
+            log.info("PRED CAP: exposure $%.0f >= 20%% cap $%.0f — blocking new entry (%s)",
+                     _pred_exposure, _pred_cap, opp.get("market", "")[:35])
+            return False
+
     # === SQLITE DEDUP (1 per market, survives restarts) ===
     _raw_mkt = opp.get("market", "")[:60]
     _mkey = _raw_mkt
