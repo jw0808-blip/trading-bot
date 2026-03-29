@@ -9,6 +9,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
 COPY ai_logger.py .
+COPY polygon_client.py .
 COPY dashboard/ dashboard/
 
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 \
