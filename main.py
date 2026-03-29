@@ -9719,6 +9719,35 @@ FUNDING_ARB_CONFIG = {
 # Latest funding rates cache: {source_asset: {"phemex": rate, "binance": rate, "ts": datetime}}
 _FUNDING_RATES_CACHE = {}
 
+# Crypto pairs config (defined early for command access)
+CRYPTO_PAIRS_CONFIG = {
+    "enabled": True,
+    "seed": [("BTC", "ETH"), ("SOL", "AVAX"), ("BNB", "ETH")],
+    "lookback_days": 30,
+    "zscore_entry": 1.1,
+    "zscore_exit": 0.0,
+    "mc_min_prob": 0.60,
+    "ttl_hours": 48,
+    "size_pct": 0.015,
+    "max_positions": 2,
+    "scan_interval_min": 5,
+}
+_CRYPTO_PAIRS_CACHE = {}
+
+# Momentum ignition config (defined early for command access)
+MOMENTUM_IGNITION_CONFIG = {
+    "enabled": True,
+    "volume_spike_mult": 5.0,
+    "price_spike_pct": 15.0,
+    "size_pct": 0.01,
+    "stop_loss_pct": 0.20,
+    "take_profit_pct": 0.10,
+    "ttl_hours": 2,
+    "max_positions": 2,
+    "min_volume_usd": 5_000_000,
+}
+_MIG_CACHE = {}
+
 
 def _fetch_phemex_funding_rate(asset):
     """Fetch funding rate from Phemex. Returns rate as decimal or 0."""
@@ -15089,20 +15118,8 @@ REGIME_CACHE_TTL = 300
 
 # ═══════════════════════════════════════════════════════════════════
 # CRYPTO PAIRS STAT ARB — Z-score mean reversion on crypto pairs 24/7
+# (Config defined earlier near FUNDING_ARB_CONFIG for command access)
 # ═══════════════════════════════════════════════════════════════════
-CRYPTO_PAIRS_CONFIG = {
-    "enabled": True,
-    "seed": [("BTC", "ETH"), ("SOL", "AVAX"), ("BNB", "ETH")],
-    "lookback_days": 30,
-    "zscore_entry": 1.1,
-    "zscore_exit": 0.0,
-    "mc_min_prob": 0.60,
-    "ttl_hours": 48,
-    "size_pct": 0.015,       # 1.5% of portfolio per leg
-    "max_positions": 2,
-    "scan_interval_min": 5,
-}
-_CRYPTO_PAIRS_CACHE = {}  # {pair_key: {"corr": x, "zscore": y, "prices_a": [...], "prices_b": [...], "ts": datetime}}
 
 
 def _fetch_crypto_price_history(symbol, days=30):
@@ -15285,20 +15302,8 @@ async def scan_crypto_pairs():
 
 # ═══════════════════════════════════════════════════════════════════
 # MOMENTUM IGNITION DETECTOR — Short pump & dump patterns
-# Volume spike >5x normal + price up >15% in 30min → short on Phemex
+# (Config defined earlier near FUNDING_ARB_CONFIG for command access)
 # ═══════════════════════════════════════════════════════════════════
-MOMENTUM_IGNITION_CONFIG = {
-    "enabled": True,
-    "volume_spike_mult": 5.0,    # 5x normal volume
-    "price_spike_pct": 15.0,     # 15% up in short window
-    "size_pct": 0.01,            # 1% of portfolio
-    "stop_loss_pct": 0.20,       # 20% stop loss
-    "take_profit_pct": 0.10,     # 10% target reversion
-    "ttl_hours": 2,              # 2h max hold
-    "max_positions": 2,
-    "min_volume_usd": 5_000_000, # Minimum $5M 24h volume
-}
-_MIG_CACHE = {}  # {symbol: {"last_check": datetime, "flagged": bool}}
 
 
 async def scan_momentum_ignition():
