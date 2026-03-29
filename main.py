@@ -4134,36 +4134,6 @@ async def status_cmd(ctx):
         await ctx.send(m2)
 
 
-@bot.command(name="risk-status")
-async def risk_status_cmd(ctx):
-    """Show factor exposure map, neutrality score, and risk alerts."""
-    exposure, neutrality = calculate_factor_exposure()
-    total_deployed = sum(p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
-    msg = f"**RISK STATUS — Factor Exposure Map**\n"
-    msg += f"Deployed: ${total_deployed:,.0f} | Neutrality: {neutrality}/100\n"
-    msg += "```\n"
-    msg += f"{'Factor':10s} {'Long':>8s} {'Short':>8s} {'Net':>9s} {'%':>6s} {'Status'}\n"
-    msg += f"{'-'*50}\n"
-    for factor in FACTOR_MAP:
-        data = exposure.get(factor, {"long": 0, "short": 0, "net": 0, "pct": 0})
-        status = "ALERT" if data["pct"] > 30 else "watch" if data["pct"] > 20 else "ok"
-        msg += (f"{factor:10s} ${data['long']:>7,.0f} ${data['short']:>7,.0f} "
-                f"${data['net']:>+8,.0f} {data['pct']:>5.1f}% {status}\n")
-    msg += "```\n"
-    # Corr flags
-    corr_flags = _RISK_STATE.get("corr_flags", [])
-    if corr_flags:
-        msg += f"**Correlation Flags ({len(corr_flags)}):**\n"
-        for t1, t2, c in corr_flags[:5]:
-            msg += f"  {t1}/{t2} corr={c:.2f}\n"
-    # Strategy pauses
-    pauses = _RISK_STATE.get("strategy_pauses", {})
-    if pauses:
-        msg += f"\n**Paused Strategies:** {', '.join(pauses.keys())}"
-    msg += f"\n\n*Factor alert threshold: 30% of deployed capital*"
-    await ctx.send(msg[:1900])
-
-
 @bot.command(name="journal")
 async def journal_cmd(ctx, count: int = 10):
     """Show last N trade journal entries. Usage: !journal or !journal 5"""
@@ -5401,6 +5371,23 @@ async def risk_status_cmd(ctx):
     msg += f"Drawdown limit: ${_RISK_STATE['drawdown_limit']}/strategy/day\n"
     msg += "```"
     await ctx.send(msg)
+
+    # Factor exposure (second message)
+    try:
+        exposure, neutrality = calculate_factor_exposure()
+        total_deployed = sum(p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+        msg2 = f"**Factor Exposure** | Deployed: ${total_deployed:,.0f} | Neutrality: {neutrality}/100\n```\n"
+        msg2 += f"{'Factor':10s} {'Long':>8s} {'Short':>8s} {'Net':>9s} {'%':>6s} Status\n"
+        msg2 += f"{'-'*50}\n"
+        for factor in FACTOR_MAP:
+            data = exposure.get(factor, {"long": 0, "short": 0, "net": 0, "pct": 0})
+            status = "ALERT" if data["pct"] > 30 else "watch" if data["pct"] > 20 else "ok"
+            msg2 += (f"{factor:10s} ${data['long']:>7,.0f} ${data['short']:>7,.0f} "
+                     f"${data['net']:>+8,.0f} {data['pct']:>5.1f}% {status}\n")
+        msg2 += "```"
+        await ctx.send(msg2)
+    except Exception:
+        pass
 
 
 @bot.command(name="morning")
