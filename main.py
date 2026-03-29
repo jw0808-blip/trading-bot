@@ -4711,6 +4711,19 @@ async def hedge_status_cmd(ctx):
     else:
         lines.append("  No active hedges")
 
+    # UVXY VIX Fade position
+    _vf_pos = [p for p in PAPER_PORTFOLIO.get("positions", []) if p.get("strategy") == "vix_fade"]
+    if _vf_pos:
+        p = _vf_pos[0]
+        _vf_entry = p.get("entry_price", 0)
+        _vf_est_profit = _vf_entry * 0.30 * p.get("shares", 0) if _vf_entry > 0 else 0  # ~30% drop if VIX→20
+        lines.append(f"\n**VIX Fade (UVXY Short):**")
+        lines.append(f"  Entry: ${_vf_entry:.2f} | Shares: {p.get('shares', 0)} | Size: ${p.get('cost', 0):.0f}")
+        lines.append(f"  Stop: ${p.get('stop_price', 0):.2f} | TP: ${p.get('target_price', 0):.2f}")
+        lines.append(f"  Est profit if VIX→20: ${_vf_est_profit:.0f}")
+    elif vix > 30:
+        lines.append(f"\n**VIX Fade:** VIX={vix:.1f} > 30 — UVXY short will open at market open")
+
     await ctx.send("\n".join(lines))
 
 
@@ -12474,6 +12487,69 @@ async def check_crash_hedges(channel):
                     f"Expiry: {expiry.strftime('%m/%d')} ({cfg['vrp_dte']}DTE)")
             except Exception:
                 pass
+        # Also open UVXY short when VIX > 30 (backwardation fade)
+        _uvxy_open = any(p.get("strategy") == "vix_fade" for p in PAPER_PORTFOLIO.get("positions", []))
+        if not _uvxy_open and vix > 30:
+            try:
+                _uvxy_size = portfolio_value * 0.01  # 1% of portfolio
+                _uvxy_hdrs = {"APCA-API-KEY-ID": ALPACA_API_KEY,
+                              "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+                              "Content-Type": "application/json"}
+                # Get UVXY price
+                _uvxy_q = requests.get("https://data.alpaca.markets/v2/stocks/UVXY/quotes/latest",
+                                       headers=_uvxy_hdrs, timeout=5)
+                _uvxy_px = 0
+                if _uvxy_q.status_code == 200:
+                    _uq = _uvxy_q.json().get("quote", {})
+                    _uvxy_px = float(_uq.get("ap", 0) or _uq.get("bp", 0) or 0)
+                if _uvxy_px > 0 and is_market_open():
+                    import math as _uvxy_math
+                    _uvxy_shares = _uvxy_math.floor(_uvxy_size / _uvxy_px)
+                    if _uvxy_shares >= 1:
+                        _uvxy_body = {"symbol": "UVXY", "qty": str(_uvxy_shares),
+                                      "side": "sell", "type": "market", "time_in_force": "day"}
+                        _uvxy_r = requests.post(f"{ALPACA_BASE_URL}/v2/orders",
+                                                json=_uvxy_body, headers=_uvxy_hdrs, timeout=10)
+                        if _uvxy_r.status_code in (200, 201):
+                            _uvxy_oid = _uvxy_r.json().get("id", "unknown")
+                            _uvxy_stop = round(_uvxy_px * 1.10, 2)
+                            _uvxy_tp = round(_uvxy_px * 0.80, 2)
+                            _uvxy_pos = {
+                                "market": f"VIX_FADE:UVXY SHORT",
+                                "side": "SHORT", "shares": _uvxy_shares,
+                                "entry_price": _uvxy_px, "cost": _uvxy_size, "value": _uvxy_size,
+                                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                                "platform": "Alpaca", "ev": (vix - 20) / 100,
+                                "strategy": "vix_fade",
+                                "stop_price": _uvxy_stop, "target_price": _uvxy_tp,
+                                "order_id": _uvxy_oid,
+                            }
+                            PAPER_PORTFOLIO["positions"].append(_uvxy_pos)
+                            PAPER_PORTFOLIO["cash"] -= _uvxy_size
+                            db_log_paper_trade(_uvxy_pos)
+                            db_open_position(
+                                market_id="VIX_FADE:UVXY SHORT", platform="Alpaca",
+                                strategy="vix_fade", direction="SHORT",
+                                size_usd=_uvxy_size, shares=_uvxy_shares,
+                                entry_price=_uvxy_px, stop_price=_uvxy_stop,
+                                target_price=_uvxy_tp,
+                                metadata={"vix_at_entry": vix, "uvxy_price": _uvxy_px,
+                                          "order_id": _uvxy_oid})
+                            log.info("VIX FADE: SHORT UVXY %d shares at $%.2f (VIX=%.1f) stop=$%.2f tp=$%.2f",
+                                     _uvxy_shares, _uvxy_px, vix, _uvxy_stop, _uvxy_tp)
+                            if channel:
+                                try:
+                                    await channel.send(
+                                        f"**VIX FADE — SHORT UVXY**\n"
+                                        f"VIX: {vix:.1f} | UVXY: ${_uvxy_px:.2f} | Shares: {_uvxy_shares}\n"
+                                        f"Stop: ${_uvxy_stop:.2f} (+10%) | TP: ${_uvxy_tp:.2f} (-20%)\n"
+                                        f"Size: ${_uvxy_size:.0f} | Exit: VIX < 25 or TP/SL")
+                                except Exception:
+                                    pass
+                        else:
+                            log.warning("VIX FADE: UVXY short failed: %d %s", _uvxy_r.status_code, _uvxy_r.text[:100])
+            except Exception as _vf_err:
+                log.warning("VIX FADE error: %s", _vf_err)
         return
 
     # === VRP REGIME: BUY PUTS (VIX 25-27) ===
@@ -12823,6 +12899,34 @@ async def run_exit_manager(channel=None):
                         pass
                 if not exit_reason and age_hours > EXIT_CONFIG.get("pairs_ttl_days", 7) * 24:
                     exit_reason = "TTL: pairs 7d"
+            elif strategy == "vix_fade":
+                # UVXY short: exit when VIX < 25, or TP/SL hit
+                _vf_vix = get_regime("equities").get("vix") or 30
+                _vf_entry = pos.get("entry_price", 0)
+                _vf_stop = pos.get("stop_price", 0)
+                _vf_tp = pos.get("target_price", 0)
+                if _vf_vix < 25:
+                    exit_reason = f"VIX REVERT: VIX={_vf_vix:.1f} < 25"
+                else:
+                    # Check UVXY live price
+                    try:
+                        _vf_q = requests.get("https://data.alpaca.markets/v2/stocks/UVXY/quotes/latest",
+                                             headers={"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}, timeout=5)
+                        if _vf_q.status_code == 200:
+                            _vf_px = float(_vf_q.json().get("quote", {}).get("bp", 0) or 0)
+                            if _vf_px > 0 and _vf_entry > 0:
+                                if _vf_stop > 0 and _vf_px >= _vf_stop:
+                                    exit_reason = f"STOP: UVXY ${_vf_px:.2f} >= ${_vf_stop:.2f}"
+                                elif _vf_tp > 0 and _vf_px <= _vf_tp:
+                                    exit_reason = f"TP: UVXY ${_vf_px:.2f} <= ${_vf_tp:.2f}"
+                                else:
+                                    _vf_pnl = (_vf_entry - _vf_px) / _vf_entry * 100
+                                    log.info("VIX FADE POS: UVXY entry=$%.2f live=$%.2f pnl=%+.1f%% VIX=%.1f",
+                                             _vf_entry, _vf_px, _vf_pnl, _vf_vix)
+                    except Exception:
+                        pass
+                if not exit_reason and age_hours > 168:  # 7 day max hold
+                    exit_reason = "TTL: vix_fade 7d"
             elif strategy == "momentum_ignition":
                 # Short pump exit: stop loss, take profit, or 2h TTL
                 _entry = pos.get("entry_price", 0)
