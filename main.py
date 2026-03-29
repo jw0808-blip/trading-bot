@@ -6163,6 +6163,15 @@ async def alert_scan_task():
                         log.warning("Funding arb %s error: %s", _fname, _fe)
             except Exception as arb_err:
                 log.warning("Funding arb scan error: %s", arb_err)
+            # === MOMENTUM IGNITION DETECTOR (pump & dump short) ===
+            try:
+                _mig_fn = getattr(__import__("sys").modules.get("__main__"), "scan_momentum_ignition", None)
+                if _mig_fn:
+                    _mig_fired = await _mig_fn()
+                    if _mig_fired and _mig_fired > 0:
+                        log.info("MOMENTUM IGNITION: %d shorts fired", _mig_fired)
+            except Exception as _mig_err:
+                log.warning("Momentum ignition error: %s", _mig_err)
             # === CRYPTO PAIRS STAT ARB (runs 24/7, every other cycle ~10min) ===
             try:
                 _cp_fn = getattr(__import__("sys").modules.get("__main__"), "scan_crypto_pairs", None)
@@ -12785,6 +12794,24 @@ async def run_exit_manager(channel=None):
                         pass
                 if not exit_reason and age_hours > EXIT_CONFIG.get("pairs_ttl_days", 7) * 24:
                     exit_reason = "TTL: pairs 7d"
+            elif strategy == "momentum_ignition":
+                # Short pump exit: stop loss, take profit, or 2h TTL
+                _entry = pos.get("entry_price", 0)
+                _stop = pos.get("stop_price", 0)
+                _tp = pos.get("target_price", 0)
+                _ticker = pos.get("market", "").replace("MIG_SHORT:", "")
+                if _entry > 0 and _ticker:
+                    _live = _fetch_crypto_spot_price(_ticker)
+                    if _live > 0:
+                        if _stop > 0 and _live >= _stop:
+                            exit_reason = f"STOP LOSS: {_ticker} ${_live:.2f} >= ${_stop:.2f}"
+                        elif _tp > 0 and _live <= _tp:
+                            exit_reason = f"TAKE PROFIT: {_ticker} ${_live:.2f} <= ${_tp:.2f}"
+                        else:
+                            _mig_pnl = (_entry - _live) / _entry * 100
+                            log.info("MIG POS: SHORT %s entry=$%.2f live=$%.2f pnl=%+.1f%%", _ticker, _entry, _live, _mig_pnl)
+                if not exit_reason and age_hours > MOMENTUM_IGNITION_CONFIG["ttl_hours"]:
+                    exit_reason = f"TTL: MIG {MOMENTUM_IGNITION_CONFIG['ttl_hours']}h"
             elif strategy == "crypto_pairs":
                 # Z-score reversion exit or TTL
                 _cp_a = pos.get("long_leg", "")
@@ -15253,6 +15280,132 @@ async def scan_crypto_pairs():
         except Exception as e:
             log.warning("CRYPTO PAIRS execution error %s/%s: %s", sym_a, sym_b, e)
 
+    return fired
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MOMENTUM IGNITION DETECTOR — Short pump & dump patterns
+# Volume spike >5x normal + price up >15% in 30min → short on Phemex
+# ═══════════════════════════════════════════════════════════════════
+MOMENTUM_IGNITION_CONFIG = {
+    "enabled": True,
+    "volume_spike_mult": 5.0,    # 5x normal volume
+    "price_spike_pct": 15.0,     # 15% up in short window
+    "size_pct": 0.01,            # 1% of portfolio
+    "stop_loss_pct": 0.20,       # 20% stop loss
+    "take_profit_pct": 0.10,     # 10% target reversion
+    "ttl_hours": 2,              # 2h max hold
+    "max_positions": 2,
+    "min_volume_usd": 5_000_000, # Minimum $5M 24h volume
+}
+_MIG_CACHE = {}  # {symbol: {"last_check": datetime, "flagged": bool}}
+
+
+async def scan_momentum_ignition():
+    """Scan Binance for pump & dump patterns. Short on extreme spikes."""
+    cfg = MOMENTUM_IGNITION_CONFIG
+    if not cfg["enabled"]:
+        return 0
+
+    # Count open ignition positions
+    mig_count = sum(1 for p in PAPER_PORTFOLIO.get("positions", [])
+                    if p.get("strategy") == "momentum_ignition")
+    if mig_count >= cfg["max_positions"]:
+        return 0
+
+    fired = 0
+    try:
+        r = requests.get("https://api.binance.com/api/v3/ticker/24hr", timeout=10)
+        if r.status_code != 200:
+            return 0
+
+        now = datetime.now(timezone.utc)
+        portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
+            p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+
+        for t in r.json():
+            if mig_count + fired >= cfg["max_positions"]:
+                break
+            sym_raw = t.get("symbol", "")
+            if not sym_raw.endswith("USDT"):
+                continue
+            base = sym_raw.replace("USDT", "")
+            if len(base) > 5 or base in CRYPTO_MEME_BLACKLIST:
+                continue
+
+            px = float(t.get("lastPrice", 0) or 0)
+            chg = float(t.get("priceChangePercent", 0) or 0)
+            vol_usd = float(t.get("quoteVolume", 0) or 0)
+            vol_prev = float(t.get("volume", 0) or 0)
+            open_px = float(t.get("openPrice", 0) or 0)
+
+            if vol_usd < cfg["min_volume_usd"] or px < 1.0:
+                continue
+
+            # Check for pump pattern: >15% up with volume spike
+            if chg < cfg["price_spike_pct"]:
+                continue
+
+            # Volume spike: compare to weighted avg (approximate with 24h volume / expected)
+            # Binance gives weightedAvgPrice which we can use to estimate normal volume
+            weighted_avg = float(t.get("weightedAvgPrice", 0) or 0)
+            if weighted_avg > 0 and open_px > 0:
+                # Price moved >15% but volume is concentrated — likely pump
+                price_deviation = (px - weighted_avg) / weighted_avg
+                if price_deviation > 0.10:  # Current price >10% above weighted average
+                    # This is a pump candidate
+                    pass
+                else:
+                    continue
+            else:
+                continue
+
+            market_id = f"MIG_SHORT:{base}"
+            # Dedup
+            if any(p.get("market") == market_id for p in PAPER_PORTFOLIO.get("positions", [])):
+                continue
+
+            leg_size = portfolio_value * cfg["size_pct"]
+            log.info("MOMENTUM IGNITION: %s price=$%.2f chg=%+.1f%% vol=$%.0fM → SHORT",
+                     base, px, chg, vol_usd / 1e6)
+
+            # Execute short on Phemex perp
+            try:
+                _ok, _msg, _oid = await execute_phemex_perp_short(base, leg_size)
+                if not _ok:
+                    log.warning("MIG SHORT FAILED: %s %s", base, _msg[:80])
+                    continue
+
+                stop_px = round(px * (1 + cfg["stop_loss_pct"]), 2)
+                tp_px = round(px * (1 - cfg["take_profit_pct"]), 2)
+                _pos = {
+                    "market": market_id,
+                    "side": f"SHORT {base}", "shares": 1,
+                    "entry_price": px, "cost": leg_size, "value": leg_size,
+                    "timestamp": now.strftime("%Y-%m-%d %H:%M UTC"),
+                    "platform": "Phemex", "ev": chg / 100,
+                    "strategy": "momentum_ignition",
+                    "stop_price": stop_px, "target_price": tp_px,
+                    "perp_order_id": _oid or "",
+                    "price_change_pct": chg,
+                }
+                PAPER_PORTFOLIO["positions"].append(_pos)
+                PAPER_PORTFOLIO["cash"] -= leg_size
+                db_log_paper_trade(_pos)
+                db_open_position(
+                    market_id=market_id, platform="Phemex", strategy="momentum_ignition",
+                    direction="SHORT", size_usd=leg_size, shares=1, entry_price=px,
+                    stop_price=stop_px, target_price=tp_px,
+                    metadata={"ticker": base, "chg_pct": chg, "vol_usd": vol_usd,
+                              "stop": stop_px, "tp": tp_px, "perp_oid": _oid or ""},
+                )
+                fired += 1
+                log.info("MIG TRADE: SHORT %s at $%.2f | stop=$%.2f tp=$%.2f | size=$%.0f",
+                         base, px, stop_px, tp_px, leg_size)
+            except Exception as _me:
+                log.warning("MIG execution error %s: %s", base, _me)
+    except Exception as e:
+        log.warning("Momentum ignition scan error: %s", e)
     return fired
 
 
