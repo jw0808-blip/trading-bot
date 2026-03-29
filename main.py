@@ -4593,7 +4593,20 @@ async def next_trades_cmd(ctx):
     except Exception:
         pass
 
-    # 6. Dark pool smart money signals
+    # 6. Unusual options activity
+    try:
+        for _uop in _UNUSUAL_OPTIONS[-5:]:
+            _uop_dir = "CALL" if _uop["type"] == "call" else "PUT"
+            candidates.append({
+                "strategy": "Options",
+                "ticker": _uop["ticker"],
+                "confidence": 75,
+                "reason": f"Unusual {_uop_dir} vol={_uop['volume']:,} V/OI={_uop['vol_oi_ratio']:.0f}x ${_uop['notional']:,.0f}",
+            })
+    except Exception:
+        pass
+
+    # 7. Dark pool smart money signals
     try:
         _dp_signals = get_darkpool_signals()
         for s in _dp_signals[:3]:
@@ -4629,6 +4642,25 @@ async def next_trades_cmd(ctx):
     else:
         msg += "\nNo opportunities above threshold right now.\n"
     msg += f"\n*Strategies: Pairs, Oracle, Crypto, Funding, Kalshi*"
+    await ctx.send(msg[:1900])
+
+
+@bot.command(name="options-flow")
+async def options_flow_cmd(ctx):
+    """Show last 10 unusual options prints."""
+    prints = scan_unusual_options()
+    msg = f"**UNUSUAL OPTIONS ACTIVITY** ({len(prints)} prints tracked)\n"
+    if prints:
+        msg += "```\n"
+        msg += f"{'Ticker':6s} {'Type':5s} {'Vol':>8s} {'OI':>8s} {'V/OI':>6s} {'$':>10s}\n"
+        msg += f"{'-'*48}\n"
+        for p in prints[-10:]:
+            msg += (f"{p['ticker']:6s} {p['type']:5s} {p['volume']:>8,d} {p['oi']:>8,d} "
+                    f"{p['vol_oi_ratio']:>5.0f}x ${p['notional']:>9,.0f}\n")
+        msg += "```"
+    else:
+        msg += "No unusual prints detected. Scans every 15min during market hours.\n"
+    msg += f"\n*Threshold: vol > 10x open interest*"
     await ctx.send(msg[:1900])
 
 
@@ -6570,6 +6602,27 @@ async def alert_scan_task():
                 _etf_fn = getattr(__import__("sys").modules.get("__main__"), "scan_etf_arb", None)
                 if _etf_fn:
                     await _etf_fn()
+            except Exception:
+                pass
+            # === UNUSUAL OPTIONS ACTIVITY ===
+            try:
+                _uo_fn = getattr(__import__("sys").modules.get("__main__"), "scan_unusual_options", None)
+                if _uo_fn:
+                    _uo_prints = _uo_fn()
+                    if _uo_prints and len(_uo_prints) > 0:
+                        # Alert on new prints
+                        _recent = [p for p in _uo_prints if p.get("ts") == datetime.now(timezone.utc).strftime("%H:%M")]
+                        if _recent:
+                            _uo_ch = bot.get_channel(int(DISCORD_CHANNEL_ID)) if DISCORD_CHANNEL_ID else None
+                            if _uo_ch:
+                                for _up in _recent[:2]:
+                                    try:
+                                        await _uo_ch.send(
+                                            f"**UNUSUAL OPTIONS** {_up['ticker']} {_up['type'].upper()}\n"
+                                            f"Vol: {_up['volume']:,} | OI: {_up['oi']:,} | "
+                                            f"V/OI: {_up['vol_oi_ratio']:.0f}x | ${_up['notional']:,.0f}")
+                                    except Exception:
+                                        pass
             except Exception:
                 pass
             # === DARK POOL MONITOR (large block detection) ===
@@ -14717,6 +14770,72 @@ def get_darkpool_signals():
                 "reason": f"Dark pool {block['side']} ${block['notional']:,.0f} ({block['size']:,} shares)",
             })
     return signals
+
+
+# ---------------------------------------------------------------------------
+# OPTIONS UNUSUAL ACTIVITY SCANNER — Large prints via Polygon
+# ---------------------------------------------------------------------------
+_UNUSUAL_OPTIONS = []  # Last N unusual prints
+_UNUSUAL_OPTIONS_LAST_SCAN = None
+_UNUSUAL_OPTIONS_TICKERS = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL",
+                             "TSLA", "AMD", "XLE", "XLF", "GLD", "TLT", "LMT", "UAL"]
+
+
+def scan_unusual_options():
+    """Scan for unusual options activity via Polygon. Returns list of unusual prints."""
+    global _UNUSUAL_OPTIONS_LAST_SCAN
+    now = datetime.now(timezone.utc)
+    if _UNUSUAL_OPTIONS_LAST_SCAN and (now - _UNUSUAL_OPTIONS_LAST_SCAN).total_seconds() < 900:
+        return _UNUSUAL_OPTIONS  # 15-min cache
+    if not is_market_open():
+        return _UNUSUAL_OPTIONS
+
+    try:
+        from polygon_client import _get_client
+        c = _get_client()
+        if not c:
+            return _UNUSUAL_OPTIONS
+
+        new_prints = []
+        for ticker in _UNUSUAL_OPTIONS_TICKERS[:8]:  # Limit API calls
+            try:
+                # Get options contracts for this ticker
+                contracts = list(c.list_options_contracts(
+                    underlying_ticker=ticker, limit=20,
+                    expiration_date_gte=now.strftime("%Y-%m-%d")))
+                for contract in contracts[:10]:
+                    try:
+                        snap = c.get_snapshot_option(ticker, contract.ticker)
+                        if not snap or not snap.day:
+                            continue
+                        vol = snap.day.volume or 0
+                        oi = snap.open_interest or 0
+                        last_px = snap.last_trade.price if snap.last_trade else 0
+                        # Unusual: volume > 10x open interest OR single trade > $500K notional
+                        if oi > 0 and vol > oi * 10:
+                            notional = vol * last_px * 100
+                            new_prints.append({
+                                "ticker": ticker, "contract": contract.ticker[:25],
+                                "volume": vol, "oi": oi, "vol_oi_ratio": round(vol / max(oi, 1), 1),
+                                "notional": round(notional, 0), "price": round(last_px, 2),
+                                "type": "call" if "C" in contract.ticker[-9:-8] else "put",
+                                "ts": now.strftime("%H:%M"),
+                            })
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        if new_prints:
+            _UNUSUAL_OPTIONS.extend(new_prints)
+            while len(_UNUSUAL_OPTIONS) > 30:
+                _UNUSUAL_OPTIONS.pop(0)
+            log.info("UNUSUAL OPTIONS: %d new prints detected", len(new_prints))
+
+        _UNUSUAL_OPTIONS_LAST_SCAN = now
+    except Exception as e:
+        log.warning("UNUSUAL OPTIONS scan error: %s", e)
+    return _UNUSUAL_OPTIONS
 
 
 # VOLATILITY SKEW SCANNER — Put/Call IV analysis for options strategy
