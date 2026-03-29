@@ -10400,8 +10400,20 @@ _GEO_ESCALATION_KEYWORDS = [
 ]
 
 
+# Polygon tickers mapped to themes for real-time news
+_POLYGON_THEME_TICKERS = {
+    "fed": ["SPY", "TLT", "XLF"],
+    "iran": ["XLE", "USO", "GLD"],
+    "tariff": ["EEM", "FXI", "SPY"],
+    "recession": ["SPY", "TLT", "GLD"],
+    "china": ["FXI", "BABA", "TSM"],
+    "ukraine": ["LMT", "RTX", "GLD"],
+    "taiwan": ["TSM", "SMH", "SOXX"],
+}
+
+
 def _intel_fetch_headlines():
-    """Meteorologist Agent: fetch top headlines for each Oracle theme via Google News RSS.
+    """Meteorologist Agent: fetch headlines via Polygon.io (primary) + Google News RSS (fallback).
     Stores in rolling 2-hour memory. Returns total headlines fetched."""
     import xml.etree.ElementTree as ET
     now = datetime.now(timezone.utc)
@@ -10411,29 +10423,51 @@ def _intel_fetch_headlines():
     for theme, queries in _INTEL_THEMES.items():
         if theme not in _INTEL_HEADLINE_MEMORY:
             _INTEL_HEADLINE_MEMORY[theme] = []
-
         # Prune old entries
         _INTEL_HEADLINE_MEMORY[theme] = [
             (t, h) for t, h in _INTEL_HEADLINE_MEMORY[theme] if t > cutoff]
 
-        # Fetch headlines for first query (rotate could be added later)
-        query = queries[0]
+        existing_titles = {h.lower() for _, h in _INTEL_HEADLINE_MEMORY[theme]}
+        polygon_fetched = 0
+
+        # Primary: Polygon.io news for theme-related tickers
         try:
-            url = f"https://news.google.com/rss/search?q={query.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
-            r = requests.get(url, timeout=8, headers={"User-Agent": "TraderJoes/1.0"})
-            if r.status_code == 200:
-                root = ET.fromstring(r.content)
-                existing_titles = {h.lower() for _, h in _INTEL_HEADLINE_MEMORY[theme]}
-                for item in root.findall(".//item")[:10]:
-                    title_el = item.find("title")
-                    if title_el is not None and title_el.text:
-                        title_text = title_el.text.strip()
-                        if title_text.lower() not in existing_titles:
-                            _INTEL_HEADLINE_MEMORY[theme].append((now, title_text))
+            from polygon_client import get_news as _poly_news
+            poly_tickers = _POLYGON_THEME_TICKERS.get(theme, [])
+            for ticker in poly_tickers[:2]:
+                articles = _poly_news(ticker=ticker, limit=5)
+                for a in articles:
+                    title_text = a.get("title", "").strip()
+                    if title_text and title_text.lower() not in existing_titles:
+                        # Check if headline is relevant to theme
+                        _tl = title_text.lower()
+                        _theme_kws = [q.split()[0].lower() for q in queries] + [theme.lower()]
+                        if any(kw in _tl for kw in _theme_kws) or theme in ("fed", "recession"):
+                            _INTEL_HEADLINE_MEMORY[theme].append((now, title_text + f" - {a.get('source', '')}"))
                             existing_titles.add(title_text.lower())
                             total += 1
-        except Exception as e:
-            log.warning("INTEL fetch %s: %s", theme, e)
+                            polygon_fetched += 1
+        except Exception as _pe:
+            pass  # Fallback to RSS below
+
+        # Fallback: Google News RSS if Polygon returned nothing
+        if polygon_fetched == 0:
+            query = queries[0]
+            try:
+                url = f"https://news.google.com/rss/search?q={query.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
+                r = requests.get(url, timeout=8, headers={"User-Agent": "TraderJoes/1.0"})
+                if r.status_code == 200:
+                    root = ET.fromstring(r.content)
+                    for item in root.findall(".//item")[:10]:
+                        title_el = item.find("title")
+                        if title_el is not None and title_el.text:
+                            title_text = title_el.text.strip()
+                            if title_text.lower() not in existing_titles:
+                                _INTEL_HEADLINE_MEMORY[theme].append((now, title_text))
+                                existing_titles.add(title_text.lower())
+                                total += 1
+            except Exception as e:
+                log.warning("INTEL RSS fetch %s: %s", theme, e)
 
     return total
 
