@@ -6506,6 +6506,25 @@ async def alert_scan_task():
                         log.warning("Funding arb %s error: %s", _fname, _fe)
             except Exception as arb_err:
                 log.warning("Funding arb scan error: %s", arb_err)
+            # === WEEKEND GAP FADE (Sat/Sun only) ===
+            try:
+                _wg_fn = getattr(__import__("sys").modules.get("__main__"), "scan_weekend_gap", None)
+                if _wg_fn:
+                    _wg_fired = await _wg_fn()
+                    if _wg_fired and _wg_fired > 0:
+                        log.info("WEEKEND GAP: %d trades fired", _wg_fired)
+            except Exception:
+                pass
+            # === FRIDAY CLOSE RECORDER (Fri 3:50-4:00 PM ET) ===
+            try:
+                from zoneinfo import ZoneInfo
+                _fri_et = datetime.now(ZoneInfo("America/New_York"))
+                if _fri_et.weekday() == 4 and _fri_et.hour == 15 and _fri_et.minute >= 50:
+                    _rec_fn = getattr(__import__("sys").modules.get("__main__"), "record_friday_close", None)
+                    if _rec_fn:
+                        _rec_fn()
+            except Exception:
+                pass
             # === CROSS-EXCHANGE CRYPTO ARB (monitoring, 24/7) ===
             try:
                 _arb_alerts_fn = getattr(__import__("sys").modules.get("__main__"), "scan_crypto_arb_spreads", None)
@@ -13381,6 +13400,34 @@ async def run_exit_manager(channel=None):
                         pass
                 if not exit_reason and age_hours > EXIT_CONFIG.get("pairs_ttl_days", 7) * 24:
                     exit_reason = "TTL: pairs 7d"
+            elif strategy == "weekend_gap":
+                _wg_sym = pos.get("market", "").replace("WEEKEND_GAP:", "")
+                _wg_entry = pos.get("entry_price", 0)
+                _wg_stop = pos.get("stop_price", 0)
+                _wg_tp = pos.get("target_price", 0)
+                _wg_dir = pos.get("side", "")
+                if _wg_sym and _wg_entry > 0:
+                    _wg_live = _fetch_crypto_spot_price(_wg_sym)
+                    if _wg_live > 0:
+                        if "SHORT" in _wg_dir:
+                            if _wg_stop > 0 and _wg_live >= _wg_stop:
+                                exit_reason = f"STOP: {_wg_sym} ${_wg_live:.0f} >= ${_wg_stop:.0f}"
+                            elif _wg_tp > 0 and _wg_live <= _wg_tp:
+                                exit_reason = f"GAP CLOSED: {_wg_sym} reverted to ${_wg_live:.0f}"
+                        else:
+                            if _wg_stop > 0 and _wg_live <= _wg_stop:
+                                exit_reason = f"STOP: {_wg_sym} ${_wg_live:.0f} <= ${_wg_stop:.0f}"
+                            elif _wg_tp > 0 and _wg_live >= _wg_tp:
+                                exit_reason = f"GAP CLOSED: {_wg_sym} reverted to ${_wg_live:.0f}"
+                        if not exit_reason:
+                            _wg_pnl_pct = ((_wg_entry - _wg_live) / _wg_entry * 100) if "SHORT" in _wg_dir else ((_wg_live - _wg_entry) / _wg_entry * 100)
+                            log.info("WEEKEND GAP POS: %s %s entry=$%.0f live=$%.0f pnl=%+.1f%%", _wg_dir, _wg_sym, _wg_entry, _wg_live, _wg_pnl_pct)
+                # Monday noon TTL
+                if not exit_reason:
+                    from zoneinfo import ZoneInfo as _wgz
+                    _wg_et = datetime.now(_wgz("America/New_York"))
+                    if _wg_et.weekday() == 0 and _wg_et.hour >= 12:
+                        exit_reason = "TTL: Monday noon"
             elif strategy == "etf_arb":
                 if age_hours > ETF_ARB_CONFIG["ttl_hours"]:
                     exit_reason = f"TTL: etf_arb {ETF_ARB_CONFIG['ttl_hours']}h"
@@ -16428,6 +16475,136 @@ def scan_market_making_opps():
     except Exception as e:
         log.warning("MM SCAN error: %s", e)
     return _MM_OPPORTUNITIES
+
+
+# ═══════════════════════════════════════════════════════════════════
+# WEEKEND GAP FADE — Mean reversion on crypto gaps from Friday close
+# FULLY FUNCTIONAL — executes via Coinbase spot + Phemex perp
+# ═══════════════════════════════════════════════════════════════════
+WEEKEND_GAP_CONFIG = {
+    "enabled": True,
+    "pairs": ["BTC", "ETH"],
+    "gap_threshold_pct": 5.0,    # 5% gap from Friday close triggers
+    "reversion_target_pct": 2.0, # Target close within 2% of Friday
+    "size_pct": 0.01,            # 1% of portfolio
+    "max_positions": 2,
+    "close_by_monday_noon": True,
+}
+_FRIDAY_CLOSES = {}  # {symbol: {"price": float, "ts": str}}
+_WEEKEND_GAP_POSITIONS = []  # Track active gap fades
+
+
+def record_friday_close():
+    """Record BTC and ETH prices at Friday 3:55 PM ET. Called by scheduler."""
+    now = datetime.now(timezone.utc)
+    for sym in WEEKEND_GAP_CONFIG["pairs"]:
+        px = _fetch_crypto_spot_price(sym)
+        if px > 0:
+            _FRIDAY_CLOSES[sym] = {"price": px, "ts": now.strftime("%Y-%m-%d %H:%M UTC")}
+            log.info("FRIDAY CLOSE: %s $%.2f", sym, px)
+
+
+async def scan_weekend_gap():
+    """Check if crypto has gapped >5% from Friday close. Execute mean reversion."""
+    cfg = WEEKEND_GAP_CONFIG
+    if not cfg["enabled"]:
+        return 0
+    # Only run on weekends
+    now = datetime.now(timezone.utc)
+    if now.weekday() < 5:  # Mon-Fri
+        return 0
+    if not _FRIDAY_CLOSES:
+        return 0
+
+    gap_count = sum(1 for p in PAPER_PORTFOLIO.get("positions", [])
+                    if p.get("strategy") == "weekend_gap")
+    if gap_count >= cfg["max_positions"]:
+        return 0
+
+    portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
+        p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+    fired = 0
+
+    for sym in cfg["pairs"]:
+        if gap_count + fired >= cfg["max_positions"]:
+            break
+        friday = _FRIDAY_CLOSES.get(sym)
+        if not friday:
+            continue
+        friday_px = friday["price"]
+        live_px = _fetch_crypto_spot_price(sym)
+        if live_px <= 0 or friday_px <= 0:
+            continue
+        gap_pct = (live_px - friday_px) / friday_px * 100
+        market_id = f"WEEKEND_GAP:{sym}"
+
+        # Already have this position?
+        if any(p.get("market") == market_id for p in PAPER_PORTFOLIO.get("positions", [])):
+            continue
+
+        if abs(gap_pct) < cfg["gap_threshold_pct"]:
+            continue
+
+        leg_size = portfolio_value * cfg["size_pct"]
+        # Gap up >5%: short the move (expect reversion down)
+        # Gap down >5%: long the move (expect reversion up)
+        if gap_pct > cfg["gap_threshold_pct"]:
+            direction = "SHORT"
+            target_px = friday_px * (1 + cfg["reversion_target_pct"] / 100)
+            stop_px = live_px * 1.05  # 5% stop
+            log.info("WEEKEND GAP: %s gapped +%.1f%% (fri=$%.0f now=$%.0f) → SHORT",
+                     sym, gap_pct, friday_px, live_px)
+            try:
+                _ok, _msg, _oid = await execute_phemex_perp_short(sym, leg_size)
+                if not _ok:
+                    log.warning("WEEKEND GAP SHORT FAILED: %s %s", sym, _msg[:80])
+                    continue
+            except Exception as e:
+                log.warning("WEEKEND GAP SHORT error: %s", e)
+                continue
+        else:
+            direction = "LONG"
+            target_px = friday_px * (1 - cfg["reversion_target_pct"] / 100)
+            stop_px = live_px * 0.95  # 5% stop
+            log.info("WEEKEND GAP: %s gapped %.1f%% (fri=$%.0f now=$%.0f) → LONG",
+                     sym, gap_pct, friday_px, live_px)
+            try:
+                _ok, _msg = await execute_coinbase_order("BUY", sym, leg_size)
+                if not _ok:
+                    log.warning("WEEKEND GAP LONG FAILED: %s %s", sym, _msg[:80])
+                    continue
+                _oid = ""
+            except Exception as e:
+                log.warning("WEEKEND GAP LONG error: %s", e)
+                continue
+
+        _pos = {
+            "market": market_id,
+            "side": f"{direction} {sym}", "shares": 1,
+            "entry_price": live_px, "cost": leg_size, "value": leg_size,
+            "timestamp": now.strftime("%Y-%m-%d %H:%M UTC"),
+            "platform": "Coinbase" if direction == "LONG" else "Phemex",
+            "ev": abs(gap_pct) / 100,
+            "strategy": "weekend_gap",
+            "friday_close": friday_px, "gap_pct": gap_pct,
+            "target_price": round(target_px, 2),
+            "stop_price": round(stop_px, 2),
+        }
+        PAPER_PORTFOLIO["positions"].append(_pos)
+        PAPER_PORTFOLIO["cash"] -= leg_size
+        db_log_paper_trade(_pos)
+        db_open_position(
+            market_id=market_id, platform=_pos["platform"], strategy="weekend_gap",
+            direction=direction, size_usd=leg_size, shares=1, entry_price=live_px,
+            stop_price=stop_px, target_price=target_px,
+            metadata={"friday_close": friday_px, "gap_pct": gap_pct,
+                      "direction": direction})
+        fired += 1
+        log.info("WEEKEND GAP TRADE: %s %s at $%.0f (gap=%+.1f%% fri=$%.0f) tp=$%.0f sl=$%.0f",
+                 direction, sym, live_px, gap_pct, friday_px, target_px, stop_px)
+        send_critical_alert("Weekend Gap",
+                            f"{direction} {sym} gap={gap_pct:+.1f}% fri=${friday_px:.0f} now=${live_px:.0f}")
+    return fired
 
 
 # PEAD SCANNER v2 — Post-Earnings Announcement Drift
