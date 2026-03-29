@@ -1663,8 +1663,6 @@ async def on_ready():
         pairs_scan_task.start()
     if not sector_rotation_task.is_running():
         sector_rotation_task.start()
-    if not crypto_pairs_task.is_running():
-        crypto_pairs_task.start()
     # Initialize ChromaDB causal memory
     _init_chromadb()
     # Sync Alpaca positions into portfolio — add any tracked positions missing from ledger
@@ -2709,33 +2707,7 @@ async def before_pairs_scan():
     await asyncio.sleep(900)
 
 
-_crypto_pairs_scan_fn = None  # Set after scan_crypto_pairs is defined
-
-@tasks.loop(minutes=5)
-async def crypto_pairs_task():
-    """Crypto pairs stat arb scanner — runs every 5 minutes 24/7."""
-    global _crypto_pairs_scan_fn
-    try:
-        if _crypto_pairs_scan_fn is None:
-            # Lazy resolve on first call
-            import sys
-            _m = sys.modules.get("__main__")
-            if _m and hasattr(_m, "scan_crypto_pairs"):
-                _crypto_pairs_scan_fn = _m.scan_crypto_pairs
-        if _crypto_pairs_scan_fn:
-            fired = await _crypto_pairs_scan_fn()
-            if fired > 0:
-                log.info("CRYPTO PAIRS: %d trades fired this cycle", fired)
-        else:
-            log.warning("CRYPTO PAIRS: awaiting scan_crypto_pairs init")
-    except Exception as e:
-        log.warning("CRYPTO PAIRS task error: %s", e)
-
-@crypto_pairs_task.before_loop
-async def before_crypto_pairs():
-    await bot.wait_until_ready()
-    import asyncio
-    await asyncio.sleep(120)  # 2-min startup delay
+# Crypto pairs scan runs inline in alert_scan_task (every cycle, 24/7)
 
 
 # ============================================================================
@@ -5952,6 +5924,15 @@ async def alert_scan_task():
                         log.warning("Funding arb %s error: %s", _fname, _fe)
             except Exception as arb_err:
                 log.warning("Funding arb scan error: %s", arb_err)
+            # === CRYPTO PAIRS STAT ARB (runs 24/7, every other cycle ~10min) ===
+            try:
+                _cp_fn = getattr(__import__("sys").modules.get("__main__"), "scan_crypto_pairs", None)
+                if _cp_fn:
+                    _cp_fired = await _cp_fn()
+                    if _cp_fired and _cp_fired > 0:
+                        log.info("CRYPTO PAIRS: %d trades fired", _cp_fired)
+            except Exception as _cperr:
+                log.warning("Crypto pairs scan error: %s", _cperr)
             # === CRASH HEDGE SCANNER (runs during market hours) ===
             if is_market_open():
                 try:
