@@ -2504,6 +2504,28 @@ async def morning_briefing_task():
                 for m in msgs:
                     await ch.send(m)
                 log.info("Morning briefing sent")
+                # Generate voice briefing MP3
+                try:
+                    import os as _vb_os
+                    _vb_os.makedirs("/app/data/briefings", exist_ok=True)
+                    _vb_date = datetime.now(timezone.utc).strftime("%Y%m%d")
+                    _vb_path = f"/app/data/briefings/briefing_{_vb_date}.mp3"
+                    # Build spoken text from briefing messages (strip markdown)
+                    import re as _vb_re
+                    _vb_text = " ".join(msgs)
+                    _vb_text = _vb_re.sub(r'[*_`~#]', '', _vb_text)  # Strip markdown
+                    _vb_text = _vb_re.sub(r'```[^`]*```', '', _vb_text)
+                    _vb_text = _vb_text[:1500]  # ~60 seconds of speech
+                    from gtts import gTTS
+                    _tts = gTTS(text=_vb_text, lang='en', slow=False)
+                    _tts.save(_vb_path)
+                    # Post to Discord
+                    import discord as _vb_disc
+                    await ch.send("**Morning Voice Briefing:**",
+                                  file=_vb_disc.File(_vb_path, filename=f"briefing_{_vb_date}.mp3"))
+                    log.info("VOICE BRIEFING: saved and posted %s", _vb_path)
+                except Exception as _vb_err:
+                    log.warning("Voice briefing error: %s", _vb_err)
         except Exception as e:
             log.warning("Morning briefing error: %s", e)
 
