@@ -1667,6 +1667,8 @@ async def on_ready():
         earnings_calendar_task.start()
     if not weekly_email_task.is_running():
         weekly_email_task.start()
+    if TELEGRAM_BOT_TOKEN and not telegram_poll_task.is_running():
+        telegram_poll_task.start()
     # Initialize ChromaDB causal memory
     _init_chromadb()
     # Sync Alpaca positions into portfolio — add any tracked positions missing from ledger
@@ -2887,6 +2889,79 @@ async def before_weekly_email():
         wait_secs += 7 * 86400
     log.info("Weekly email scheduled in %.0f minutes", wait_secs / 60)
     await asyncio.sleep(wait_secs)
+
+
+_TG_OFFSET = 0  # Track last processed Telegram update
+
+
+@tasks.loop(seconds=30)
+async def telegram_poll_task():
+    """Poll Telegram for commands and respond. Lightweight — no python-telegram-bot needed."""
+    global _TG_OFFSET
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                         params={"offset": _TG_OFFSET, "timeout": 5, "limit": 5}, timeout=10)
+        if r.status_code != 200:
+            return
+        updates = r.json().get("result", [])
+        for upd in updates:
+            _TG_OFFSET = upd["update_id"] + 1
+            msg = upd.get("message", {})
+            text = msg.get("text", "").strip()
+            chat_id = str(msg.get("chat", {}).get("id", ""))
+            if chat_id != TELEGRAM_CHAT_ID:
+                continue
+            # Handle commands
+            reply = None
+            if text == "/status":
+                cash = PAPER_PORTFOLIO.get("cash", 0)
+                pos_count = len(PAPER_PORTFOLIO.get("positions", []))
+                equity = cash + sum(p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+                regime = get_regime("equities")
+                reply = (f"<b>TraderJoes Status</b>\n"
+                         f"Cash: ${cash:,.2f}\nEquity: ${equity:,.2f}\n"
+                         f"Positions: {pos_count}\nVIX: {regime.get('vix', '?')}\n"
+                         f"Regime: {regime.get('regime', '?').upper()}")
+            elif text == "/pnl":
+                try:
+                    conn = sqlite3.connect(DB_PATH)
+                    c = conn.cursor()
+                    c.execute("SELECT COALESCE(SUM(realized_pnl),0) FROM positions WHERE status='closed' AND strategy!='pairs_legacy'")
+                    total_pnl = c.fetchone()[0]
+                    conn.close()
+                    reply = f"<b>Realized P&L:</b> ${total_pnl:+,.2f}"
+                except Exception:
+                    reply = "Error fetching P&L"
+            elif text == "/oracle":
+                try:
+                    data = _build_api_oracle()
+                    sigs = data.get("signals", [])
+                    reply = "<b>Oracle Signals</b>\n"
+                    for s in sigs[:5]:
+                        reply += f"{s['name']}: YES=${s['yes_price']:.2f} {'ACTIVE' if s['active'] else 'watch'}\n"
+                except Exception:
+                    reply = "Error"
+            elif text == "/hedge":
+                regime = get_regime("equities")
+                vix = regime.get("vix", 0)
+                vrp = _VRP_REGIME_STATE.get("current", "?")
+                reply = f"<b>Hedge Status</b>\nVIX: {vix}\nVRP: {vrp}"
+            elif text == "/next":
+                reply = "<b>Use !next-trades on Discord</b>\n(Too complex for Telegram)"
+            elif text == "/help":
+                reply = "<b>Commands:</b>\n/status /pnl /oracle /hedge /next /help"
+            if reply:
+                send_telegram(reply)
+    except Exception:
+        pass
+
+@telegram_poll_task.before_loop
+async def before_telegram_poll():
+    await bot.wait_until_ready()
+    import asyncio
+    await asyncio.sleep(30)
 
 
 @tasks.loop(minutes=30)
@@ -4132,6 +4207,16 @@ async def status_cmd(ctx):
     await ctx.send(m1)
     if m2.strip():
         await ctx.send(m2)
+
+
+@bot.command(name="telegram-test")
+async def telegram_test_cmd(ctx):
+    """Send a test message to Telegram."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        await ctx.send("Telegram not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env")
+        return
+    ok = send_telegram("<b>Test</b>\nTraderJoes War Room — Telegram is working!")
+    await ctx.send(f"Telegram test: {'Sent' if ok else 'FAILED'}")
 
 
 @bot.command(name="sms-test")
@@ -5514,11 +5599,32 @@ def send_email(subject, body):
         return False
 
 
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+
+def send_telegram(message):
+    """Send message to Telegram chat. No-op if credentials not configured."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": f"[TraderJoes] {message[:4000]}",
+                  "parse_mode": "HTML"},
+            timeout=10)
+        return r.status_code == 200
+    except Exception as e:
+        log.warning("Telegram error: %s", e)
+        return False
+
+
 def send_critical_alert(subject, message):
     sms_ok = send_sms(message)
     email_ok = send_email(subject, message)
-    log.info("CRITICAL ALERT: %s (sms=%s email=%s)", subject, sms_ok, email_ok)
-    return sms_ok or email_ok
+    tg_ok = send_telegram(f"<b>{subject}</b>\n{message}")
+    log.info("CRITICAL ALERT: %s (sms=%s email=%s tg=%s)", subject, sms_ok, email_ok, tg_ok)
+    return sms_ok or email_ok or tg_ok
 
 
 @bot.command(name="memory-query")
