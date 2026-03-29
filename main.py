@@ -11022,8 +11022,28 @@ _SENTIMENT_NEGATIVE = [
 _THEME_SENTIMENT = {}
 
 
+_VADER_ANALYZER = None
+
+def _get_vader():
+    """Lazy-init VADER sentiment analyzer."""
+    global _VADER_ANALYZER
+    if _VADER_ANALYZER is None:
+        try:
+            from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+            _VADER_ANALYZER = SentimentIntensityAnalyzer()
+            log.info("VADER sentiment analyzer initialized")
+        except ImportError:
+            log.warning("VADER not installed — falling back to keyword sentiment")
+    return _VADER_ANALYZER
+
+
 def _score_headline_sentiment(headline):
-    """Score a headline from -1 (very negative) to +1 (very positive)."""
+    """Score a headline from -1 to +1 using VADER NLP (keyword fallback)."""
+    vader = _get_vader()
+    if vader:
+        scores = vader.polarity_scores(headline)
+        return scores["compound"]
+    # Fallback to keyword matching if VADER unavailable
     hl = headline.lower()
     pos = sum(1 for w in _SENTIMENT_POSITIVE if w in hl)
     neg = sum(1 for w in _SENTIMENT_NEGATIVE if w in hl)
