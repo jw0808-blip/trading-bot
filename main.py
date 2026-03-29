@@ -3545,24 +3545,31 @@ async def paper_pnl_cmd(ctx):
     start_capital = 25000
     total_return = ((equity / start_capital) - 1) * 100
 
-    msg = f"**Paper P&L Dashboard**\n"
-    msg += f"```\n"
-    msg += f"{'Realized P&L (closed):':<26s} ${total_realized:>+10,.2f}\n"
-    msg += f"{'Unrealized P&L (open):':<26s} ${total_unrealized:>+10,.2f}\n"
-    msg += f"{'Combined P&L:':<26s} ${combined:>+10,.2f}\n"
-    msg += f"{'─' * 42}\n"
-    msg += f"{'Cash:':<26s} ${cash:>10,.2f}\n"
-    msg += f"{'Cost basis:':<26s} ${total_cost:>10,.2f}\n"
-    msg += f"{'Equity:':<26s} ${equity:>10,.2f}\n"
-    msg += f"{'Return from $25K:':<26s} {total_return:>+10.1f}%\n"
-    msg += f"{'─' * 42}\n"
-    msg += f"{'Position':35s} {'Cost':>7s}  {'Unr P&L':>9s}  {'Price'}\n"
-    for line in pos_lines[:15]:
-        msg += line + "\n"
-    if len(pos_lines) > 15:
-        msg += f"  +{len(pos_lines)-15} more\n"
-    msg += f"```"
-    await ctx.send(msg)
+    header = f"**Paper P&L Dashboard**\n"
+    header += f"```\n"
+    header += f"{'Realized P&L (closed):':<26s} ${total_realized:>+10,.2f}\n"
+    header += f"{'Unrealized P&L (open):':<26s} ${total_unrealized:>+10,.2f}\n"
+    header += f"{'Combined P&L:':<26s} ${combined:>+10,.2f}\n"
+    header += f"{'─' * 42}\n"
+    header += f"{'Cash:':<26s} ${cash:>10,.2f}\n"
+    header += f"{'Cost basis:':<26s} ${total_cost:>10,.2f}\n"
+    header += f"{'Equity:':<26s} ${equity:>10,.2f}\n"
+    header += f"{'Return from $25K:':<26s} {total_return:>+10.1f}%\n"
+    header += f"{'─' * 42}\n"
+    header += f"{'Position':35s} {'Cost':>7s}  {'Unr P&L':>9s}  {'Price'}\n"
+    header += f"```"
+    await ctx.send(header)
+
+    # Split positions into chunks that fit Discord's 2000 char limit
+    chunk = "```\n"
+    for line in pos_lines:
+        if len(chunk) + len(line) + 10 > 1900:
+            chunk += "```"
+            await ctx.send(chunk)
+            chunk = "```\n"
+        chunk += line + "\n"
+    chunk += f"```\n*{len(pos_lines)} positions*"
+    await ctx.send(chunk)
 
 @bot.command(name="status")
 async def status_cmd(ctx):
