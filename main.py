@@ -1574,7 +1574,8 @@ async def on_ready():
     load_all_state()  # Restore paper_portfolio.json, analytics, signals, etc.
     db_load_daily_state()
     # Backfill positions from SQLite only if JSON had none (fresh deploy)
-    if not PAPER_PORTFOLIO.get("positions"):
+    # Backfill from SQLite only if JSON was empty AND cash is not full (not a reset)
+    if not PAPER_PORTFOLIO.get("positions") and PAPER_PORTFOLIO.get("cash", 0) < 24999:
         try:
             _rconn = sqlite3.connect(DB_PATH)
             _rc = _rconn.cursor()
@@ -1593,6 +1594,8 @@ async def on_ready():
                 log.info("Backfilled %d positions from SQLite (JSON was empty)", len(_rows))
         except Exception as _e:
             log.warning("Position backfill error: %s", _e)
+    elif not PAPER_PORTFOLIO.get("positions"):
+        log.info("Backfill skipped — clean reset detected (cash=$%.0f)", PAPER_PORTFOLIO.get("cash", 0))
     log.info("TraderJoes bot online as %s | Cash: $%.2f | Positions: %d",
              bot.user, PAPER_PORTFOLIO.get("cash", 0), len(PAPER_PORTFOLIO.get("positions", [])))
     # Reconcile Alpaca positions — close any orphans from failed pairs orders
