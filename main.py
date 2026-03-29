@@ -4645,6 +4645,28 @@ async def next_trades_cmd(ctx):
     await ctx.send(msg[:1900])
 
 
+@bot.command(name="correlation-regime")
+async def correlation_regime_cmd(ctx):
+    """Show cross-asset correlation matrix and regime status."""
+    avg, regime = calculate_correlation_regime()
+    state = _CORR_REGIME_STATE
+    msg = f"**CORRELATION REGIME MONITOR**\n"
+    msg += f"Regime: **{regime.upper()}** | Avg |corr|: {avg:.3f}\n"
+    msg += f"Pairs paused: {state.get('pairs_paused', False)}\n"
+    msg += f"Last scan: {state.get('last_scan', 'Never')}\n\n"
+    matrix = state.get("matrix", {})
+    if matrix:
+        msg += "**Cross-Asset Correlation Matrix (30d):**\n```\n"
+        for pair, c in sorted(matrix.items()):
+            bar = "+" * int(abs(c) * 10)
+            msg += f"  {pair:10s} {c:+.3f} {bar}\n"
+        msg += "```\n"
+        msg += f"*>0.7 = crash regime (pairs paused) | <0.5 = normal*"
+    else:
+        msg += "No correlation data yet. Calculates hourly.\n"
+    await ctx.send(msg[:1900])
+
+
 @bot.command(name="options-flow")
 async def options_flow_cmd(ctx):
     """Show last 10 unusual options prints."""
@@ -6602,6 +6624,32 @@ async def alert_scan_task():
                 _etf_fn = getattr(__import__("sys").modules.get("__main__"), "scan_etf_arb", None)
                 if _etf_fn:
                     await _etf_fn()
+            except Exception:
+                pass
+            # === CORRELATION REGIME MONITOR (hourly) ===
+            try:
+                _cr_fn = getattr(__import__("sys").modules.get("__main__"), "check_correlation_regime_action", None)
+                if _cr_fn:
+                    _cr_changed = _cr_fn()
+                    if _cr_changed:
+                        _cr_ch = bot.get_channel(int(DISCORD_CHANNEL_ID)) if DISCORD_CHANNEL_ID else None
+                        if _cr_ch:
+                            _cr_regime = _CORR_REGIME_STATE["regime"]
+                            _cr_avg = _CORR_REGIME_STATE["avg_corr"]
+                            if _cr_regime == "crash":
+                                try:
+                                    await _cr_ch.send(
+                                        f"**CRASH REGIME DETECTED** — avg corr={_cr_avg:.3f}\n"
+                                        f"Everything moving together. Pairs auto-paused 4h.\n"
+                                        f"Matrix: {_CORR_REGIME_STATE['matrix']}")
+                                    send_critical_alert("Crash Regime", f"Avg corr={_cr_avg:.3f} — pairs paused")
+                                except Exception:
+                                    pass
+                            else:
+                                try:
+                                    await _cr_ch.send(f"**CORRELATION REGIME NORMAL** — avg corr={_cr_avg:.3f}\nPairs resumed.")
+                                except Exception:
+                                    pass
             except Exception:
                 pass
             # === UNUSUAL OPTIONS ACTIVITY ===
@@ -14836,6 +14884,97 @@ def scan_unusual_options():
     except Exception as e:
         log.warning("UNUSUAL OPTIONS scan error: %s", e)
     return _UNUSUAL_OPTIONS
+
+
+# ---------------------------------------------------------------------------
+# CORRELATION REGIME MONITOR — Detect crash regimes (everything correlated)
+# ---------------------------------------------------------------------------
+_CORR_REGIME_ASSETS = ["SPY", "TLT", "GLD", "XLE"]
+_CORR_REGIME_STATE = {"avg_corr": 0.0, "regime": "normal", "matrix": {}, "last_scan": None, "pairs_paused": False}
+
+
+def calculate_correlation_regime():
+    """Calculate cross-asset correlation matrix. Returns avg correlation and regime label."""
+    global _CORR_REGIME_STATE
+    now = datetime.now(timezone.utc)
+    # Rate limit: hourly
+    if _CORR_REGIME_STATE["last_scan"] and (now - _CORR_REGIME_STATE["last_scan"]).total_seconds() < 3600:
+        return _CORR_REGIME_STATE["avg_corr"], _CORR_REGIME_STATE["regime"]
+
+    try:
+        import yfinance as _yf_corr
+        import numpy as np
+        prices = {}
+        for asset in _CORR_REGIME_ASSETS:
+            h = _yf_corr.Ticker(asset).history(period="30d")
+            if len(h) >= 15:
+                prices[asset] = h["Close"].pct_change().dropna().values
+        if len(prices) < 3:
+            return _CORR_REGIME_STATE["avg_corr"], _CORR_REGIME_STATE["regime"]
+
+        # Build correlation matrix
+        assets = list(prices.keys())
+        n = len(assets)
+        matrix = {}
+        corrs = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                min_len = min(len(prices[assets[i]]), len(prices[assets[j]]))
+                if min_len < 10:
+                    continue
+                c = float(np.corrcoef(prices[assets[i]][-min_len:], prices[assets[j]][-min_len:])[0, 1])
+                if not np.isnan(c):
+                    pair_key = f"{assets[i]}/{assets[j]}"
+                    matrix[pair_key] = round(c, 3)
+                    corrs.append(abs(c))
+
+        avg_corr = sum(corrs) / len(corrs) if corrs else 0
+        prev_regime = _CORR_REGIME_STATE["regime"]
+        if avg_corr > 0.7:
+            regime = "crash"
+        elif avg_corr > 0.5:
+            regime = "elevated"
+        else:
+            regime = "normal"
+
+        _CORR_REGIME_STATE.update({
+            "avg_corr": round(avg_corr, 3), "regime": regime,
+            "matrix": matrix, "last_scan": now})
+
+        if regime != prev_regime:
+            log.info("CORRELATION REGIME: %s → %s (avg_corr=%.3f)", prev_regime, regime, avg_corr)
+            # Log to SQLite
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                conn.execute("INSERT INTO echo_memory (event_type, theme, signal_name, probability, context, created_at) VALUES (?,?,?,?,?,datetime('now'))",
+                             ("corr_regime", "market", regime, avg_corr, json.dumps(matrix)))
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+
+        return avg_corr, regime
+    except Exception as e:
+        log.warning("CORRELATION REGIME error: %s", e)
+        return _CORR_REGIME_STATE["avg_corr"], _CORR_REGIME_STATE["regime"]
+
+
+def check_correlation_regime_action(channel_notify=None):
+    """Auto-pause pairs in crash regime, resume in normal. Returns True if changed."""
+    avg_corr, regime = calculate_correlation_regime()
+    changed = False
+    if regime == "crash" and not _CORR_REGIME_STATE.get("pairs_paused"):
+        _CORR_REGIME_STATE["pairs_paused"] = True
+        # Add pairs to strategy pauses
+        _RISK_STATE.get("strategy_pauses", {})["pairs"] = datetime.now(timezone.utc) + __import__("datetime").timedelta(hours=4)
+        log.warning("CRASH REGIME DETECTED — pairs auto-paused (avg_corr=%.3f)", avg_corr)
+        changed = True
+    elif regime == "normal" and _CORR_REGIME_STATE.get("pairs_paused"):
+        _CORR_REGIME_STATE["pairs_paused"] = False
+        _RISK_STATE.get("strategy_pauses", {}).pop("pairs", None)
+        log.info("CORRELATION REGIME NORMAL — pairs resumed (avg_corr=%.3f)", avg_corr)
+        changed = True
+    return changed
 
 
 # VOLATILITY SKEW SCANNER — Put/Call IV analysis for options strategy
