@@ -1661,6 +1661,8 @@ async def on_ready():
         regime_snapshot_task.start()
     if not pairs_scan_task.is_running():
         pairs_scan_task.start()
+    if not sector_rotation_task.is_running():
+        sector_rotation_task.start()
     # Initialize ChromaDB causal memory
     _init_chromadb()
     # Sync Alpaca positions into portfolio — add any tracked positions missing from ledger
@@ -2575,6 +2577,111 @@ async def before_regime_snapshot():
         target += __import__("datetime").timedelta(days=1)
     wait_secs = (target - now_et).total_seconds()
     log.info("Regime snapshot scheduled in %.0f minutes", wait_secs / 60)
+    await asyncio.sleep(wait_secs)
+
+
+# ---------------------------------------------------------------------------
+# SECTOR ROTATION SCANNER — Morning scan of 11 S&P 500 sector ETFs
+# ---------------------------------------------------------------------------
+SECTOR_ETFS = ["XLF", "XLK", "XLE", "XLV", "XLI", "XLB", "XLU", "XLRE", "XLC", "XLY", "XLP"]
+_SECTOR_RANKINGS = {"rankings": [], "top2": [], "bottom2": [], "last_scan": None}
+
+
+def scan_sector_rotation():
+    """Fetch 5-day performance for all sector ETFs. Returns sorted rankings."""
+    try:
+        from polygon_client import get_quote
+        rankings = []
+        for etf in SECTOR_ETFS:
+            q = get_quote(etf)
+            if q and q.get("change_pct") is not None:
+                rankings.append({"etf": etf, "change_pct": round(q["change_pct"], 2),
+                                 "price": q.get("last", 0)})
+        if not rankings:
+            # Fallback: yfinance
+            import yfinance as _yf_sec
+            for etf in SECTOR_ETFS:
+                try:
+                    h = _yf_sec.Ticker(etf).history(period="5d")
+                    if len(h) >= 2:
+                        chg = (h["Close"].iloc[-1] / h["Close"].iloc[0] - 1) * 100
+                        rankings.append({"etf": etf, "change_pct": round(chg, 2),
+                                         "price": float(h["Close"].iloc[-1])})
+                except Exception:
+                    pass
+        rankings.sort(key=lambda r: r["change_pct"], reverse=True)
+        _SECTOR_RANKINGS["rankings"] = rankings
+        _SECTOR_RANKINGS["top2"] = rankings[:2] if len(rankings) >= 2 else rankings
+        _SECTOR_RANKINGS["bottom2"] = rankings[-2:] if len(rankings) >= 2 else []
+        _SECTOR_RANKINGS["last_scan"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        log.info("SECTOR ROTATION: top=%s(%+.1f%%) %s(%+.1f%%) | bottom=%s(%+.1f%%) %s(%+.1f%%)",
+                 rankings[0]["etf"], rankings[0]["change_pct"],
+                 rankings[1]["etf"], rankings[1]["change_pct"],
+                 rankings[-2]["etf"], rankings[-2]["change_pct"],
+                 rankings[-1]["etf"], rankings[-1]["change_pct"])
+        return rankings
+    except Exception as e:
+        log.warning("SECTOR ROTATION error: %s", e)
+        return []
+
+
+def get_sector_rotation_pairs():
+    """Generate sector momentum pairs: long top ETF vs short bottom ETF."""
+    top2 = _SECTOR_RANKINGS.get("top2", [])
+    bottom2 = _SECTOR_RANKINGS.get("bottom2", [])
+    pairs = []
+    if len(top2) >= 1 and len(bottom2) >= 1:
+        pairs.append((top2[0]["etf"], bottom2[-1]["etf"]))  # Best vs worst
+    if len(top2) >= 2 and len(bottom2) >= 2:
+        pairs.append((top2[1]["etf"], bottom2[-2]["etf"]))  # 2nd best vs 2nd worst
+    return pairs
+
+
+@tasks.loop(hours=24)
+async def sector_rotation_task():
+    """Morning sector rotation scan at 9:35 AM ET."""
+    try:
+        rankings = scan_sector_rotation()
+        if rankings and DISCORD_CHANNEL_ID:
+            ch = bot.get_channel(int(DISCORD_CHANNEL_ID))
+            if ch:
+                msg = "**SECTOR ROTATION — Morning Scan**\n```\n"
+                msg += f"{'ETF':5s} {'5D Chg':>8s} {'Price':>8s}\n"
+                msg += f"{'-'*25}\n"
+                for i, r in enumerate(rankings):
+                    arrow = ">>>" if i < 2 else "<<<" if i >= len(rankings) - 2 else "   "
+                    msg += f"{arrow} {r['etf']:5s} {r['change_pct']:>+7.2f}% ${r['price']:>7.2f}\n"
+                msg += "```\n"
+                pairs = get_sector_rotation_pairs()
+                if pairs:
+                    msg += "**Rotation Pairs:**\n"
+                    for long_etf, short_etf in pairs:
+                        msg += f"  Long {long_etf} / Short {short_etf}\n"
+                await ch.send(msg)
+                # Add sector pairs to pairs scanner seed dynamically
+                _eq_cfg = globals().get("EQUITIES_CONFIG", {})
+                _seed = _eq_cfg.get("pairs", {}).get("seed", [])
+                for long_etf, short_etf in pairs:
+                    pair = (long_etf, short_etf)
+                    if pair not in _seed:
+                        _seed.append(pair)
+                        log.info("SECTOR ROTATION: added %s/%s to pairs seed", long_etf, short_etf)
+    except Exception as e:
+        log.warning("Sector rotation task error: %s", e)
+
+@sector_rotation_task.before_loop
+async def before_sector_rotation():
+    await bot.wait_until_ready()
+    import asyncio
+    from zoneinfo import ZoneInfo
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    target = now_et.replace(hour=9, minute=35, second=0, microsecond=0)
+    if now_et >= target:
+        target += __import__("datetime").timedelta(days=1)
+    while target.weekday() >= 5:
+        target += __import__("datetime").timedelta(days=1)
+    wait_secs = (target - now_et).total_seconds()
+    log.info("Sector rotation scheduled in %.0f minutes", wait_secs / 60)
     await asyncio.sleep(wait_secs)
 
 
@@ -4102,6 +4209,48 @@ async def next_trades_cmd(ctx):
     else:
         msg += "\nNo opportunities above threshold right now.\n"
     msg += f"\n*Strategies: Pairs, Oracle, Crypto, Funding, Kalshi*"
+    await ctx.send(msg[:1900])
+
+
+@bot.command(name="sectors")
+async def sectors_cmd(ctx):
+    """Show sector ETF rankings and rotation pairs."""
+    rankings = _SECTOR_RANKINGS.get("rankings", [])
+    last_scan = _SECTOR_RANKINGS.get("last_scan", "Never")
+
+    if not rankings:
+        # Try live scan
+        rankings = scan_sector_rotation()
+
+    msg = f"**SECTOR ROTATION** (last scan: {last_scan})\n"
+    if rankings:
+        msg += "```\n"
+        msg += f"{'':3s} {'ETF':5s} {'5D Change':>10s} {'Price':>8s}\n"
+        msg += f"{'-'*30}\n"
+        for i, r in enumerate(rankings):
+            if i < 2:
+                label = ">>>"
+            elif i >= len(rankings) - 2:
+                label = "<<<"
+            else:
+                label = "   "
+            msg += f"{label} {r['etf']:5s} {r['change_pct']:>+9.2f}% ${r['price']:>7.2f}\n"
+        msg += "```\n"
+        pairs = get_sector_rotation_pairs()
+        if pairs:
+            msg += "**Rotation Pairs (Long top / Short bottom):**\n"
+            for long_etf, short_etf in pairs:
+                msg += f"  Long {long_etf} / Short {short_etf}\n"
+        # Active sector trades
+        sector_trades = [p for p in PAPER_PORTFOLIO.get("positions", [])
+                         if p.get("market", "").startswith("PAIRS:") and
+                         any(etf in p.get("market", "") for etf in SECTOR_ETFS)]
+        if sector_trades:
+            msg += f"\n**Active Sector Trades ({len(sector_trades)}):**\n"
+            for p in sector_trades:
+                msg += f"  {p.get('market')} | ${p.get('cost', 0):.0f}\n"
+    else:
+        msg += "No sector data available. Scans at 9:35 AM ET on trading days.\n"
     await ctx.send(msg[:1900])
 
 
