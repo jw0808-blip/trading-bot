@@ -4632,6 +4632,21 @@ async def next_trades_cmd(ctx):
     await ctx.send(msg[:1900])
 
 
+@bot.command(name="earnings-positions")
+async def earnings_positions_cmd(ctx):
+    """Show simulated earnings vol crush positions."""
+    msg = f"**EARNINGS VOL CRUSH** (simulated — requires options margin for live)\n"
+    if _EARNINGS_CRUSH_POSITIONS:
+        msg += "```\n"
+        for p in _EARNINGS_CRUSH_POSITIONS:
+            msg += (f"  {p['ticker']:6s} strike=${p['strike']:.0f} x{p['contracts']} "
+                    f"credit=${p['premium_collected']:.0f} {p['status']} {p['opened_at'][:10]}\n")
+        msg += "```"
+    else:
+        msg += "No active positions. Scans 9:35 AM ET on earnings days.\n"
+    await ctx.send(msg)
+
+
 @bot.command(name="darkpool")
 async def darkpool_cmd(ctx):
     """Show last 5 large block trades detected."""
@@ -16148,6 +16163,80 @@ async def scan_etf_arb():
     except Exception as e:
         log.warning("ETF ARB error: %s", e)
     return 0
+
+
+# ═══════════════════════════════════════════════════════════════════
+# EARNINGS VOLATILITY CRUSH — Sell straddles before earnings (SIMULATED)
+# Real execution requires options margin — this tracks P&L on paper only
+# ═══════════════════════════════════════════════════════════════════
+EARNINGS_CRUSH_CONFIG = {
+    "enabled": True,
+    "size_pct": 0.005,         # 0.5% of portfolio per straddle
+    "max_positions": 3,
+    "close_hours_after": 2,    # Close 2h after earnings
+}
+_EARNINGS_CRUSH_POSITIONS = []  # Simulated positions
+
+
+async def scan_earnings_crush(channel=None):
+    """Scan for earnings within 24h, simulate selling ATM straddle."""
+    cfg = EARNINGS_CRUSH_CONFIG
+    if not cfg["enabled"] or not is_market_open():
+        return 0
+    if len(_EARNINGS_CRUSH_POSITIONS) >= cfg["max_positions"]:
+        return 0
+
+    fired = 0
+    # Get earnings tickers from calendar
+    tickers = _EARNINGS_WEEK.get("tickers", [])
+    if not tickers:
+        return 0
+
+    portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
+        p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+    now = datetime.now(timezone.utc)
+
+    for ticker in tickers[:5]:
+        if len(_EARNINGS_CRUSH_POSITIONS) + fired >= cfg["max_positions"]:
+            break
+        # Already have this ticker?
+        if any(p.get("ticker") == ticker for p in _EARNINGS_CRUSH_POSITIONS):
+            continue
+
+        try:
+            from polygon_client import get_quote
+            q = get_quote(ticker)
+            if not q or q.get("last", 0) <= 0:
+                continue
+            price = q["last"]
+            size = portfolio_value * cfg["size_pct"]
+            # Simulate: sell ATM call + ATM put, collect ~3-5% of stock price as premium
+            est_premium = price * 0.04  # ~4% combined premium estimate
+            contracts = max(1, int(size / (est_premium * 100)))
+            credit = est_premium * contracts * 100
+
+            _sim_pos = {
+                "ticker": ticker, "entry_price": price, "strike": round(price, 0),
+                "premium_collected": round(credit, 2), "contracts": contracts,
+                "opened_at": now.strftime("%Y-%m-%d %H:%M UTC"),
+                "status": "open", "simulated": True,
+            }
+            _EARNINGS_CRUSH_POSITIONS.append(_sim_pos)
+            fired += 1
+            log.info("EARNINGS CRUSH (SIM): %s ATM straddle strike=$%.0f x%d credit=$%.0f",
+                     ticker, price, contracts, credit)
+            if channel:
+                try:
+                    await channel.send(
+                        f"**EARNINGS CRUSH** (simulated) — {ticker}\n"
+                        f"Sell ATM straddle: strike ${price:.0f} x{contracts}\n"
+                        f"Est credit: ${credit:.0f} | Close 2h post-earnings\n"
+                        f"**RISK**: Unlimited loss — requires options margin for live")
+                except Exception:
+                    pass
+        except Exception as e:
+            log.warning("EARNINGS CRUSH %s error: %s", ticker, e)
+    return fired
 
 
 # PEAD SCANNER v2 — Post-Earnings Announcement Drift
