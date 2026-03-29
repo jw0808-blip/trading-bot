@@ -7,10 +7,11 @@
 <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: 'Courier New', monospace; background: #0a0e17; color: #c8d6e5; font-size: 13px; }
-.war-room { display: grid; grid-template-rows: auto 1fr auto; height: 100vh; gap: 1px; background: #1a1f2e; }
+.war-room { display: grid; grid-template-rows: auto auto 1fr auto; min-height: 100vh; gap: 1px; background: #1a1f2e; }
 .top-bar { display: flex; justify-content: space-around; align-items: center; padding: 10px 20px; background: #0d1117; border-bottom: 1px solid #21262d; flex-wrap: wrap; gap: 8px; }
 .metric { text-align: center; }
 .metric-label { font-size: 10px; color: #6b7280; text-transform: uppercase; letter-spacing: 1px; }
@@ -19,13 +20,13 @@ body { font-family: 'Courier New', monospace; background: #0a0e17; color: #c8d6e
 .metric-value.red { color: #ef4444; }
 .metric-value.amber { color: #f59e0b; }
 .metric-value.blue { color: #3b82f6; }
+.charts-row { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 1px; }
 .main-panels { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1px; overflow: hidden; }
 .panel { background: #0d1117; padding: 12px; overflow-y: auto; }
 .panel-title { font-size: 11px; color: #58a6ff; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #21262d; padding-bottom: 6px; margin-bottom: 8px; }
 .pos-row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #161b22; font-size: 12px; }
 .pos-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pos-cost { width: 60px; text-align: right; color: #8b949e; }
-.pos-pnl { width: 55px; text-align: right; font-weight: bold; }
 .signal-row { margin-bottom: 10px; }
 .signal-name { font-size: 11px; color: #8b949e; margin-bottom: 3px; display: flex; justify-content: space-between; }
 .signal-bar-bg { height: 8px; background: #21262d; border-radius: 4px; overflow: hidden; }
@@ -36,45 +37,47 @@ body { font-family: 'Courier New', monospace; background: #0a0e17; color: #c8d6e
 .event-row { padding: 4px 0; border-bottom: 1px solid #161b22; font-size: 11px; }
 .event-agent { color: #58a6ff; font-weight: bold; }
 .event-time { color: #484f58; font-size: 10px; }
-.event-msg { color: #c8d6e5; }
 .bottom-bar { background: #0d1117; padding: 8px 20px; border-top: 1px solid #21262d; overflow: hidden; }
 .headline-scroll { display: flex; gap: 40px; animation: scroll 60s linear infinite; white-space: nowrap; }
 .headline { font-size: 11px; color: #8b949e; }
 .headline .theme { color: #f59e0b; font-weight: bold; }
 @keyframes scroll { from { transform: translateX(0); } to { transform: translateX(-50%); } }
 .loading { color: #484f58; text-align: center; padding: 20px; }
-/* Mobile nav bar */
-.mobile-nav { display: none; position: fixed; bottom: 0; left: 0; right: 0; background: #0d1117; border-top: 1px solid #21262d; padding: 8px 0; z-index: 100; }
-.mobile-nav-inner { display: flex; justify-content: space-around; }
-.mobile-nav a { color: #58a6ff; text-decoration: none; font-size: 10px; text-align: center; padding: 4px 8px; }
-.mobile-nav a span { display: block; font-size: 16px; }
-/* Mobile responsive */
-@media (max-width: 768px) {
-  body { font-size: 14px; }
-  .war-room { height: auto; min-height: 100vh; padding-bottom: 60px; }
-  .top-bar { padding: 8px 10px; gap: 4px; justify-content: space-between; }
-  .metric { min-width: 60px; }
-  .metric-label { font-size: 9px; }
-  .metric-value { font-size: 15px; }
-  .main-panels { grid-template-columns: 1fr; grid-template-rows: auto auto auto; }
-  .panel { max-height: 40vh; padding: 10px; }
-  .pos-row { padding: 8px 0; font-size: 13px; cursor: pointer; }
-  .pos-row:active { background: #161b22; }
-  .signal-row { margin-bottom: 12px; }
-  .signal-name { font-size: 12px; }
-  .signal-bar-bg { height: 12px; }
-  .event-row { font-size: 12px; padding: 6px 0; }
-  .bottom-bar { display: none; }
-  .mobile-nav { display: block; }
-  .panel-title { font-size: 12px; padding-bottom: 8px; margin-bottom: 10px; }
-  .tag { font-size: 10px; padding: 2px 6px; }
-}
 .tag { font-size: 9px; padding: 1px 4px; border-radius: 2px; margin-left: 4px; }
 .tag-pairs { background: #1f3a5f; color: #58a6ff; }
 .tag-crypto { background: #3a1f5f; color: #a855f7; }
 .tag-pred { background: #1f5f3a; color: #22c55e; }
 .tag-oracle { background: #5f3a1f; color: #f59e0b; }
 .tag-hedge { background: #5f1f1f; color: #ef4444; }
+/* Launch criteria */
+.launch-panel { background: #0d1117; padding: 12px; }
+.criteria-row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid #161b22; }
+.criteria-label { font-size: 11px; color: #8b949e; }
+.criteria-value { font-size: 13px; font-weight: bold; }
+.criteria-bar { height: 6px; background: #21262d; border-radius: 3px; flex: 1; margin: 0 10px; }
+.criteria-fill { height: 100%; border-radius: 3px; transition: width 0.5s; }
+.criteria-fill.good { background: #22c55e; }
+.criteria-fill.warn { background: #f59e0b; }
+.criteria-fill.bad { background: #ef4444; }
+/* Chart containers */
+.chart-container { background: #0d1117; padding: 12px; min-height: 200px; }
+canvas { max-height: 180px; }
+/* Mobile nav */
+.mobile-nav { display: none; position: fixed; bottom: 0; left: 0; right: 0; background: #0d1117; border-top: 1px solid #21262d; padding: 8px 0; z-index: 100; }
+.mobile-nav-inner { display: flex; justify-content: space-around; }
+.mobile-nav a { color: #58a6ff; text-decoration: none; font-size: 10px; text-align: center; padding: 4px 8px; }
+.mobile-nav a span { display: block; font-size: 16px; }
+@media (max-width: 768px) {
+  body { font-size: 14px; }
+  .war-room { padding-bottom: 60px; }
+  .top-bar { padding: 8px 10px; gap: 4px; }
+  .metric-value { font-size: 15px; }
+  .charts-row { grid-template-columns: 1fr; }
+  .main-panels { grid-template-columns: 1fr; }
+  .panel { max-height: 40vh; }
+  .bottom-bar { display: none; }
+  .mobile-nav { display: block; }
+}
 </style>
 </head>
 <body>
@@ -102,8 +105,8 @@ function useApi(endpoint) {
 function fmt(n, d=0) { return n != null ? `$${Number(n).toLocaleString(undefined, {minimumFractionDigits:d,maximumFractionDigits:d})}` : '—'; }
 function pnlClass(n) { return n > 0 ? 'green' : n < 0 ? 'red' : ''; }
 function stratTag(s) {
-  const m = {pairs:'tag-pairs',crypto:'tag-crypto',prediction:'tag-pred',oracle_trade:'tag-oracle',crash_hedge_put:'tag-hedge',event_synthetic:'tag-pred',options_spread:'tag-hedge',tv_signal:'tag-oracle'};
-  return <span className={`tag ${m[s]||''}`}>{(s||'?').slice(0,6)}</span>;
+  const m = {pairs:'tag-pairs',crypto:'tag-crypto',prediction:'tag-pred',oracle_trade:'tag-oracle',crash_hedge_put:'tag-hedge',cascade_trade:'tag-oracle'};
+  return <span className={`tag ${m[s]||''}`}>{(s||'?').slice(0,8)}</span>;
 }
 
 function TopBar({status}) {
@@ -126,6 +129,137 @@ function TopBar({status}) {
   );
 }
 
+function EquityChart({charts}) {
+  const canvasRef = React.useRef(null);
+  const chartRef = React.useRef(null);
+  React.useEffect(() => {
+    if (!charts?.equity_curve?.length || !canvasRef.current) return;
+    if (chartRef.current) chartRef.current.destroy();
+    const ctx = canvasRef.current.getContext('2d');
+    chartRef.current = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: charts.equity_curve.map(d => d.date?.slice(5) || ''),
+        datasets: [{
+          label: 'Equity',
+          data: charts.equity_curve.map(d => d.equity),
+          borderColor: '#58a6ff', backgroundColor: 'rgba(88,166,255,0.1)',
+          fill: true, tension: 0.3, pointRadius: 2,
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { ticks: { color: '#484f58', font: { size: 9 } }, grid: { color: '#161b22' } },
+          y: { ticks: { color: '#484f58', font: { size: 9 }, callback: v => '$'+v.toLocaleString() }, grid: { color: '#161b22' } }
+        }
+      }
+    });
+  }, [charts]);
+  return (
+    <div className="chart-container">
+      <div className="panel-title">Equity Curve</div>
+      <canvas ref={canvasRef} height="170"></canvas>
+    </div>
+  );
+}
+
+function StrategyChart({charts}) {
+  const canvasRef = React.useRef(null);
+  const chartRef = React.useRef(null);
+  React.useEffect(() => {
+    if (!charts?.strategy_pnl?.length || !canvasRef.current) return;
+    if (chartRef.current) chartRef.current.destroy();
+    const colors = ['#58a6ff','#22c55e','#f59e0b','#a855f7','#ef4444','#06b6d4','#f97316'];
+    const ctx = canvasRef.current.getContext('2d');
+    chartRef.current = new Chart(ctx, {
+      type: 'doughnut',
+      data: {
+        labels: charts.strategy_pnl.map(s => s.strategy),
+        datasets: [{
+          data: charts.strategy_pnl.map(s => Math.abs(s.pnl)),
+          backgroundColor: colors,
+          borderColor: '#0d1117', borderWidth: 2,
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: {
+          legend: { position: 'bottom', labels: { color: '#8b949e', font: { size: 9 }, boxWidth: 10 } }
+        }
+      }
+    });
+  }, [charts]);
+  return (
+    <div className="chart-container">
+      <div className="panel-title">Strategy P&L</div>
+      <canvas ref={canvasRef} height="170"></canvas>
+    </div>
+  );
+}
+
+function FrequencyChart({charts}) {
+  const canvasRef = React.useRef(null);
+  const chartRef = React.useRef(null);
+  React.useEffect(() => {
+    if (!charts?.trade_freq?.length || !canvasRef.current) return;
+    if (chartRef.current) chartRef.current.destroy();
+    const ctx = canvasRef.current.getContext('2d');
+    chartRef.current = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: charts.trade_freq.map(d => d.date?.slice(5) || ''),
+        datasets: [{
+          label: 'Trades',
+          data: charts.trade_freq.map(d => d.count),
+          backgroundColor: 'rgba(34,197,94,0.6)', borderColor: '#22c55e', borderWidth: 1,
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { ticks: { color: '#484f58', font: { size: 9 } }, grid: { display: false } },
+          y: { ticks: { color: '#484f58', font: { size: 9 }, stepSize: 1 }, grid: { color: '#161b22' } }
+        }
+      }
+    });
+  }, [charts]);
+  return (
+    <div className="chart-container">
+      <div className="panel-title">Trade Frequency</div>
+      <canvas ref={canvasRef} height="170"></canvas>
+    </div>
+  );
+}
+
+function LaunchCriteria({charts}) {
+  const lc = charts?.launch_criteria || {};
+  const criteria = [
+    { label: 'Clean Trades', value: lc.clean_trades||0, target: lc.clean_trades_target||100, unit: '' },
+    { label: 'Win Rate', value: lc.win_rate||0, target: lc.win_rate_target||54, unit: '%' },
+    { label: 'Sharpe Ratio', value: lc.sharpe||0, target: lc.sharpe_target||1.5, unit: '' },
+    { label: 'Consec Days', value: lc.consec_days||0, target: lc.consec_days_target||10, unit: '' },
+  ];
+  return (
+    <div className="launch-panel">
+      <div className="panel-title">Launch Criteria Progress</div>
+      {criteria.map((c, i) => {
+        const pct = Math.min((c.value / c.target) * 100, 100);
+        const cls = pct >= 80 ? 'good' : pct >= 50 ? 'warn' : 'bad';
+        return (
+          <div key={i} className="criteria-row">
+            <span className="criteria-label" style={{width:90}}>{c.label}</span>
+            <div className="criteria-bar"><div className={`criteria-fill ${cls}`} style={{width:`${pct}%`}}/></div>
+            <span className="criteria-value" style={{width:70,textAlign:'right'}}>{c.value}{c.unit} / {c.target}{c.unit}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function Positions({status}) {
   if (!status?.positions) return <div className="panel"><div className="panel-title">Positions</div><div className="loading">Loading...</div></div>;
   return (
@@ -137,6 +271,7 @@ function Positions({status}) {
           <span className="pos-cost">{fmt(p.cost)}</span>
         </div>
       ))}
+      {status.positions.length === 0 && <div style={{color:'#22c55e',textAlign:'center',padding:20}}>Clean slate — Phase 2 ready</div>}
     </div>
   );
 }
@@ -146,53 +281,37 @@ function OracleSignals({oracle}) {
   const geo = oracle.geo_state || {};
   return (
     <div className="panel">
-      <div className="panel-title">Oracle Signals {geo.active && <span style={{color:'#ef4444'}}> GEO ALERT: {geo.theme}</span>}</div>
+      <div className="panel-title">Oracle Signals {geo.active && <span style={{color:'#ef4444'}}> GEO: {geo.theme}</span>}</div>
       {oracle.signals.map((s, i) => {
         const pct = Math.min(s.pct_to_threshold, 100);
         const cls = pct >= 90 ? 'hot' : pct >= 60 ? 'warm' : 'cool';
         return (
           <div key={i} className="signal-row">
             <div className="signal-name">
-              <span>{s.name} {s.inverse && '↓'} {s.active && '🔴'} {s.inverse && s.geo_ok === false && '⚠️geo'}</span>
+              <span>{s.name} {s.inverse && '\u2193'} {s.active && '\uD83D\uDD34'} {s.inverse && s.geo_ok === false && '\u26A0\uFE0Fgeo'}</span>
               <span>{s.long}/{s.short} — ${s.yes_price.toFixed(2)} / {s.inverse ? '<' : ''}{s.threshold.toFixed(2)}</span>
             </div>
             <div className="signal-bar-bg"><div className={`signal-bar ${cls}`} style={{width: `${pct}%`}} /></div>
           </div>
         );
       })}
-      {oracle.signals.length === 0 && <div style={{color:'#484f58'}}>No matching signals in current markets</div>}
+      {oracle.signals.length === 0 && <div style={{color:'#484f58'}}>No signals</div>}
     </div>
   );
 }
 
 function IntelFeed({intel}) {
   if (!intel?.events) return <div className="panel"><div className="panel-title">Intelligence Feed</div><div className="loading">Loading...</div></div>;
-  const isMobile = window.innerWidth < 768;
-  const events = isMobile ? intel.events.slice(0, 5) : intel.events;
   return (
     <div className="panel">
-      <div className="panel-title">Intelligence Feed {isMobile && `(${intel.events.length})`}</div>
-      {events.map((e, i) => (
+      <div className="panel-title">Intelligence Feed</div>
+      {intel.events.slice(0,8).map((e, i) => (
         <div key={i} className="event-row">
           <span className="event-time">{e.timestamp?.slice(11,16)}</span>{' '}
           <span className="event-agent">[{e.agent}]</span>{' '}
-          <span className="event-msg">{e.message}</span>
+          <span>{e.message}</span>
         </div>
       ))}
-      {intel.events.length === 0 && <div style={{color:'#484f58'}}>No agent events yet...</div>}
-    </div>
-  );
-}
-
-function MobileNav() {
-  return (
-    <div className="mobile-nav">
-      <div className="mobile-nav-inner">
-        <a href="#top"><span>$</span>Portfolio</a>
-        <a href="#signals"><span>~</span>Signals</a>
-        <a href="#intel"><span>!</span>Intel</a>
-        <a href="/api/status" target="_blank"><span>{'{}'}</span>API</a>
-      </div>
     </div>
   );
 }
@@ -216,13 +335,35 @@ function Headlines({oracle}) {
   );
 }
 
+function MobileNav() {
+  return (
+    <div className="mobile-nav">
+      <div className="mobile-nav-inner">
+        <a href="#top"><span>$</span>Portfolio</a>
+        <a href="#charts"><span>~</span>Charts</a>
+        <a href="#signals"><span>!</span>Signals</a>
+        <a href="/api/status" target="_blank"><span>{'{}'}</span>API</a>
+      </div>
+    </div>
+  );
+}
+
 function App() {
   const status = useApi('/api/status');
   const intel = useApi('/api/intelligence');
   const oracle = useApi('/api/oracle');
+  const charts = useApi('/api/charts');
   return (
     <div className="war-room">
       <TopBar status={status} />
+      <div className="charts-row" id="charts">
+        <EquityChart charts={charts} />
+        <StrategyChart charts={charts} />
+        <div style={{display:'flex',flexDirection:'column',gap:1}}>
+          <FrequencyChart charts={charts} />
+          <LaunchCriteria charts={charts} />
+        </div>
+      </div>
       <div className="main-panels">
         <div id="top"><Positions status={status} /></div>
         <div id="signals"><OracleSignals oracle={oracle} /></div>

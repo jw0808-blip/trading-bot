@@ -8894,6 +8894,69 @@ def _build_api_oracle():
     return {"signals": signals, "headlines": headlines, "geo_state": _geo_safe}
 
 
+def _build_api_charts():
+    """Build /api/charts response for dashboard equity curve, strategy P&L, trade frequency."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        # Equity curve: daily snapshots
+        c.execute("SELECT date, paper_cash FROM daily_state ORDER BY date DESC LIMIT 30")
+        equity_rows = c.fetchall()
+        equity_curve = [{"date": r[0], "equity": r[1] or 25000} for r in reversed(equity_rows)]
+        # Strategy P&L breakdown
+        c.execute("""SELECT strategy, COALESCE(SUM(realized_pnl), 0) as pnl, COUNT(*) as trades,
+            SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins
+            FROM positions WHERE status='closed' AND strategy NOT IN ('pairs_legacy')
+            AND realized_pnl IS NOT NULL GROUP BY strategy""")
+        strat_rows = c.fetchall()
+        strategy_pnl = [{"strategy": r[0], "pnl": round(r[1], 2), "trades": r[2], "wins": r[3]} for r in strat_rows]
+        # Trade frequency: trades per day last 14 days
+        c.execute("""SELECT DATE(created_at) as d, COUNT(*) FROM positions
+            WHERE created_at IS NOT NULL AND strategy NOT IN ('pairs_legacy')
+            GROUP BY DATE(created_at) ORDER BY d DESC LIMIT 14""")
+        freq_rows = c.fetchall()
+        trade_freq = [{"date": r[0], "count": r[1]} for r in reversed(freq_rows)]
+        # Launch criteria
+        c.execute("SELECT COUNT(*) FROM positions WHERE status='closed' AND strategy NOT IN ('pairs_legacy') AND created_at >= '2026-03-29'")
+        clean_trades = c.fetchone()[0]
+        c.execute("""SELECT COUNT(*), SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END)
+            FROM positions WHERE status='closed' AND strategy NOT IN ('pairs_legacy')
+            AND realized_pnl IS NOT NULL AND created_at >= '2026-03-29'""")
+        _wr_row = c.fetchone()
+        total_wr = _wr_row[0] or 0
+        wins_wr = _wr_row[1] or 0
+        win_rate = (wins_wr / total_wr * 100) if total_wr > 0 else 0
+        # Sharpe from daily P&L
+        c.execute("""SELECT SUM(realized_pnl) FROM positions WHERE status='closed'
+            AND strategy NOT IN ('pairs_legacy') AND DATE(closed_at) = DATE('now')""")
+        # Consecutive balanced days
+        c.execute("""SELECT DATE(closed_at), SUM(realized_pnl) FROM positions
+            WHERE status='closed' AND closed_at IS NOT NULL AND strategy NOT IN ('pairs_legacy')
+            GROUP BY DATE(closed_at) ORDER BY DATE(closed_at) DESC LIMIT 30""")
+        day_rows = c.fetchall()
+        consec = 0
+        for _, dpnl in day_rows:
+            if dpnl and dpnl > 0:
+                consec += 1
+            else:
+                break
+        conn.close()
+        return {
+            "equity_curve": equity_curve,
+            "strategy_pnl": strategy_pnl,
+            "trade_freq": trade_freq,
+            "launch_criteria": {
+                "clean_trades": clean_trades, "clean_trades_target": 100,
+                "win_rate": round(win_rate, 1), "win_rate_target": 54,
+                "sharpe": 0, "sharpe_target": 1.5,
+                "consec_days": consec, "consec_days_target": 10,
+            },
+        }
+    except Exception as e:
+        return {"error": str(e), "equity_curve": [], "strategy_pnl": [],
+                "trade_freq": [], "launch_criteria": {}}
+
+
 def _build_api_risk():
     """Build /api/risk response."""
     return {
@@ -8918,6 +8981,8 @@ class TVWebhookHandler(BaseHTTPRequestHandler):
                 data = _build_api_oracle()
             elif path == "/api/risk":
                 data = _build_api_risk()
+            elif path == "/api/charts":
+                data = _build_api_charts()
             elif path == "/dashboard" or path == "/":
                 # Serve the HTML dashboard
                 try:
