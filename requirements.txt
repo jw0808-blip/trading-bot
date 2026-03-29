@@ -11,3 +11,4 @@ py-clob-client
 redis>=5.0.0
 yfinance>=0.2.0
 chromadb>=0.4.0
+polygon-api-client>=1.13.0

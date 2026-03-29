@@ -1618,6 +1618,13 @@ async def on_ready():
     _sync_alpaca_to_portfolio()
     # Re-queue cascades for open oracle trades that lost queue on restart
     cascade_requeue_on_startup()
+    # Test Polygon.io connection
+    try:
+        from polygon_client import test_connection as _poly_test
+        _poly_ok, _poly_msg = _poly_test()
+        log.info("POLYGON: %s", _poly_msg)
+    except Exception as _pe:
+        log.warning("POLYGON: import/test failed: %s", _pe)
 
 
 @bot.command()
@@ -3991,6 +3998,41 @@ async def next_trades_cmd(ctx):
         msg += "\nNo opportunities above threshold right now.\n"
     msg += f"\n*Strategies: Pairs, Oracle, Crypto, Funding, Kalshi*"
     await ctx.send(msg[:1900])
+
+
+@bot.command(name="polygon-status")
+async def polygon_status_cmd(ctx):
+    """Show Polygon.io connection status and sample data."""
+    try:
+        from polygon_client import test_connection, get_quote, get_crypto_price, get_news, get_market_movers
+        ok, status_msg = test_connection()
+        msg = f"**POLYGON.IO STATUS**\n"
+        msg += f"Connection: {'OK' if ok else 'FAILED'} — {status_msg}\n"
+        if ok:
+            # Sample quote
+            spy = get_quote("SPY")
+            if spy:
+                msg += f"\nSPY: ${spy['last']:.2f} (bid ${spy['bid']:.2f} / ask ${spy['ask']:.2f}) {spy['change_pct']:+.2f}%\n"
+            # Crypto
+            btc = get_crypto_price("BTC")
+            if btc:
+                msg += f"BTC: ${btc['price']:,.2f} {btc['change_pct']:+.2f}%\n"
+            # Top movers
+            movers = get_market_movers("gainers", limit=3)
+            if movers:
+                msg += "\n**Top Gainers:**\n```\n"
+                for m in movers:
+                    msg += f"  {m['ticker']:6s} ${m['price']:.2f} {m['change_pct']:+.1f}% vol={m['volume']:,.0f}\n"
+                msg += "```"
+            # Latest news
+            news = get_news(limit=3)
+            if news:
+                msg += "\n**Latest News:**\n"
+                for n in news:
+                    msg += f"> {n['title'][:70]} — {n['source']}\n"
+        await ctx.send(msg[:1900])
+    except Exception as e:
+        await ctx.send(f"Polygon error: {e}")
 
 
 @bot.command(name="kalshi-status")
