@@ -4578,6 +4578,14 @@ async def oracle_status_cmd(ctx):
     msg += f"Signals tracked: {len(prices)} markets\n"
     _geo_str = f"ELEVATED ({geo_state['theme']}, {geo_state['count']} hits)" if geo_state["active"] else "normal"
     msg += f"Geo risk: {_geo_str} | Headlines: {_total_hl}\n"
+    # Sentiment scores per theme
+    _sent_parts = []
+    for _st in ["iran", "ukraine", "taiwan", "fed", "recession"]:
+        _ss = get_theme_sentiment(_st)
+        if _ss != 0:
+            _sent_parts.append(f"{_st}={_ss:+.2f}")
+    if _sent_parts:
+        msg += f"Sentiment: {' '.join(_sent_parts)}\n"
     msg += f"{'─' * 50}\n"
 
     if signal_lines:
@@ -10602,6 +10610,53 @@ _GEO_ESCALATION_KEYWORDS = [
     "deploy", "retaliat", "escalat", "mobiliz", "blockade",
 ]
 
+# Sentiment scoring keywords
+_SENTIMENT_POSITIVE = [
+    "ceasefire", "deal", "recovery", "stimulus", "agreement", "peace", "rally",
+    "surge", "growth", "profit", "beat", "upgrade", "optimis", "boom", "record high",
+    "ease", "relief", "cooperat", "diplomac", "deescalat", "withdraw", "retreat",
+]
+_SENTIMENT_NEGATIVE = [
+    "attack", "invasion", "crash", "recession", "sanctions", "default", "collapse",
+    "plunge", "crisis", "war", "bomb", "missile", "nuclear", "escalat", "panic",
+    "layoff", "bankrupt", "downgrade", "sell-off", "slump", "tariff", "retaliat",
+    "blockade", "deploy", "strike", "troops",
+]
+# Theme sentiment cache: {theme: {"score": float, "count": int, "ts": datetime}}
+_THEME_SENTIMENT = {}
+
+
+def _score_headline_sentiment(headline):
+    """Score a headline from -1 (very negative) to +1 (very positive)."""
+    hl = headline.lower()
+    pos = sum(1 for w in _SENTIMENT_POSITIVE if w in hl)
+    neg = sum(1 for w in _SENTIMENT_NEGATIVE if w in hl)
+    total = pos + neg
+    if total == 0:
+        return 0.0
+    return (pos - neg) / total
+
+
+def update_theme_sentiment():
+    """Calculate average sentiment per theme from recent headlines."""
+    now = datetime.now(timezone.utc)
+    import datetime as _dt_sent
+    cutoff = now - _dt_sent.timedelta(hours=2)
+    for theme, entries in _INTEL_HEADLINE_MEMORY.items():
+        recent = [(t, h) for t, h in entries if t > cutoff]
+        if not recent:
+            _THEME_SENTIMENT[theme] = {"score": 0.0, "count": 0, "ts": now}
+            continue
+        scores = [_score_headline_sentiment(h) for _, h in recent]
+        avg = sum(scores) / len(scores) if scores else 0.0
+        _THEME_SENTIMENT[theme] = {"score": round(avg, 3), "count": len(scores), "ts": now}
+
+
+def get_theme_sentiment(theme):
+    """Get sentiment score for a theme. Returns float -1 to +1."""
+    s = _THEME_SENTIMENT.get(theme, {})
+    return s.get("score", 0.0)
+
 
 # Polygon tickers mapped to themes for real-time news
 _POLYGON_THEME_TICKERS = {
@@ -10843,6 +10898,7 @@ async def scan_oracle_signals(channel=None):
         _intel_count = _intel_fetch_headlines()
         if _intel_count > 0:
             log.info("INTEL: fetched %d new headlines across %d themes", _intel_count, len(_INTEL_HEADLINE_MEMORY))
+        update_theme_sentiment()
     except Exception as _ie:
         log.warning("INTEL headline fetch error: %s", _ie)
 
@@ -10970,6 +11026,13 @@ async def scan_oracle_signals(channel=None):
             _conv_price = (1 - yes_price) if _is_inverse else yes_price
             kelly_mult = min(_conv_price * (1 + abs(delta_1h) * 5), 2.0)
             leg_size = base_size * kelly_mult * psychologist_size_multiplier() * meta_alloc_multiplier("oracle_trade")
+
+            # Sentiment boost: very negative sentiment on geo theme → 1.5x size
+            if _is_inverse and sig.get("geo_required"):
+                _sent_score = get_theme_sentiment(sig["geo_required"])
+                if _sent_score < -0.7:
+                    leg_size *= 1.5
+                    log.info("SENTIMENT BOOST: %s sentiment=%.2f → 1.5x size", signal_name, _sent_score)
 
             # Causal Memory: adjust size based on historical regime similarity
             try:
