@@ -4632,6 +4632,28 @@ async def next_trades_cmd(ctx):
     await ctx.send(msg[:1900])
 
 
+@bot.command(name="fed-sentiment")
+async def fed_sentiment_cmd(ctx):
+    """Show current Fed hawkish/dovish score and recent headlines."""
+    update_fed_sentiment()
+    fs = _FED_SENTIMENT_STATE
+    score = fs["score"]
+    label = "HAWKISH" if score > 0.2 else "DOVISH" if score < -0.2 else "NEUTRAL"
+    msg = f"**FED SENTIMENT BOT**\n"
+    msg += f"Score: **{score:+.3f}** ({label})\n"
+    msg += f"Last update: {fs.get('last_update', 'Never')}\n\n"
+    if fs.get("headlines"):
+        msg += "**Recent Fed Headlines:**\n```\n"
+        for hl, s in fs["headlines"]:
+            tag = "H" if s > 0 else "D" if s < 0 else "N"
+            msg += f"  [{tag}] {s:+.1f} {hl}\n"
+        msg += "```"
+    else:
+        msg += "No Fed headlines scored yet.\n"
+    msg += f"\n*+1.0 = max hawkish | -1.0 = max dovish | shift >0.3 triggers alert*"
+    await ctx.send(msg[:1900])
+
+
 @bot.command(name="mm-status")
 async def mm_status_cmd(ctx):
     """Show prediction market making opportunities (wide spreads)."""
@@ -11439,6 +11461,53 @@ def get_theme_sentiment(theme):
     return s.get("score", 0.0)
 
 
+# ---------------------------------------------------------------------------
+# FED SENTIMENT BOT — Hawkish/Dovish scoring from Fed-related headlines
+# ---------------------------------------------------------------------------
+_FED_HAWKISH = ["hike", "inflation", "restrictive", "higher for longer", "tighten",
+                "hawkish", "rate increase", "overheating", "hot", "above target"]
+_FED_DOVISH = ["cut", "ease", "pivot", "pause", "accommodative", "supportive",
+               "dovish", "rate decrease", "slowdown", "cool", "soft landing"]
+_FED_SENTIMENT_STATE = {"score": 0.0, "prev_score": 0.0, "headlines": [], "last_update": None}
+
+
+def update_fed_sentiment():
+    """Calculate hawkish/dovish score from Fed headlines. Returns (score, shifted)."""
+    now = datetime.now(timezone.utc)
+    import datetime as _dt_fed
+    cutoff = now - _dt_fed.timedelta(hours=2)
+    _FED_SENTIMENT_STATE["prev_score"] = _FED_SENTIMENT_STATE["score"]
+    fed_entries = _INTEL_HEADLINE_MEMORY.get("fed", [])
+    recent = [(t, h) for t, h in fed_entries if t > cutoff]
+    if not recent:
+        return _FED_SENTIMENT_STATE["score"], False
+
+    scores = []
+    headlines_scored = []
+    for _, hl in recent:
+        hl_lower = hl.lower()
+        hawk = sum(1 for w in _FED_HAWKISH if w in hl_lower)
+        dove = sum(1 for w in _FED_DOVISH if w in hl_lower)
+        total = hawk + dove
+        if total > 0:
+            s = (hawk - dove) / total  # +1 = hawkish, -1 = dovish
+            scores.append(s)
+            headlines_scored.append((hl[:60], round(s, 2)))
+
+    if scores:
+        avg = sum(scores) / len(scores)
+        _FED_SENTIMENT_STATE["score"] = round(avg, 3)
+        _FED_SENTIMENT_STATE["headlines"] = headlines_scored[-5:]
+        _FED_SENTIMENT_STATE["last_update"] = now.strftime("%Y-%m-%d %H:%M UTC")
+
+    shift = abs(_FED_SENTIMENT_STATE["score"] - _FED_SENTIMENT_STATE["prev_score"])
+    shifted = shift > 0.3
+    if shifted:
+        log.info("FED SENTIMENT SHIFT: %.2f → %.2f (shift=%.2f)",
+                 _FED_SENTIMENT_STATE["prev_score"], _FED_SENTIMENT_STATE["score"], shift)
+    return _FED_SENTIMENT_STATE["score"], shifted
+
+
 # Polygon tickers mapped to themes for real-time news
 _POLYGON_THEME_TICKERS = {
     "fed": ["SPY", "TLT", "XLF"],
@@ -11680,6 +11749,16 @@ async def scan_oracle_signals(channel=None):
         if _intel_count > 0:
             log.info("INTEL: fetched %d new headlines across %d themes", _intel_count, len(_INTEL_HEADLINE_MEMORY))
         update_theme_sentiment()
+        # Fed sentiment check
+        _fed_score, _fed_shifted = update_fed_sentiment()
+        if _fed_shifted and channel:
+            try:
+                _fed_dir = "HAWKISH" if _fed_score > 0 else "DOVISH"
+                await channel.send(
+                    f"**FED SENTIMENT SHIFT** → {_fed_dir} ({_fed_score:+.2f})\n"
+                    f"Shift > 0.3 detected — Oracle fed thresholds adjusted ±10%")
+            except Exception:
+                pass
     except Exception as _ie:
         log.warning("INTEL headline fetch error: %s", _ie)
 
