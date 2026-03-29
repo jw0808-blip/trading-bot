@@ -3846,11 +3846,12 @@ async def next_trades_cmd(ctx):
     # 1. Pairs Z-scores above 1.1
     try:
         import yfinance as _nt_yf
-        _pairs_cfg = globals().get("PAIRS_CONFIG", {})
+        _eq_cfg = globals().get("EQUITIES_CONFIG", {})
+        _pairs_cfg = _eq_cfg.get("pairs", {})
         _seed = _pairs_cfg.get("seed", [])
         for ta, tb in _seed[:20]:
             try:
-                corr, zscore, _ = calculate_pair_zscore(ta, tb, _pairs_cfg.get("lookback_days", 20))
+                corr, zscore, _ = calculate_pair_zscore(ta, tb, _pairs_cfg.get("lookback_days", 252))
                 if corr is not None and abs(zscore) >= 1.1 and corr >= 0.7:
                     # Already open?
                     _open = any(p.get("market") == f"PAIRS:{ta}/{tb}" for p in PAPER_PORTFOLIO.get("positions", []))
@@ -11184,8 +11185,8 @@ def _sync_alpaca_to_portfolio():
                     known_tickers.add(p.strip().upper())
 
         # Check known pairs config for untracked pairs
-        _pairs_cfg = globals().get("PAIRS_CONFIG", {})
-        _seed = _pairs_cfg.get("seed", [])
+        _eq_cfg = globals().get("EQUITIES_CONFIG", {})
+        _seed = _eq_cfg.get("pairs", {}).get("seed", [])
         added = 0
         for ta, tb in _seed:
             ta_u, tb_u = ta.upper(), tb.upper()
@@ -11274,19 +11275,24 @@ def reconcile_alpaca_positions():
             if sym in known_tickers:
                 continue  # Matched — this position is tracked
 
-            # Orphaned position — close it
-            log.warning("RECONCILE: Orphaned %s %s qty=%.2f val=$%.2f — closing",
-                        side, sym, abs(qty), abs(mkt_val))
-            try:
-                _cr = requests.delete(f"{ALPACA_BASE_URL}/v2/positions/{sym}",
-                                      headers=hdrs, timeout=10)
-                if _cr.status_code == 200:
-                    log.info("RECONCILE: Closed orphaned %s %s", side, sym)
-                    closed += 1
-                else:
-                    log.warning("RECONCILE: Failed to close %s: %d %s", sym, _cr.status_code, _cr.text[:100])
-            except Exception as _ce:
-                log.warning("RECONCILE: Error closing %s: %s", sym, _ce)
+            # Orphaned position — log but don't auto-close on weekends (market orders fail)
+            # Only auto-close during market hours to avoid 403 errors
+            if is_market_open():
+                log.warning("RECONCILE: Orphaned %s %s qty=%.2f val=$%.2f — closing",
+                            side, sym, abs(qty), abs(mkt_val))
+                try:
+                    _cr = requests.delete(f"{ALPACA_BASE_URL}/v2/positions/{sym}",
+                                          headers=hdrs, timeout=10)
+                    if _cr.status_code == 200:
+                        log.info("RECONCILE: Closed orphaned %s %s", side, sym)
+                        closed += 1
+                    else:
+                        log.warning("RECONCILE: Failed to close %s: %d %s", sym, _cr.status_code, _cr.text[:100])
+                except Exception as _ce:
+                    log.warning("RECONCILE: Error closing %s: %s", sym, _ce)
+            else:
+                log.info("RECONCILE: Orphaned %s %s qty=%.2f val=$%.2f — skipping (market closed)",
+                         side, sym, abs(qty), abs(mkt_val))
 
         if closed > 0:
             log.info("RECONCILE: Closed %d orphaned Alpaca positions", closed)
