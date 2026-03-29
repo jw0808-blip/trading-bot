@@ -8938,6 +8938,9 @@ class TVWebhookHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
             self.end_headers()
             self.wfile.write(_json_api.dumps(data).encode())
         except Exception as exc:
@@ -11204,8 +11207,12 @@ async def scan_theta_harvest(channel=None):
 
 def _sync_alpaca_to_portfolio():
     """On startup, check if Alpaca has positions that form pairs not in our portfolio.
-    Adds missing pairs positions to PAPER_PORTFOLIO so the reconciler doesn't close them."""
+    Adds missing pairs positions to PAPER_PORTFOLIO so the reconciler doesn't close them.
+    Skipped when portfolio has 0 positions (clean reset — closing orders may be pending)."""
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        return
+    if len(PAPER_PORTFOLIO.get("positions", [])) == 0 and PAPER_PORTFOLIO.get("cash", 0) >= 24999:
+        log.info("SYNC: skipped — clean reset detected (0 positions, full cash)")
         return
     try:
         hdrs = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
