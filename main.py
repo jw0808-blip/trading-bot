@@ -2713,15 +2713,13 @@ async def before_pairs_scan():
 async def crypto_pairs_task():
     """Crypto pairs stat arb scanner — runs every 5 minutes 24/7."""
     try:
-        import sys as _cp_sys
-        _main = _cp_sys.modules.get("__main__")
-        _scan_fn = getattr(_main, "scan_crypto_pairs", None) if _main else None
+        _scan_fn = globals().get("scan_crypto_pairs")
         if _scan_fn:
             fired = await _scan_fn()
             if fired > 0:
                 log.info("CRYPTO PAIRS: %d trades fired this cycle", fired)
         else:
-            log.warning("CRYPTO PAIRS: scan_crypto_pairs not found")
+            log.warning("CRYPTO PAIRS: scan_crypto_pairs not in globals")
     except Exception as e:
         log.warning("CRYPTO PAIRS task error: %s", e)
 
