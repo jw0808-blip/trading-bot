@@ -3005,3 +3005,8 @@ BTC: 0.014797 ($1,098.54)
 - [Polymarket] Netanyahu out by April 30?
 - EV: +3.9% | 6231 shares @ $0.038 = $238.20
 ---
+
+## Auto-Paper Trade — 02:50 UTC
+- [Polymarket] US forces enter Iran by April 30?
+- EV: +34.5% | 679 shares @ $0.345 = $235.66
+---
