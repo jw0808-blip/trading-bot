@@ -9882,9 +9882,9 @@ ORACLE_SIGNALS = [
      "inverse": True, "geo_required": "ukraine", "geo_min_headlines": 5},
     # Taiwan escalation: semiconductor supply chain disruption play
     {"name": "taiwan_escalation", "keywords": ["taiwan"],
-     "threshold": 0.35, "long": "INTC", "short": "TSM", "extra_long": "SMH",
+     "threshold": 0.35, "long": "SOXX", "short": "TSM", "extra_long": "SMH",
      "inverse": True, "geo_required": "taiwan", "geo_min_headlines": 8,
-     "extra_long_side": "short"},  # extra_long_side=short means SHORT SMH, not long
+     "extra_long_side": "short"},  # Long SOXX (US semis ETF), Short TSM + Short SMH
 ]
 
 # ---------------------------------------------------------------------------
@@ -9915,8 +9915,8 @@ CASCADE_CHAINS = {
     "taiwan_escalation": [
         {"name": "taiwan_cascade_semi", "long": "NVDA", "short": "TSM", "delay_min": 15,
          "description": "Semi supply disruption → US semis up, Taiwan semis down"},
-        {"name": "taiwan_cascade_onshore", "long": "INTC", "short": "SMH", "delay_min": 15,
-         "description": "Onshoring premium → INTC up, broad semis down"},
+        {"name": "taiwan_cascade_onshore", "long": "SOXX", "short": "SMH", "delay_min": 15,
+         "description": "Onshoring premium → US semis (SOXX) up, broad semis down"},
     ],
 }
 
