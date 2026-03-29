@@ -1,5 +1,5 @@
 {
-  "cash": 23204.556942660325,
+  "cash": 22704.556942660325,
   "positions": [
     {
       "market": "Will the Iranian regime fall by March 31?",
@@ -71,7 +71,10 @@
       "timestamp": "2026-03-25 14:37 UTC",
       "platform": "Alpaca",
       "ev": 0.11165174909705981,
-      "strategy": "prediction"
+      "strategy": "pairs",
+      "long_leg": "NVDA",
+      "short_leg": "AMD",
+      "entry_zscore": -1.1
     },
     {
       "market": "Will Trump visit China by April 30?",
@@ -221,6 +224,23 @@
       "ev": 0.345,
       "no_token_id": "76533108781962275310651165149634079251899733930834190485860627580128626747247",
       "strategy": "prediction"
+    },
+    {
+      "market": "PAIRS:XOM/CVX",
+      "side": "Short XOM / Long CVX",
+      "shares": 1,
+      "entry_price": -1.27,
+      "cost": 500.0,
+      "value": 500.0,
+      "timestamp": "2026-03-27 15:39 UTC",
+      "platform": "Alpaca",
+      "ev": 0,
+      "strategy": "pairs",
+      "long_leg": "CVX",
+      "short_leg": "XOM",
+      "entry_long_price": 211.19,
+      "entry_short_price": 117.82,
+      "entry_zscore": 1.21
     }
   ],
   "trades": [

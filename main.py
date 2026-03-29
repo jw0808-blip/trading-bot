@@ -3893,26 +3893,36 @@ async def next_trades_cmd(ctx):
     except Exception:
         pass
 
-    # 3. Crypto momentum above 6% 24h
+    # 3. Crypto momentum above 6% 24h (runs 24/7 including weekends)
     try:
-        binance_movers = _fetch_binance_movers()
-        for m in binance_movers:
-            if abs(m["chg"]) >= 6:
-                conf = min(int(abs(m["chg"]) * 5 + m["vol"] / 1e9 * 10), 85)
-                candidates.append({
-                    "strategy": "Crypto",
-                    "ticker": m["sym"],
-                    "confidence": conf,
-                    "reason": f"{m['chg']:+.1f}% 24h vol=${m['vol']/1e6:.0f}M [Binance]",
-                })
+        r = requests.get("https://api.binance.com/api/v3/ticker/24hr", timeout=10)
+        if r.status_code == 200:
+            for t in r.json():
+                sym_raw = t.get("symbol", "")
+                if not sym_raw.endswith("USDT"):
+                    continue
+                base = sym_raw.replace("USDT", "")
+                px = float(t.get("lastPrice", 0) or 0)
+                chg = float(t.get("priceChangePercent", 0) or 0)
+                vol_usd = float(t.get("quoteVolume", 0) or 0)
+                if px >= 1.0 and vol_usd >= 10_000_000 and abs(chg) >= 6 and len(base) <= 5:
+                    if base not in CRYPTO_MEME_BLACKLIST:
+                        conf = min(int(abs(chg) * 5 + vol_usd / 1e9 * 10), 85)
+                        candidates.append({
+                            "strategy": "Crypto",
+                            "ticker": base,
+                            "confidence": conf,
+                            "reason": f"{chg:+.1f}% 24h vol=${vol_usd/1e6:.0f}M ${px:,.2f} [Binance]",
+                        })
     except Exception:
         pass
 
-    # 4. Funding rates above 0.02%
+    # 4. Funding rates above 0.02% (positive or negative)
     try:
         rates = fetch_all_funding_rates()
         for asset, ri in rates.items():
             best = ri.get("best", 0)
+            most_neg = ri.get("most_negative", 0)
             if best > 0.0002:
                 ann = best * 3 * 365 * 100
                 conf = min(int(ann / 2), 70)
@@ -3921,6 +3931,15 @@ async def next_trades_cmd(ctx):
                     "ticker": asset,
                     "confidence": conf,
                     "reason": f"Rate={best*100:.4f}% ({ri['best_source']}) ann={ann:.0f}%",
+                })
+            elif most_neg < -0.0002:
+                neg_ann = abs(most_neg) * 3 * 365 * 100
+                conf = min(int(neg_ann / 2), 65)
+                candidates.append({
+                    "strategy": "Neg Funding",
+                    "ticker": asset,
+                    "confidence": conf,
+                    "reason": f"Rate={most_neg*100:.4f}% ({ri['most_negative_source']}) SHORT perp ann={neg_ann:.0f}%",
                 })
     except Exception:
         pass
