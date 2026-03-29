@@ -11664,9 +11664,11 @@ def auto_resolve_expired():
         if pos.get("strategy") != "prediction":
             continue
         mkt = pos.get("market", "")
+        # Strip YES:/NO: prefix for date parsing
+        _clean_mkt = _ar_re.sub(r'^(YES:|NO:|yes:|no:)\s*', '', mkt)
         # Match "by March 14" or "on March 8" patterns
         for pattern in [r'by (\w+)\s+(\d{1,2})', r'on (\w+)\s+(\d{1,2})']:
-            m = _ar_re.search(pattern, mkt)
+            m = _ar_re.search(pattern, _clean_mkt)
             if m:
                 months = {"January":1,"February":2,"March":3,"April":4,"May":5,"June":6,
                           "July":7,"August":8,"September":9,"October":10,"November":11,"December":12}
@@ -11689,6 +11691,9 @@ def auto_resolve_expired():
             try:
                 _c = sqlite3.connect(DB_PATH)
                 _c.execute("UPDATE paper_trades SET status='resolved_loss' WHERE market=? AND status='open'", (removed.get("market",""),))
+                _c.execute("UPDATE positions SET status='closed', closed_at=datetime('now'), exit_reason=?, realized_pnl=? WHERE market_id=? AND status='open'",
+                           (reason, salvage - removed.get("cost", 0), removed.get("market", "")))
+                db_close_position(removed.get("market", ""), 0, reason, salvage - removed.get("cost", 0))
                 _c.commit()
                 _c.close()
             except Exception:
