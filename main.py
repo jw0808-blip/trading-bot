@@ -4632,6 +4632,31 @@ async def next_trades_cmd(ctx):
     await ctx.send(msg[:1900])
 
 
+@bot.command(name="arb-spread")
+async def arb_spread_cmd(ctx):
+    """Show current Coinbase vs Binance price spreads."""
+    scan_crypto_arb_spreads()  # Fresh scan
+    msg = f"**CROSS-EXCHANGE CRYPTO ARB** (monitoring only)\n"
+    msg += f"Threshold: {CRYPTO_ARB_CONFIG['min_spread_pct']}% | Est fees: {CRYPTO_ARB_CONFIG['est_fees_pct']}%\n"
+    msg += "```\n"
+    msg += f"{'Sym':5s} {'Coinbase':>12s} {'Binance':>12s} {'Spread':>8s} {'Net':>8s} Status\n"
+    msg += f"{'-'*52}\n"
+    for sym in CRYPTO_ARB_CONFIG["pairs"]:
+        data = _CRYPTO_ARB_SPREADS.get(sym, {})
+        if data:
+            cb = data.get("coinbase", 0)
+            bn = data.get("binance", 0)
+            sp = data.get("spread_pct", 0)
+            net = sp - CRYPTO_ARB_CONFIG["est_fees_pct"]
+            status = "ALERT" if net > 0 and sp > CRYPTO_ARB_CONFIG["min_spread_pct"] else "—"
+            msg += f"{sym:5s} ${cb:>11,.2f} ${bn:>11,.2f} {sp:>7.3f}% {net:>7.3f}% {status}\n"
+        else:
+            msg += f"{sym:5s} {'—':>12s} {'—':>12s} {'—':>8s} {'—':>8s} no data\n"
+    msg += "```"
+    msg += "\n*Manual execution only — auto-trade requires dual-exchange integration*"
+    await ctx.send(msg[:1900])
+
+
 @bot.command(name="earnings-positions")
 async def earnings_positions_cmd(ctx):
     """Show simulated earnings vol crush positions."""
@@ -6460,6 +6485,24 @@ async def alert_scan_task():
                         log.warning("Funding arb %s error: %s", _fname, _fe)
             except Exception as arb_err:
                 log.warning("Funding arb scan error: %s", arb_err)
+            # === CROSS-EXCHANGE CRYPTO ARB (monitoring, 24/7) ===
+            try:
+                _arb_alerts_fn = getattr(__import__("sys").modules.get("__main__"), "scan_crypto_arb_spreads", None)
+                if _arb_alerts_fn:
+                    _arb_alerts = _arb_alerts_fn()
+                    if _arb_alerts:
+                        _arb_ch = bot.get_channel(int(DISCORD_CHANNEL_ID)) if DISCORD_CHANNEL_ID else None
+                        if _arb_ch:
+                            for _aa in _arb_alerts[:2]:
+                                try:
+                                    await _arb_ch.send(
+                                        f"**CRYPTO ARB DETECTED** (manual execution)\n"
+                                        f"{_aa['symbol']}: spread={_aa['spread_pct']:.3f}% net={_aa['net_spread']:.3f}%\n"
+                                        f"Buy on {_aa['buy_on']} at ${_aa['buy_px']:,.2f} / Sell on {_aa['sell_on']} at ${_aa['sell_px']:,.2f}")
+                                except Exception:
+                                    pass
+            except Exception:
+                pass
             # === ETF NAV ARBITRAGE (SPY premium/discount) ===
             try:
                 _etf_fn = getattr(__import__("sys").modules.get("__main__"), "scan_etf_arb", None)
@@ -16237,6 +16280,61 @@ async def scan_earnings_crush(channel=None):
         except Exception as e:
             log.warning("EARNINGS CRUSH %s error: %s", ticker, e)
     return fired
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CROSS-EXCHANGE CRYPTO ARB — Monitor Coinbase vs Binance spreads
+# MONITORING ONLY — alerts when spread exceeds threshold, no auto-trade
+# ═══════════════════════════════════════════════════════════════════
+CRYPTO_ARB_CONFIG = {
+    "enabled": True,
+    "pairs": ["BTC", "ETH", "SOL"],
+    "min_spread_pct": 0.15,      # 0.15% after estimated fees
+    "est_fees_pct": 0.10,        # ~0.05% per side
+    "close_spread_pct": 0.05,    # Target close when spread narrows
+}
+_CRYPTO_ARB_SPREADS = {}  # {symbol: {"coinbase": px, "binance": px, "spread_pct": x, "ts": dt}}
+
+
+def scan_crypto_arb_spreads():
+    """Fetch prices from Coinbase and Binance, calculate spread. Returns alerts."""
+    now = datetime.now(timezone.utc)
+    alerts = []
+    for sym in CRYPTO_ARB_CONFIG["pairs"]:
+        try:
+            # Coinbase
+            cb_px = 0
+            r1 = requests.get(f"https://api.coinbase.com/v2/prices/{sym}-USD/spot", timeout=5)
+            if r1.status_code == 200:
+                cb_px = float(r1.json().get("data", {}).get("amount", 0))
+            # Binance
+            bn_px = 0
+            r2 = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={sym}USDT", timeout=5)
+            if r2.status_code == 200:
+                bn_px = float(r2.json().get("price", 0))
+            if cb_px > 0 and bn_px > 0:
+                spread_pct = abs(cb_px - bn_px) / min(cb_px, bn_px) * 100
+                cheap_exchange = "Binance" if bn_px < cb_px else "Coinbase"
+                expensive_exchange = "Coinbase" if bn_px < cb_px else "Binance"
+                _CRYPTO_ARB_SPREADS[sym] = {
+                    "coinbase": round(cb_px, 2), "binance": round(bn_px, 2),
+                    "spread_pct": round(spread_pct, 4),
+                    "cheap": cheap_exchange, "expensive": expensive_exchange,
+                    "ts": now,
+                }
+                if spread_pct > CRYPTO_ARB_CONFIG["min_spread_pct"]:
+                    net_spread = spread_pct - CRYPTO_ARB_CONFIG["est_fees_pct"]
+                    if net_spread > 0:
+                        alerts.append({
+                            "symbol": sym, "spread_pct": spread_pct, "net_spread": net_spread,
+                            "buy_on": cheap_exchange, "sell_on": expensive_exchange,
+                            "buy_px": min(cb_px, bn_px), "sell_px": max(cb_px, bn_px),
+                        })
+                        log.info("CRYPTO ARB ALERT: %s spread=%.3f%% net=%.3f%% buy@%s sell@%s",
+                                 sym, spread_pct, net_spread, cheap_exchange, expensive_exchange)
+        except Exception as e:
+            log.warning("CRYPTO ARB %s error: %s", sym, e)
+    return alerts
 
 
 # PEAD SCANNER v2 — Post-Earnings Announcement Drift
