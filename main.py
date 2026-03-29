@@ -15087,6 +15087,32 @@ def _regime_weighted_half_kelly(portfolio_value, mc_prob, hist_stats):
     details["live_win_rate"] = p
     details["payoff_ratio"] = b
 
+    # --- Memory-Weighted Kelly: blend live win rate with historical analog ---
+    historical_p = p  # Default to live if no memory
+    try:
+        _cm_matches = causal_memory_query(strategy="pairs", n_results=5)
+        if _cm_matches and len(_cm_matches) >= 3:
+            _cm_wins = 0
+            _cm_losses = 0
+            for meta, dist in _cm_matches:
+                _cm_pnl = meta.get("daily_pnl_pairs", 0)
+                if isinstance(_cm_pnl, (int, float)):
+                    if _cm_pnl > 0:
+                        _cm_wins += 1
+                    elif _cm_pnl < 0:
+                        _cm_losses += 1
+            _cm_total = _cm_wins + _cm_losses
+            if _cm_total >= 3:
+                historical_p = _cm_wins / _cm_total
+                # Blend: 60% live + 40% historical analog
+                p = p * 0.6 + historical_p * 0.4
+                log.info("MEMORY KELLY: live_wr=%.0f%% historical_wr=%.0f%% → blended=%.0f%%",
+                         details["live_win_rate"] * 100, historical_p * 100, p * 100)
+    except Exception:
+        pass
+    details["historical_win_rate"] = historical_p
+    details["blended_win_rate"] = p
+
     # --- Half-Kelly: f = (p - q/b) / 2 ---
     q = 1 - p
     if b > 0:
