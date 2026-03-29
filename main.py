@@ -1614,6 +1614,8 @@ async def on_ready():
         regime_snapshot_task.start()
     # Initialize ChromaDB causal memory
     _init_chromadb()
+    # Sync Alpaca positions into portfolio — add any tracked positions missing from ledger
+    _sync_alpaca_to_portfolio()
     # Re-queue cascades for open oracle trades that lost queue on restart
     cascade_requeue_on_startup()
 
@@ -11157,6 +11159,74 @@ async def scan_theta_harvest(channel=None):
     return fired
 
 
+def _sync_alpaca_to_portfolio():
+    """On startup, check if Alpaca has positions that form pairs not in our portfolio.
+    Adds missing pairs positions to PAPER_PORTFOLIO so the reconciler doesn't close them."""
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        return
+    try:
+        hdrs = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+        r = requests.get(f"{ALPACA_BASE_URL}/v2/positions", headers=hdrs, timeout=10)
+        if r.status_code != 200:
+            return
+        alpaca_positions = {p.get("symbol", "").upper(): p for p in r.json()}
+
+        # Build known tickers from portfolio
+        known_tickers = set()
+        for pos in PAPER_PORTFOLIO.get("positions", []):
+            for _lk in ("long_leg", "short_leg", "extra_long_leg"):
+                _l = pos.get(_lk, "")
+                if _l:
+                    known_tickers.add(_l.upper())
+            mkt = pos.get("market", "")
+            if "PAIRS:" in mkt:
+                for p in mkt.replace("PAIRS:", "").split("/"):
+                    known_tickers.add(p.strip().upper())
+
+        # Check known pairs config for untracked pairs
+        _pairs_cfg = globals().get("PAIRS_CONFIG", {})
+        _seed = _pairs_cfg.get("seed", [])
+        added = 0
+        for ta, tb in _seed:
+            ta_u, tb_u = ta.upper(), tb.upper()
+            pair_id = f"PAIRS:{ta}/{tb}"
+            # Both tickers in Alpaca but neither in portfolio?
+            if ta_u in alpaca_positions and tb_u in alpaca_positions:
+                if ta_u not in known_tickers and tb_u not in known_tickers:
+                    # Determine long/short from Alpaca side
+                    a_side = alpaca_positions[ta_u].get("side", "")
+                    b_side = alpaca_positions[tb_u].get("side", "")
+                    if a_side == "long" and b_side == "short":
+                        long_tk, short_tk = ta_u, tb_u
+                    elif a_side == "short" and b_side == "long":
+                        long_tk, short_tk = tb_u, ta_u
+                    else:
+                        continue
+                    a_val = abs(float(alpaca_positions[ta_u].get("market_value", 0)))
+                    b_val = abs(float(alpaca_positions[tb_u].get("market_value", 0)))
+                    cost = a_val + b_val
+                    entry_long = float(alpaca_positions[long_tk].get("avg_entry_price", 0))
+                    entry_short = float(alpaca_positions[short_tk].get("avg_entry_price", 0))
+                    _pos = {
+                        "market": pair_id, "side": f"Long {long_tk} / Short {short_tk}",
+                        "shares": 1, "entry_price": 0, "cost": cost, "value": cost,
+                        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                        "platform": "Alpaca", "ev": 0, "strategy": "pairs",
+                        "long_leg": long_tk, "short_leg": short_tk,
+                        "entry_long_price": entry_long, "entry_short_price": entry_short,
+                    }
+                    PAPER_PORTFOLIO["positions"].append(_pos)
+                    known_tickers.add(ta_u)
+                    known_tickers.add(tb_u)
+                    added += 1
+                    log.info("SYNC: Added missing pair %s (L:%s S:%s cost=$%.0f) from Alpaca",
+                             pair_id, long_tk, short_tk, cost)
+        if added > 0:
+            log.info("SYNC: Added %d missing pairs positions from Alpaca", added)
+    except Exception as e:
+        log.warning("SYNC: Alpaca portfolio sync error: %s", e)
+
+
 def reconcile_alpaca_positions():
     """Close any Alpaca positions that have no matching open position in PAPER_PORTFOLIO.
     Prevents orphaned directional risk from failed pairs orders."""
@@ -11175,19 +11245,24 @@ def reconcile_alpaca_positions():
         # Build set of tickers that PAPER_PORTFOLIO knows about
         known_tickers = set()
         for pos in PAPER_PORTFOLIO.get("positions", []):
-            # Pairs: long_leg and short_leg
-            ll = pos.get("long_leg", "")
-            sl = pos.get("short_leg", "")
-            if ll:
-                known_tickers.add(ll.upper())
-            if sl:
-                known_tickers.add(sl.upper())
-            # Market string fallback for non-pairs
+            # Pairs/Oracle/Cascade: long_leg, short_leg, extra_long_leg
+            for _leg_key in ("long_leg", "short_leg", "extra_long_leg"):
+                _leg = pos.get(_leg_key, "")
+                if _leg:
+                    known_tickers.add(_leg.upper())
+            # Market string fallback: parse PAIRS:A/B and ORACLE:* formats
             mkt = pos.get("market", "")
             if "PAIRS:" in mkt:
                 parts = mkt.replace("PAIRS:", "").split("/")
                 for p in parts:
                     known_tickers.add(p.strip().upper())
+            elif "CASCADE:" in mkt or "ORACLE:" in mkt:
+                # Oracle/cascade tickers already captured via leg fields above
+                pass
+            # Option symbols (crash hedge)
+            _opt = pos.get("option_symbol", "")
+            if _opt:
+                known_tickers.add(_opt.upper())
 
         closed = 0
         for ap in alpaca_positions:
