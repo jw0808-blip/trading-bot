@@ -3020,3 +3020,8 @@ BTC: 0.014797 ($1,098.54)
 - [Polymarket] US forces enter Iran by April 30?
 - EV: +33.5% | 685 shares @ $0.335 = $230.85
 ---
+
+## Auto-Paper Trade — 12:30 UTC
+- [Polymarket] US forces enter Iran by April 30?
+- EV: +32.5% | 699 shares @ $0.325 = $228.54
+---
