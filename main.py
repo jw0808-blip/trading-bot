@@ -1615,6 +1615,8 @@ async def on_ready():
         evening_briefing_task.start()
     if not regime_snapshot_task.is_running():
         regime_snapshot_task.start()
+    if not pairs_scan_task.is_running():
+        pairs_scan_task.start()
     # Initialize ChromaDB causal memory
     _init_chromadb()
     # Sync Alpaca positions into portfolio — add any tracked positions missing from ledger
@@ -2530,6 +2532,28 @@ async def before_regime_snapshot():
     wait_secs = (target - now_et).total_seconds()
     log.info("Regime snapshot scheduled in %.0f minutes", wait_secs / 60)
     await asyncio.sleep(wait_secs)
+
+
+@tasks.loop(minutes=30)
+async def pairs_scan_task():
+    """Dedicated pairs scanner — runs every 30 minutes during market hours.
+    Independent of main 10-minute loop for higher trade frequency."""
+    if not EQUITIES_ENABLED or not is_market_open():
+        return
+    try:
+        log.info("PAIRS SCAN (dedicated): starting 30-min cycle")
+        opps = scan_pairs_opportunities()
+        if opps:
+            log.info("PAIRS SCAN (dedicated): %d opportunities found", len(opps))
+    except Exception as e:
+        log.warning("PAIRS SCAN (dedicated) error: %s", e)
+
+@pairs_scan_task.before_loop
+async def before_pairs_scan():
+    await bot.wait_until_ready()
+    import asyncio
+    # Wait 15 minutes to offset from the main 10-min loop
+    await asyncio.sleep(900)
 
 
 # ============================================================================
