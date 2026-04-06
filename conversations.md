@@ -3090,3 +3090,8 @@ BTC: 0.014797 ($1,098.54)
 - [Crypto] UNI $3.13 (-13.5% 24h)
 - EV: +4.0% | 13 shares @ $3.130 = $40.93
 ---
+
+## Auto-Paper Trade — 04:29 UTC
+- [Polymarket] Will the U.S. invade Iran before 2027?
+- EV: +57.5% | 356 shares @ $0.575 = $205.93
+---
