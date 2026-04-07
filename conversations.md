@@ -3100,3 +3100,8 @@ BTC: 0.014797 ($1,098.54)
 - [Crypto] TAO $322.06 (+8.5% 24h)
 - EV: +2.6% | 1 shares @ $322.060 = $323.99
 ---
+
+## Auto-Paper Trade — 03:50 UTC
+- [Polymarket] US x Iran ceasefire by April 30?
+- EV: +26.5% | 313 shares @ $0.265 = $83.44
+---
