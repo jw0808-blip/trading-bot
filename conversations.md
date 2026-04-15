@@ -3225,3 +3225,8 @@ BTC: 0.014797 ($1,098.54)
 - [Crypto] RAVE $13.50 (-9.9% 24h)
 - EV: +3.0% | 7 shares @ $13.500 = $95.07
 ---
+
+## Auto-Paper Trade — 14:14 UTC
+- [Polymarket] Israel x Hezbollah ceasefire by April 15, 2026?
+- EV: +47.5% | 336 shares @ $0.475 = $160.56
+---
