@@ -3235,3 +3235,8 @@ BTC: 0.014797 ($1,098.54)
 - [Crypto] ORDI $3.33 (+35.7% 24h)
 - EV: +10.7% | 56 shares @ $3.330 = $187.60
 ---
+
+## Auto-Paper Trade — 15:36 UTC
+- [Polymarket] Israel x Hezbollah ceasefire by April 30, 2026?
+- EV: +12.6% | 1629 shares @ $0.126 = $206.49
+---
