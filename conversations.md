@@ -3250,3 +3250,8 @@ BTC: 0.014797 ($1,098.54)
 - [Polymarket] US x Iran permanent peace deal by April 30, 2026?
 - EV: +35.5% | 566 shares @ $0.355 = $202.14
 ---
+
+## Auto-Paper Trade — 16:58 UTC
+- [Crypto] PROM $2.25 (+40.2% 24h)
+- EV: +12.1% | 88 shares @ $2.250 = $199.19
+---
