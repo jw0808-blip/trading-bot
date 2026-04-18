@@ -3245,3 +3245,8 @@ BTC: 0.014797 ($1,098.54)
 - [Crypto] RAVE $16.98 (+36.8% 24h)
 - EV: +11.0% | 5 shares @ $16.980 = $93.95
 ---
+
+## Auto-Paper Trade — 16:58 UTC
+- [Polymarket] US x Iran permanent peace deal by April 30, 2026?
+- EV: +35.5% | 566 shares @ $0.355 = $202.14
+---
