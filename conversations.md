@@ -3295,3 +3295,8 @@ BTC: 0.014797 ($1,098.54)
 - [Crypto] ZRO $1.60 (-18.3% 24h)
 - EV: +5.5% | 133 shares @ $1.600 = $214.08
 ---
+
+## Auto-Paper Trade — 06:48 UTC
+- [Polymarket] US x Iran permanent peace deal by April 30, 2026?
+- EV: +38.5% | 561 shares @ $0.385 = $217.28
+---
