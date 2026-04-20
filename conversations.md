@@ -3370,3 +3370,8 @@ BTC: 0.014797 ($1,098.54)
 - [Crypto] ZEC $307.18 (-8.4% 24h)
 - EV: +2.5% | 1 shares @ $307.180 = $309.02
 ---
+
+## Auto-Paper Trade — 17:03 UTC
+- [Polymarket] US x Iran diplomatic meeting by April 21, 2026?
+- EV: +41.5% | 474 shares @ $0.415 = $197.89
+---
