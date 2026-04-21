@@ -3385,3 +3385,8 @@ BTC: 0.014797 ($1,098.54)
 - [Crypto] ORDI $4.91 (+9.3% 24h)
 - EV: +2.8% | 36 shares @ $4.910 = $177.82
 ---
+
+## Auto-Paper Trade — 20:55 UTC
+- [Polymarket] US x Iran ceasefire extended by April 21, 2026?
+- EV: +43.5% | 420 shares @ $0.435 = $183.80
+---
