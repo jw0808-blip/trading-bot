@@ -11191,7 +11191,19 @@ _VRP_REGIME_STATE = {"current": "none", "last_switch": None, "cycle_count": 0}
 # ORACLE ENGINE — Prediction-market-driven equity trades
 # ---------------------------------------------------------------------------
 ORACLE_CONFIG = {
-    "enabled": True,
+    "enabled": False,                # DISABLED 2026-04-22 per May 3 decision
+                                     # matrix (oracle = HOLD until next catalyst).
+                                     # scan_oracle_signals() returns 0 immediately
+                                     # when this is False. Also: the in-memory
+                                     # dedup at main.py:15787 only checks
+                                     # PAPER_PORTFOLIO (filled positions) not the
+                                     # SQLite positions table, so WAL-pending rows
+                                     # from pending_new orders don't get deduped.
+                                     # 132 such phantoms accumulated 2026-04-21→22
+                                     # and were cleaned up via
+                                     # oracle_phantom_cleanup_2026-04-22.
+                                     # Re-enable when (a) catalyst returns and
+                                     # (b) dedup is fixed to query SQLite.
     "base_size_pct": 0.0075,         # 0.75% of portfolio per leg
     "ttl_hours": 48,                 # Max hold time
     "cooldown_hours": 4,             # Min hours between same signal re-entry
