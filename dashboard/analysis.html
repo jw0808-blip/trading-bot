@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<!--
+  TraderJoes Trading Analysis Dashboard — MAY 3 DECISION VIEW
+  Standalone page, separate from /app/dashboard/index.html (the ops view).
+  Mock dataset embedded for immediate viewing.
+  To wire to live VPS data, replace the MOCK_DATA block with fetch calls:
+    /api/tier_summary       (tier balances + status)
+    /api/status?tier=PAPER  (paper strategy_stats + totals)
+    /api/shadow_strategies  (per-strategy shadow + SGS join)
+    /api/sgs                (latest SGS + recommendation per strategy)
+  See main.py _build_api_tier_summary / _build_api_sgs for endpoint shapes.
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TraderJoes — May 3 Decision View</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+:root {
+  --bg: #0a0e1a; --panel: rgba(13,17,30,0.85); --border: rgba(255,255,255,0.06);
+  --text: #e2e8f0; --text-dim: #6b7280; --blue: #00d4ff; --green: #22c55e;
+  --red: #ef4444; --amber: #f59e0b; --gold: #ffd700;
+}
+html, body { min-height: 100%; background: var(--bg); color: var(--text); font: 13px/1.5 Inter, system-ui, sans-serif; }
+.app { max-width: 1400px; margin: 0 auto; padding: 20px; }
+.hdr { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 8px; }
+.hdr h1 { font-size: 20px; font-weight: 800; letter-spacing: 2px; color: var(--gold); }
+.hdr .sub { font-size: 10px; color: var(--text-dim); letter-spacing: 1.5px; text-transform: uppercase; }
+.tf-row { display: flex; gap: 4px; }
+.tf { background: rgba(255,255,255,0.04); border: 1px solid transparent; color: var(--text-dim); padding: 5px 12px; border-radius: 6px; cursor: pointer; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; }
+.tf.active { background: rgba(0,212,255,0.15); color: var(--blue); border-color: rgba(0,212,255,0.35); }
+.grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); margin-bottom: 14px; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 14px; backdrop-filter: blur(8px); }
+.panel h2 { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1.8px; color: var(--blue); margin-bottom: 10px; }
+.card { background: rgba(255,255,255,0.02); border-left: 3px solid var(--text-dim); border-radius: 4px; padding: 10px 12px; margin-bottom: 8px; cursor: pointer; transition: background 0.15s ease; }
+.card:hover { background: rgba(255,255,255,0.04); }
+.card.green { border-left-color: var(--green); }
+.card.yellow { border-left-color: var(--amber); }
+.card.red { border-left-color: var(--red); }
+.card.hidden { display: none; }
+.card-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+.card-name { font-weight: 700; font-size: 13px; letter-spacing: 0.3px; }
+.card-pnl { font-weight: 700; font-variant-numeric: tabular-nums; font-size: 13px; }
+.green-txt { color: var(--green); } .red-txt { color: var(--red); } .amber-txt { color: var(--amber); } .dim { color: var(--text-dim); }
+.card-stats { display: flex; gap: 14px; font-size: 10px; color: var(--text-dim); }
+.card-stats span { font-variant-numeric: tabular-nums; }
+.card-detail { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); font-size: 11px; color: var(--text-dim); line-height: 1.6; }
+.platform-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 6px; }
+.p-cell { padding: 8px 10px; border-radius: 4px; background: rgba(255,255,255,0.02); border-left: 2px solid var(--green); }
+.p-cell.yellow { border-left-color: var(--amber); } .p-cell.red { border-left-color: var(--red); }
+.p-cell-name { font-size: 9px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.8px; }
+.p-cell-bal { font-size: 14px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.matrix { width: 100%; border-collapse: collapse; font-size: 12px; }
+.matrix th, .matrix td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); }
+.matrix th { font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1px; font-weight: 600; }
+.matrix td.rec { font-weight: 700; }
+.pill { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 10px; font-weight: 700; letter-spacing: 0.5px; }
+.pill.green { background: rgba(34,197,94,0.15); color: var(--green); }
+.pill.yellow { background: rgba(245,158,11,0.15); color: var(--amber); }
+.pill.red { background: rgba(239,68,68,0.15); color: var(--red); }
+.pnl-chart { position: relative; height: 200px; }
+.toggle-row { display: flex; gap: 4px; flex-wrap: wrap; font-size: 10px; margin: 8px 0 4px; }
+.toggle { padding: 3px 8px; border-radius: 3px; cursor: pointer; background: rgba(255,255,255,0.04); color: var(--text-dim); border: 1px solid transparent; }
+.toggle.on { background: rgba(0,212,255,0.1); color: var(--blue); border-color: rgba(0,212,255,0.3); }
+.footer { text-align: center; font-size: 10px; color: var(--text-dim); padding: 20px 0; border-top: 1px solid var(--border); margin-top: 20px; }
+@media (max-width: 640px) {
+  .app { padding: 12px; }
+  .hdr h1 { font-size: 16px; }
+  .grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useMemo } = React;
+
+// ============================================================================
+// MOCK DATA  —  Replace with fetch() calls against VPS APIs when wiring live.
+// Shape chosen to match the user-specified dataset in CLAUDE_CODE_PROMPT.md.
+// ============================================================================
+const MOCK_DATA = {
+  today: {
+    vrp_income:       { trades: 3, closed: 3, wr: 100, pnl: 1077,  status: "green",
+                        rationale: "Mechanical theta decay. 3/3 SPY short-puts expired OTM." },
+    oracle_futures:   { trades: 0, closed: 0, wr: null, pnl: 0,    status: "red",
+                        rationale: "Holding 1 stale catalyst position. Sharpe 5.36→1.68 since last trade." },
+    crypto_momentum:  { trades: 9, closed: 9, wr: 33,  pnl: -16,   status: "red",
+                        rationale: "WR collapse 60%→33%. Regime shift or signal decay under investigation." },
+    liquidity_vacuum: { trades: 7, closed: 7, wr: 0,   pnl: 0,     status: "yellow",
+                        rationale: "7/7 expired flat at TTL. No fills, no losses. Signal quality TBD." },
+    pairs:            { trades: 1, closed: 1, wr: 0,   pnl: -1.72, status: "yellow",
+                        rationale: "Z-score near-flat; engineer tightened entry 1.8→2.1 this week." },
+    total_pnl: 1059.28,
+  },
+  platforms: {
+    alpaca:     { balance: 98767, status: "green",  label: "Alpaca (paper)" },
+    coinbase:   { balance: 85174, status: "green",  label: "Coinbase (paper)" },
+    ib_gateway: { balance: 11645, status: "green",  label: "IB Gateway (paper)" },
+    kalshi:     { balance: 1238,  status: "yellow", label: "Kalshi" },
+    polymarket: { balance: 2025,  status: "green",  label: "Polymarket" },
+    phemex:     { balance: 5118,  status: "yellow", label: "Phemex" },
+  },
+  // Daily cumulative P&L curve — morning audit through current
+  pnl_series: [
+    { t: "Apr 19 00:00", pnl: 0 },
+    { t: "Apr 20 00:00", pnl: 348 },
+    { t: "Apr 20 12:00", pnl: 686 },
+    { t: "Apr 20 23:40", pnl: 695 },
+    { t: "Apr 21 12:00", pnl: 1059 },
+    { t: "Apr 22 09:00", pnl: 1077 },
+  ],
+  decisions: [
+    { strategy: "VRP Income",          rec: "READY",   color: "green",
+      size: "$10K first tranche", gate: "options_replay validation; May 3 approval" },
+    { strategy: "Phemex S1 (Funding)", rec: "PENDING", color: "yellow",
+      size: "$5K shadow deploy",  gate: "7-day shadow → 14-day paper → live eligible" },
+    { strategy: "Oracle Futures",      rec: "HOLD",    color: "red",
+      size: "—",                  gate: "Wait for next geopolitical catalyst; re-evaluate" },
+    { strategy: "Crypto Momentum",     rec: "HOLD",    color: "red",
+      size: "—",                  gate: "WR recovery to ≥55% over 30 trades" },
+    { strategy: "Liquidity Vacuum",    rec: "HOLD",    color: "yellow",
+      size: "—",                  gate: "Need first real fill + edge signal" },
+    { strategy: "Pairs",               rec: "HOLD",    color: "yellow",
+      size: "—",                  gate: "Engineer-tuned threshold stabilization" },
+  ],
+};
+
+// ============================================================================
+// Components
+// ============================================================================
+const fmt = (n, digits = 0) => n == null ? "—"
+  : "$" + Number(n).toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits });
+const pnlFmt = (n, digits = 2) => n == null ? "—" : (n >= 0 ? "+" : "") + fmt(n, digits);
+const pnlClass = (n) => n == null ? "dim" : n > 0 ? "green-txt" : n < 0 ? "red-txt" : "dim";
+
+function StrategyCard({ name, data, expanded, onToggle, visible }) {
+  if (!visible) return null;
+  const wrStr = data.wr == null ? "—" : data.wr + "%";
+  return (
+    <div className={`card ${data.status}`} onClick={onToggle}>
+      <div className="card-top">
+        <span className="card-name">{name}</span>
+        <span className={`card-pnl ${pnlClass(data.pnl)}`}>{pnlFmt(data.pnl)}</span>
+      </div>
+      <div className="card-stats">
+        <span>trades {data.trades}</span>
+        <span>closed {data.closed}</span>
+        <span>WR {wrStr}</span>
+      </div>
+      {expanded && <div className="card-detail">{data.rationale}</div>}
+    </div>
+  );
+}
+
+function StrategyGrid({ data, timeframe }) {
+  const [expanded, setExpanded] = useState(null);
+  const strategies = Object.entries(data.today).filter(([k]) => k !== "total_pnl");
+  const [visible, setVisible] = useState(Object.fromEntries(strategies.map(([k]) => [k, true])));
+  return (
+    <div className="panel">
+      <h2>Strategy Performance · {timeframe}</h2>
+      <div className="toggle-row">
+        {strategies.map(([k]) => (
+          <span key={k} className={`toggle ${visible[k] ? "on" : ""}`}
+            onClick={() => setVisible({ ...visible, [k]: !visible[k] })}>
+            {k.replace(/_/g, " ")}
+          </span>
+        ))}
+      </div>
+      {strategies.map(([k, v]) => (
+        <StrategyCard key={k} name={k.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())}
+          data={v} expanded={expanded === k} visible={visible[k]}
+          onToggle={() => setExpanded(expanded === k ? null : k)} />
+      ))}
+      <div style={{ marginTop: 12, paddingTop: 10, borderTop: "1px solid var(--border)",
+                     display: "flex", justifyContent: "space-between", fontSize: 13 }}>
+        <span style={{ color: "var(--text-dim)", fontWeight: 700 }}>TOTAL</span>
+        <span className={pnlClass(data.today.total_pnl)} style={{ fontWeight: 700 }}>
+          {pnlFmt(data.today.total_pnl)}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function PnlChart({ series }) {
+  const ref = useRef(null);
+  const chart = useRef(null);
+  useEffect(() => {
+    if (!ref.current || !series?.length) return;
+    if (chart.current) chart.current.destroy();
+    chart.current = new Chart(ref.current, {
+      type: "line",
+      data: {
+        labels: series.map(p => p.t),
+        datasets: [{
+          data: series.map(p => p.pnl),
+          borderColor: "#22c55e", backgroundColor: "rgba(34,197,94,0.12)",
+          borderWidth: 2, fill: true, tension: 0.25, pointRadius: 3, pointBackgroundColor: "#22c55e",
+        }],
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false },
+          tooltip: { callbacks: { label: c => "+$" + c.parsed.y.toLocaleString() } } },
+        scales: {
+          x: { ticks: { color: "#6b7280", font: { size: 9 }, maxRotation: 0, autoSkipPadding: 20 },
+               grid: { color: "rgba(255,255,255,0.03)" } },
+          y: { ticks: { color: "#6b7280", callback: v => "$" + v },
+               grid: { color: "rgba(255,255,255,0.03)" } },
+        },
+      },
+    });
+    return () => { if (chart.current) chart.current.destroy(); };
+  }, [series]);
+  return (
+    <div className="panel">
+      <h2>Cumulative P&L · Apr 19 → now</h2>
+      <div className="pnl-chart"><canvas ref={ref}></canvas></div>
+    </div>
+  );
+}
+
+function PlatformGrid({ platforms }) {
+  return (
+    <div className="panel">
+      <h2>Platforms</h2>
+      <div className="platform-grid">
+        {Object.entries(platforms).map(([k, v]) => (
+          <div key={k} className={`p-cell ${v.status}`}>
+            <div className="p-cell-name">{v.label}</div>
+            <div className="p-cell-bal">{fmt(v.balance)}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function DecisionMatrix({ decisions }) {
+  return (
+    <div className="panel">
+      <h2>May 3 Decision Matrix</h2>
+      <table className="matrix">
+        <thead>
+          <tr><th>Strategy</th><th>Recommendation</th><th>Size / Action</th><th>Gate</th></tr>
+        </thead>
+        <tbody>
+          {decisions.map(d => (
+            <tr key={d.strategy}>
+              <td style={{ fontWeight: 700 }}>{d.strategy}</td>
+              <td className="rec"><span className={`pill ${d.color}`}>{d.rec}</span></td>
+              <td>{d.size}</td>
+              <td style={{ color: "var(--text-dim)", fontSize: 11 }}>{d.gate}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function App() {
+  const [tf, setTf] = useState("today");
+  // NOTE: tf filter would switch fetch URL / data slice when wired live.
+  // For mock, we just relabel the header; all sections use the same dataset.
+  return (
+    <div className="app">
+      <div className="hdr">
+        <div>
+          <h1>TRADERJOES <span className="sub">· May 3 decision view</span></h1>
+        </div>
+        <div className="tf-row">
+          {["today", "7d", "30d", "all"].map(t => (
+            <span key={t} className={`tf ${tf === t ? "active" : ""}`} onClick={() => setTf(t)}>
+              {t}
+            </span>
+          ))}
+        </div>
+      </div>
+
+      <div className="grid">
+        <StrategyGrid data={MOCK_DATA} timeframe={tf} />
+        <PnlChart series={MOCK_DATA.pnl_series} />
+      </div>
+
+      <PlatformGrid platforms={MOCK_DATA.platforms} />
+      <div style={{ height: 14 }}></div>
+      <DecisionMatrix decisions={MOCK_DATA.decisions} />
+
+      <div className="footer">
+        Analysis view · mock data. To wire live, replace MOCK_DATA with fetches to
+        <code> /api/tier_summary, /api/status, /api/shadow_strategies, /api/sgs</code>.
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
