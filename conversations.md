@@ -3400,3 +3400,8 @@ BTC: 0.014797 ($1,098.54)
 - [Polymarket] US x Iran ceasefire extended by April 22, 2026?
 - EV: +33.0% | 564 shares @ $0.330 = $187.24
 ---
+
+## Auto-Paper Trade — 13:25 UTC
+- [Polymarket] US x Iran ceasefire extended by April 22, 2026?
+- EV: +40.0% | 465 shares @ $0.400 = $187.12
+---
