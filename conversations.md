@@ -3415,3 +3415,8 @@ BTC: 0.014797 ($1,098.54)
 - [Polymarket] US x Iran permanent peace deal by May 31, 2026?
 - EV: +36.5% | 486 shares @ $0.365 = $178.45
 ---
+
+## Auto-Paper Trade — 13:44 UTC
+- [Crypto] DEXE $14.05 (+15.3% 24h)
+- EV: +4.6% | 12 shares @ $14.050 = $169.61
+---
