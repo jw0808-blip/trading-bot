@@ -3435,3 +3435,8 @@ BTC: 0.014797 ($1,098.54)
 - [Polymarket] Israel x Hezbollah Ceasefire extended by April 26, 2026?
 - EV: +49.5% | 321 shares @ $0.495 = $159.85
 ---
+
+## Auto-Paper Trade — 07:11 UTC
+- [Crypto] MOVR $2.36 (+39.3% 24h)
+- EV: +11.8% | 66 shares @ $2.360 = $156.69
+---
