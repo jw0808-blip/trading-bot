@@ -3450,3 +3450,8 @@ BTC: 0.014797 ($1,098.54)
 - [Polymarket] US x Iran diplomatic meeting by April 30, 2026?
 - EV: +64.5% | 269 shares @ $0.645 = $174.55
 ---
+
+## Auto-Paper Trade — 00:33 UTC
+- [Crypto] MOVR $2.22 (-19.4% 24h)
+- EV: +5.8% | 79 shares @ $2.220 = $176.43
+---
