@@ -3540,3 +3540,8 @@ BTC: 0.014797 ($1,098.54)
 - [Crypto] ORCA $1.29 (-17.2% 24h)
 - EV: +5.1% | 141 shares @ $1.290 = $182.98
 ---
+
+## Auto-Paper Trade — 03:03 UTC
+- [Polymarket] Israel x Hezbollah Ceasefire extended by April 26, 2026?
+- EV: +38.5% | 469 shares @ $0.385 = $181.65
+---
