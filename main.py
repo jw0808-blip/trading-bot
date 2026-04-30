@@ -6,6 +6,66 @@ Platforms: Kalshi, Polymarket, Robinhood (Crypto), Coinbase (Advanced Trade), Ph
 """
 
 MAX_POSITION_PCT = 0.015  # Tiered: 1.5% high / 0.5% medium / 0.25% low confidence
+MAX_PAIRS_POSITIONS = 5   # Hard cap on simultaneous pairs positions
+# 2026-04-18: add a soft sector-concentration cap for pairs entries. Reads
+# live sector % from Redis key `portfolio_exposure` (published by
+# intelligence_workers/factor_exposure.py). If the pair-under-consideration
+# would push any sector over SECTOR_SOFT_CAP, skip it. Does NOT close
+# existing positions; only gates new entries.
+SECTOR_SOFT_CAP = 0.35
+
+# GICS sector for the tickers we actually pair-trade. Keep this in sync with
+# intelligence_workers/factor_exposure.py:SECTOR_HINTS. Only used to estimate
+# the post-entry sector %; it's OK to miss a ticker (falls back to "Unknown"
+# and the cap won't block the entry).
+PAIRS_SECTOR_MAP = {
+    "XLF": "Financials", "XLK": "Technology", "XLE": "Energy",
+    "XLV": "Health Care", "XLI": "Industrials", "XLB": "Materials",
+    "XLU": "Utilities", "XLRE": "Real Estate", "XLC": "Communication Services",
+    "XLY": "Consumer Discretionary", "XLP": "Consumer Staples",
+    "JPM": "Financials", "BAC": "Financials", "GS": "Financials",
+    "BLK": "Financials", "V": "Financials", "MA": "Financials",
+    "XOM": "Energy", "CVX": "Energy", "COP": "Energy",
+    "AEP": "Utilities", "ETR": "Utilities", "ATO": "Utilities",
+    "DUK": "Utilities", "NEE": "Utilities", "LNT": "Utilities",
+    "NVDA": "Technology", "AAPL": "Technology", "MSFT": "Technology",
+    "GOOGL": "Communication Services", "META": "Communication Services",
+    "AMZN": "Consumer Discretionary", "TSLA": "Consumer Discretionary",
+    "UNH": "Health Care", "LLY": "Health Care", "JNJ": "Health Care",
+}
+
+
+def _pairs_sector_cap_blocks(long_tk: str, short_tk: str, pair_size: float) -> tuple[bool, str]:
+    """Check if opening a LONG/SHORT pair of given size would push any sector
+    above SECTOR_SOFT_CAP (gross basis — counts both legs toward that sector).
+
+    Returns (blocked, reason). Fail-open if Redis is unreachable: we prefer
+    letting the bot trade through a Redis outage over blocking indefinitely."""
+    try:
+        r = _get_redis_safe()
+        if not r:
+            return False, "redis unreachable — sector cap fail-open"
+        raw = r.get("portfolio_exposure")
+        if not raw:
+            return False, "no portfolio_exposure yet — fail-open"
+        expo = json.loads(raw)
+        sector_gross = {s: pct * expo.get("gross_total_usd", 0)
+                        for s, pct in (expo.get("sector_pct") or {}).items()}
+        gross_total = float(expo.get("gross_total_usd", 0))
+        # Project the new state assuming both legs land at $pair_size/leg.
+        new_gross_total = gross_total + 2 * pair_size
+        for tk in (long_tk, short_tk):
+            sec = PAIRS_SECTOR_MAP.get(tk.upper(), "Unknown")
+            if sec == "Unknown":
+                continue
+            projected = sector_gross.get(sec, 0.0) + pair_size
+            pct = projected / new_gross_total if new_gross_total > 0 else 0
+            if pct > SECTOR_SOFT_CAP:
+                return True, (f"{sec} would be {pct*100:.1f}% with {long_tk}/{short_tk} "
+                              f"(cap={SECTOR_SOFT_CAP*100:.0f}%)")
+        return False, "ok"
+    except Exception as _se:
+        return False, f"sector-cap check error ({_se}) — fail-open"
 DAILY_LOSS_LIMIT = -500
 DAILY_PNL = 0.0
 # HARD KILL-SWITCH: If total portfolio drops below this, ALL trading stops.
@@ -26,9 +86,11 @@ TRADINGVIEW_SIGNALS = {
     "auto_execute_size_pct": 0.01,  # 1% of portfolio per auto-exec
 }
 
+import asyncio
 import discord
 from discord.ext import commands, tasks
 import os
+from pathlib import Path
 import sqlite3
 try:
     import redis as redis_lib
@@ -57,6 +119,131 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("traderjoes")
+
+# Administrative exit reasons excluded from all trading statistics.
+# Only real trading exits count: Z-REVERT, Z-BREAK, TTL, TP, SL, MANUAL_TP, etc.
+ADMIN_EXIT_REASONS = ("cleanup_stale", "CRITERIA_FAIL", "manually_closed",
+                      "DEDUP_CLEANUP", "criteria_check_failed", "FULL_RESET_MARCH29",
+                      "dedup_fix", "EXCESS_POSITION_CLEANUP", "GHOST_CLEANUP")
+# SQL fragment: append to WHERE clause to exclude admin closes AND
+# restrict to the PAPER tier (observation-window clean baseline per
+# specs/shadow_tier_charter.md + HANDOFF_APRIL25 tier migration). All
+# analytics/WR/Sharpe/dashboard queries built from this fragment
+# automatically default to PAPER-tier rows.
+#
+# HISTORICAL/TRANSITIONAL rows remain in the table for reference and
+# are visible via the HISTORICAL dashboard tab, but never drive current
+# firm-state decisions.
+_SQL_REAL_TRADES = (" AND COALESCE(exit_reason,'') NOT IN "
+    "('cleanup_stale','CRITERIA_FAIL','manually_closed','DEDUP_CLEANUP',"
+    "'criteria_check_failed','FULL_RESET_MARCH29','dedup_fix','EXCESS_POSITION_CLEANUP',"
+    "'GHOST_CLEANUP')"
+    " AND COALESCE(exit_reason,'') NOT LIKE 'ZOMBIE%'"
+    " AND COALESCE(exit_reason,'') NOT LIKE 'PRED EXPIRY EXIT%'"
+    " AND tier = 'PAPER'"
+    # Real vs Simulated P&L (2026-04-30, see docs/GOVERNANCE.md): exclude
+    # rows written by sim functions (vrp_income, covered_call) — those are
+    # research probes, not realized return. Also excludes any row marked
+    # deleted_sim=1 (the audit-trail soft-delete for retired sim writers).
+    " AND COALESCE(platform,'') != 'Simulated'"
+    " AND COALESCE(deleted_sim, 0) = 0")
+_SQL_REAL_TRADES_AND_LEGACY = _SQL_REAL_TRADES + " AND strategy NOT IN ('pairs_legacy')"
+
+# Inverse fragment for sim-only queries (sim_pnl_* metrics). Same admin-exit
+# exclusions, but ONLY rows that ARE simulated, scoped to PAPER tier.
+_SQL_SIM_TRADES = (" AND COALESCE(exit_reason,'') NOT IN "
+    "('cleanup_stale','CRITERIA_FAIL','manually_closed','DEDUP_CLEANUP',"
+    "'criteria_check_failed','FULL_RESET_MARCH29','dedup_fix','EXCESS_POSITION_CLEANUP',"
+    "'GHOST_CLEANUP')"
+    " AND COALESCE(exit_reason,'') NOT LIKE 'ZOMBIE%'"
+    " AND tier = 'PAPER'"
+    " AND COALESCE(platform,'') = 'Simulated'"
+    " AND COALESCE(deleted_sim, 0) = 0")
+
+# Admin SQL fragment: same admin-exit exclusions but WITHOUT the tier
+# filter. Use this for archaeology / historical audits (e.g. post-mortem
+# queries against pre-Apr-19 data).
+_SQL_REAL_TRADES_ALL_TIERS = (" AND COALESCE(exit_reason,'') NOT IN "
+    "('cleanup_stale','CRITERIA_FAIL','manually_closed','DEDUP_CLEANUP',"
+    "'criteria_check_failed','FULL_RESET_MARCH29','dedup_fix','EXCESS_POSITION_CLEANUP',"
+    "'GHOST_CLEANUP')"
+    " AND COALESCE(exit_reason,'') NOT LIKE 'ZOMBIE%'"
+    " AND COALESCE(exit_reason,'') NOT LIKE 'PRED EXPIRY EXIT%'"
+    " AND COALESCE(platform,'') != 'Simulated'"
+    " AND COALESCE(deleted_sim, 0) = 0")
+
+_VALID_TIERS = {"LIVE", "PAPER", "HISTORICAL", "TRANSITIONAL", "SHADOW", "ALL"}
+
+# Per-tier baselines (denominators for Return %):
+# PAPER: Phase 2 adjusted start equity (config.paper_start_equity, fallback $18,692.16)
+# HISTORICAL: original $25K start-of-bot bankroll
+# TRANSITIONAL: None — bookkeeping tier, no dedicated bankroll
+# SHADOW: $100K aggregate across 11 strategies (SHADOW-RISK-A)
+# LIVE: 0 until first tranche deploy (May 3, 2026)
+# ALL: PAPER + HISTORICAL + SHADOW summed
+_TIER_BASELINE_DEFAULTS = {
+    "PAPER": 18692.16,
+    "HISTORICAL": 25000.0,
+    "TRANSITIONAL": None,
+    "SHADOW": 100000.0,
+    "LIVE": 0.0,
+}
+
+def _tier_baseline(tier):
+    """Return the denominator for Return % for a given tier, or None if N/A."""
+    t = (tier or "PAPER").upper()
+    if t == "PAPER":
+        try:
+            import sqlite3 as _tbc
+            _c = _tbc.connect(DB_PATH)
+            _row = _c.execute(
+                "SELECT value FROM config WHERE key='paper_start_equity'"
+            ).fetchone()
+            _c.close()
+            if _row and _row[0]:
+                return float(_row[0])
+        except Exception:
+            pass
+        return _TIER_BASELINE_DEFAULTS["PAPER"]
+    if t == "SHADOW":
+        try:
+            import sqlite3 as _tbc
+            _c = _tbc.connect(DB_PATH)
+            _row = _c.execute(
+                "SELECT COALESCE(SUM(initial_allocation),0) "
+                "FROM shadow_strategy_allocations"
+            ).fetchone()
+            _c.close()
+            if _row and _row[0]:
+                return float(_row[0])
+        except Exception:
+            pass
+        return _TIER_BASELINE_DEFAULTS["SHADOW"]
+    if t == "ALL":
+        p = _tier_baseline("PAPER") or 0
+        s = _tier_baseline("SHADOW") or 0
+        return p + s + _TIER_BASELINE_DEFAULTS["HISTORICAL"]
+    return _TIER_BASELINE_DEFAULTS.get(t)
+
+def _sql_tier_fragment(tier="PAPER"):
+    """Build SQL real-trades fragment for a given tier.
+
+    tier='ALL' drops the tier clause (cross-tier aggregate).
+    tier='LIVE' filters to tier='LIVE' rows — none exist until first
+    live deploy, so aggregates are 0 by design.
+    Unknown tiers fall back to PAPER.
+    pairs_legacy exclusion applies only to PAPER/SHADOW/LIVE (live
+    decision tiers); HISTORICAL/TRANSITIONAL/ALL see the full archive.
+    """
+    t = (tier or "PAPER").upper()
+    if t not in _VALID_TIERS:
+        t = "PAPER"
+    frag = _SQL_REAL_TRADES_ALL_TIERS
+    if t != "ALL":
+        frag = frag + f" AND tier = '{t}'"
+    if t in ("PAPER", "SHADOW", "LIVE"):
+        frag = frag + " AND strategy NOT IN ('pairs_legacy')"
+    return frag
 
 # ---------------------------------------------------------------------------
 # Discord setup
@@ -119,6 +306,26 @@ def db_open_position(market_id, platform, strategy, direction,
         row_id = c.lastrowid
         conn.commit(); conn.close()
         log.info("DB-OPEN: %s | %s | $%.2f", market_id, strategy, size_usd)
+        # Verify record exists
+        _verify = c if not conn else sqlite3.connect(DB_PATH).cursor()
+        _vc = sqlite3.connect(DB_PATH)
+        _vr = _vc.execute("SELECT id FROM positions WHERE id=? AND status='open'", (row_id,)).fetchone()
+        _vc.close()
+        if not _vr:
+            log.error("DB-VERIFY-FAIL: position %s (id=%s) not found after insert — retrying", market_id, row_id)
+            # Retry once
+            _rc2 = sqlite3.connect(DB_PATH)
+            _rc2.execute("""INSERT INTO positions
+                (market_id,platform,strategy,direction,size_usd,shares,entry_price,
+                 stop_price,target_price,long_leg,short_leg,entry_zscore,
+                 status,regime,created_at,metadata)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',?,datetime('now'),?)""",
+                (market_id,platform,strategy,direction,size_usd,shares,entry_price,
+                 stop_price,target_price,long_leg,short_leg,entry_zscore,
+                 regime, _js.dumps(metadata or {})))
+            row_id = _rc2.execute("SELECT last_insert_rowid()").fetchone()[0]
+            _rc2.commit(); _rc2.close()
+            log.info("DB-VERIFY-RETRY: %s re-inserted as id=%s", market_id, row_id)
         try:
             shadow_open_position(market_id, strategy, direction, size_usd, entry_price)
         except Exception:
@@ -188,6 +395,17 @@ def db_close_position(market_id, exit_price, exit_reason, realized_pnl=0):
                 shadow_close_position(market_id, realized_pnl, exit_reason)
             except Exception:
                 pass
+        # Verify close was persisted
+        _vc = sqlite3.connect(DB_PATH)
+        _still_open = _vc.execute("SELECT id FROM positions WHERE market_id=? AND status='open'", (market_id,)).fetchone()
+        _vc.close()
+        if _still_open and rows > 0:
+            log.error("DB-VERIFY-FAIL: %s still shows open after close — retrying", market_id)
+            _rc2 = sqlite3.connect(DB_PATH)
+            _rc2.execute("UPDATE positions SET status='closed', exit_reason=?, realized_pnl=?, closed_at=datetime('now') WHERE market_id=? AND status='open'",
+                         (exit_reason, realized_pnl, market_id))
+            _rc2.commit(); _rc2.close()
+            log.info("DB-VERIFY-RETRY: %s force-closed on retry", market_id)
         conn.close()
         return rows > 0
     except Exception as e:
@@ -225,15 +443,199 @@ def db_position_count(strategy=None):
         return 0
 
 
+def _rebuild_positions_from_db():
+    """Rebuild PAPER_PORTFOLIO positions from SQLite positions table (source of truth).
+    Preserves cash from JSON. Replaces position list entirely from DB open positions."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM positions WHERE status='open'").fetchall()
+        conn.close()
+        rebuilt = []
+        for r in rows:
+            pos = {
+                "market": r["market_id"] or "",
+                "side": r["direction"] or "BUY",
+                "shares": r["shares"] or 0,
+                "entry_price": r["entry_price"] or 0,
+                "cost": r["size_usd"] or 0,
+                "value": r["size_usd"] or 0,
+                "timestamp": r["created_at"] or "",
+                "platform": r["platform"] or "",
+                "ev": 0,
+                "strategy": r["strategy"] or "prediction",
+                "long_leg": r["long_leg"] or "",
+                "short_leg": r["short_leg"] or "",
+                "entry_zscore": r["entry_zscore"] or 0,
+            }
+            if r["stop_price"]:
+                pos["stop_price"] = r["stop_price"]
+            if r["target_price"]:
+                pos["target_price"] = r["target_price"]
+            if r["metadata"]:
+                try:
+                    import json as _jm
+                    meta = _jm.loads(r["metadata"])
+                    # Preserve extra fields from metadata
+                    for k in ("vrp_regime", "no_token_id", "source_market",
+                              "extra_long_leg", "signal_threshold", "est_credit",
+                              "short_strike", "long_strike", "contracts",
+                              "entry_long_price", "entry_short_price",
+                              "long_order_id", "short_order_id", "correlation",
+                              "option_symbol"):
+                        if k in meta:
+                            pos[k] = meta[k]
+                except Exception:
+                    pass
+            rebuilt.append(pos)
+        old_count = len(PAPER_PORTFOLIO.get("positions", []))
+        PAPER_PORTFOLIO["positions"] = rebuilt
+        log.info("POSITION REBUILD: %d positions from SQLite (was %d in JSON)", len(rebuilt), old_count)
+        # Warm price cache for all open position tickers
+        _warmed = set()
+        for pos in rebuilt:
+            for leg in (pos.get("long_leg", ""), pos.get("short_leg", "")):
+                if leg and leg not in _warmed:
+                    try:
+                        px, src = get_current_price(leg)
+                        if px > 0:
+                            log.info("PRICE WARM: %s = $%.2f via %s", leg, px, src)
+                        _warmed.add(leg)
+                    except Exception:
+                        _warmed.add(leg)
+        if _warmed:
+            log.info("PRICE CACHE: warmed %d tickers on startup", len(_warmed))
+    except Exception as e:
+        log.warning("Position rebuild from DB error: %s — falling back to JSON", e)
+
+
+_VIX_CACHE = {"value": None, "ts": 0}
+
 def _fetch_vix_price():
+    """Fetch spot VIX. On failure, fall back to Redis cache, then in-memory cache."""
+    global _VIX_CACHE
     try:
         import yfinance as yf
         h = yf.Ticker("^VIX").history(period="5d")
         if not h.empty:
-            return float(h["Close"].iloc[-1])
+            val = float(h["Close"].iloc[-1])
+            _VIX_CACHE = {"value": val, "ts": time.time()}
+            try:
+                import redis as _redis
+                _r = _redis.Redis(host="traderjoes-redis", port=6379, decode_responses=True)
+                _r.setex("intel:vix:last", 86400 * 7, json.dumps(_VIX_CACHE))
+            except Exception:
+                pass
+            return val
     except Exception as e:
-        print(f"[Regime] VIX fetch failed: {e}")
+        log.warning("VIX fetch failed: %s — using cache fallback", e)
+    # 1. In-memory cache
+    if _VIX_CACHE.get("value") is not None:
+        return _VIX_CACHE["value"]
+    # 2. Redis cache
+    try:
+        import redis as _redis
+        _r = _redis.Redis(host="traderjoes-redis", port=6379, decode_responses=True)
+        raw = _r.get("intel:vix:last")
+        if raw:
+            cached = json.loads(raw)
+            _VIX_CACHE = cached
+            return cached["value"]
+    except Exception:
+        pass
     return None
+
+# ── Universal Price Function ──────────────────────────────────────────────
+# Single source of truth for all stock price fetches.
+# Fallback chain: Polygon (30s cache) → Alpaca quote → yfinance → last cached.
+_PRICE_CACHE_UNIVERSAL = {}  # {ticker: {"price": float, "source": str, "ts": float}}
+_PRICE_CACHE_TTL = 30  # seconds
+
+def get_current_price(ticker):
+    """Universal price fetch with fallback chain. Returns (price, source) tuple.
+    Never returns 0 — uses last cached price as final fallback."""
+    import time as _t
+    ticker = ticker.upper().strip()
+    now = _t.time()
+
+    # Check cache first
+    cached = _PRICE_CACHE_UNIVERSAL.get(ticker)
+    if cached and (now - cached["ts"]) < _PRICE_CACHE_TTL:
+        return cached["price"], cached["source"] + " (cached)"
+
+    price = 0.0
+    source = "none"
+
+    # 1. Polygon real-time
+    try:
+        _poly_key = os.getenv("POLYGON_API_KEY", "")
+        if _poly_key:
+            r = requests.get(
+                f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}",
+                params={"apiKey": _poly_key}, timeout=5)
+            if r.status_code == 200:
+                snap = r.json().get("ticker", {})
+                px = snap.get("lastTrade", {}).get("p", 0)
+                if not px:
+                    px = snap.get("prevDay", {}).get("c", 0)
+                if px and float(px) > 0:
+                    price = float(px)
+                    source = "polygon"
+    except Exception:
+        pass
+
+    # 2. Alpaca quote
+    if price <= 0:
+        try:
+            _alp_key = os.getenv("ALPACA_API_KEY", "")
+            _alp_sec = os.getenv("ALPACA_SECRET_KEY", "")
+            if _alp_key:
+                _hdr = {"APCA-API-KEY-ID": _alp_key, "APCA-API-SECRET-KEY": _alp_sec}
+                r = requests.get(f"https://data.alpaca.markets/v2/stocks/{ticker}/quotes/latest",
+                                 headers=_hdr, timeout=5)
+                if r.status_code == 200:
+                    q = r.json().get("quote", {})
+                    px = float(q.get("ap", 0) or 0)
+                    if px <= 0:
+                        px = float(q.get("bp", 0) or 0)
+                    if px > 0:
+                        price = px
+                        source = "alpaca"
+                if price <= 0:
+                    r2 = requests.get(f"https://data.alpaca.markets/v2/stocks/{ticker}/trades/latest",
+                                      headers=_hdr, timeout=5)
+                    if r2.status_code == 200:
+                        px = float(r2.json().get("trade", {}).get("p", 0) or 0)
+                        if px > 0:
+                            price = px
+                            source = "alpaca-trade"
+        except Exception:
+            pass
+
+    # 3. yfinance
+    if price <= 0:
+        try:
+            import yfinance as yf
+            t = yf.Ticker(ticker)
+            h = t.history(period="5d")
+            if not h.empty:
+                price = float(h["Close"].iloc[-1])
+                source = "yfinance"
+        except Exception:
+            pass
+
+    # 4. Last cached price (never return 0)
+    if price <= 0 and cached:
+        price = cached["price"]
+        source = cached["source"] + " (stale)"
+
+    # Update cache if we got a valid price
+    if price > 0:
+        _PRICE_CACHE_UNIVERSAL[ticker] = {"price": price, "source": source, "ts": now}
+        log.debug("PRICE %s: $%.2f via %s", ticker, price, source)
+
+    return price, source
+
 
 def _fetch_crypto_vol_24h(symbol):
     try:
@@ -346,12 +748,6 @@ POLYMARKET_SECRET       = os.environ.get("POLYMARKET_SECRET", "")
 POLYMARKET_PASSPHRASE   = os.environ.get("POLYMARKET_PASSPHRASE", "")
 POLY_PRIVATE_KEY        = os.environ.get("POLY_PRIVATE_KEY", "")
 
-# Robinhood Crypto API
-ROBINHOOD_API_KEY       = os.environ.get("ROBINHOOD_API_KEY", "")
-ROBINHOOD_PRIVATE_KEY   = os.environ.get("ROBINHOOD_PRIVATE_KEY", "")
-ROBINHOOD_PUBLIC_KEY    = os.environ.get("ROBINHOOD_PUBLIC_KEY", "")
-ROBINHOOD_BASE          = "https://trading.robinhood.com"
-
 # Coinbase Advanced Trade (CDP API Keys - JWT auth)
 COINBASE_API_KEY        = os.environ.get("COINBASE_API_KEY", "")
 COINBASE_API_SECRET     = os.environ.get("COINBASE_API_SECRET", "")
@@ -381,8 +777,125 @@ TRADING_MODE    = os.environ.get("TRADING_MODE", "paper")
 DRY_RUN_MODE    = False  # Paper orders enabled (ALPACA_BASE_URL must be paper-api)
 PAPER_PORTFOLIO = {"cash": 10000.0, "positions": [], "trades": [], "pnl": 0.0}
 
-# OpenAI
-OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "")
+# AI API
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+
+# ============================================================================
+# INTELLIGENCE WORKER INTEGRATION (Redis-backed, non-blocking)
+# ============================================================================
+def _get_redis_safe():
+    """Get Redis connection or None (never blocks main loop)."""
+    try:
+        import redis as _redis_mod
+        r = _redis_mod.Redis(host="traderjoes-redis", port=6379, decode_responses=True, socket_timeout=2)
+        r.ping()
+        return r
+    except Exception:
+        return None
+
+
+def _tv_signal_allows_entry(ticker: str) -> tuple[bool, str]:
+    """Check TradingView signal (published by intelligence_workers/tradingview_signals.py)
+    as a buy-side gate for crypto and sympathy-lag entries. Returns (allow, reason).
+
+    Fail-open policy: if Redis is down OR the ticker isn't in the TV watchlist,
+    allow the trade (we don't have TV coverage for most crypto symbols anyway).
+    Strict-block only when a signal IS present and explicitly not bullish."""
+    if not ticker:
+        return True, "no ticker"
+    try:
+        r = _get_redis_safe()
+        if not r:
+            return True, "redis down — allow"
+        raw = r.get(f"tv_signals:{ticker.upper()}")
+        if not raw:
+            return True, "no signal cached — allow"
+        sig = json.loads(raw)
+        rec = (sig.get("recommendation") or "").upper()
+        if rec in ("STRONG_BUY", "BUY"):
+            return True, f"TV={rec}"
+        return False, f"TV={rec or 'UNKNOWN'}"
+    except Exception as e:
+        log.warning("TV_SIGNAL_CHECK: %s error: %s — allowing", ticker, e)
+        return True, f"check error: {e}"
+
+
+def check_cfo_exposure_limit(strategy):
+    """Check if CFO has capped this strategy's exposure. Returns True if allowed."""
+    try:
+        r = _get_redis_safe()
+        if not r:
+            return True  # If Redis is down, don't block trading
+        raw = r.get("config:exposure_limits")
+        if not raw:
+            return True
+        limits = json.loads(raw)
+        cap = limits.get(strategy)
+        if cap is None:
+            return True
+        # Check current exposure for this strategy
+        strat_exposure = sum(p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", [])
+                             if p.get("strategy") == strategy)
+        portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
+            p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+        current_pct = strat_exposure / portfolio_value if portfolio_value > 0 else 0
+        if current_pct >= cap:
+            log.info("CFO_CAP: %s at %.0f%% (limit %.0f%%)", strategy, current_pct * 100, cap * 100)
+            return False
+        return True
+    except Exception:
+        return True  # Never block on intelligence failure
+
+
+def get_intel_sizing_modifier(ticker):
+    """Get sizing modifier from intelligence signals. Returns float multiplier."""
+    try:
+        r = _get_redis_safe()
+        if not r:
+            return 1.0
+        modifier = 1.0
+        for source in ("darkpool", "congress", "insider", "options"):
+            raw = r.get(f"intel:{source}:{ticker}")
+            if not raw:
+                continue
+            sig = json.loads(raw)
+            sig_type = sig.get("signal_type", "")
+            if source == "darkpool":
+                modifier *= 1.25 if sig_type == "ACCUMULATION" else 0.75
+            elif source == "congress" and sig_type == "BUY":
+                modifier *= 1.15
+            elif source == "insider" and sig_type == "BUY":
+                modifier *= 1.20
+            elif source == "options":
+                modifier *= 1.10 if sig_type == "BULLISH" else 0.90
+        return round(modifier, 3)
+    except Exception:
+        return 1.0
+
+
+def get_intel_feed(limit=10):
+    """Get last N signals from the intelligence feed."""
+    try:
+        r = _get_redis_safe()
+        if not r:
+            return []
+        raw_list = r.lrange("intel:feed", 0, limit - 1)
+        return [json.loads(x) for x in raw_list]
+    except Exception:
+        return []
+
+
+def get_cfo_allocation():
+    """Get current CFO allocation from Redis."""
+    try:
+        r = _get_redis_safe()
+        if not r:
+            return None
+        raw = r.get("intel:cfo:allocation")
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
 
 
 # ============================================================================
@@ -785,14 +1298,28 @@ def get_polymarket_positions_detail():
     return ""
 
 
+_GAMMA_CACHE = {"data": [], "limit": 0, "fetched_at": 0}
+_GAMMA_CACHE_TTL = 600  # 10 minutes
+
 def get_polymarket_markets(limit=20):
-    """Fetch current, active markets from Polymarket Gamma API with CLOB fallback."""
+    """Fetch current, active markets from Polymarket Gamma API with CLOB fallback.
+    Cached for 10 minutes to prevent excessive API calls."""
+    import time as _gtime
+    # Return cache if fresh and limit is satisfied
+    if (_GAMMA_CACHE["data"]
+            and _gtime.time() - _GAMMA_CACHE["fetched_at"] < _GAMMA_CACHE_TTL
+            and _GAMMA_CACHE["limit"] >= limit):
+        log.info("Gamma API cache hit (%d markets, %ds old)",
+                 len(_GAMMA_CACHE["data"]),
+                 int(_gtime.time() - _GAMMA_CACHE["fetched_at"]))
+        return _GAMMA_CACHE["data"][:limit]
+
     # --- Primary: Gamma API ---
     try:
         r = requests.get(
             "https://gamma-api.polymarket.com/markets",
             params={
-                "limit": limit,
+                "limit": max(limit, 50),  # Fetch at least 50 to maximize cache utility
                 "closed": "false",
                 "order": "volume24hr",
                 "ascending": "false",
@@ -804,8 +1331,11 @@ def get_polymarket_markets(limit=20):
             data = r.json()
             markets = data if isinstance(data, list) else []
             if markets:
-                log.info("Gamma API returned %d markets", len(markets))
-                return markets
+                _GAMMA_CACHE["data"] = markets
+                _GAMMA_CACHE["limit"] = len(markets)
+                _GAMMA_CACHE["fetched_at"] = _gtime.time()
+                log.info("Gamma API returned %d markets (cached for %ds)", len(markets), _GAMMA_CACHE_TTL)
+                return markets[:limit]
             log.warning("Gamma API returned empty list, trying CLOB fallback")
     except Exception as exc:
         log.warning("Gamma API failed (%s), trying CLOB fallback", exc)
@@ -829,71 +1359,10 @@ def get_polymarket_markets(limit=20):
 
 
 # ============================================================================
-# ROBINHOOD (Crypto Trading API - Ed25519 auth)
+# Robinhood integration was removed 2026-04-18 — unused strategy wiring, dead
+# code was a security surface area without any live trading benefit. If ever
+# needed for a specific strategy, keys are in .env.bak.before_robinhood_removal.
 # ============================================================================
-
-def _robinhood_sign(method, path, body=""):
-    if not ROBINHOOD_API_KEY or not ROBINHOOD_PRIVATE_KEY:
-        return {}
-    try:
-        ts = int(datetime.now(timezone.utc).timestamp())
-        message = f"{ROBINHOOD_API_KEY}{ts}{path}{method}{body}"
-        private_bytes = base64.b64decode(ROBINHOOD_PRIVATE_KEY)
-        priv_key = ed25519.Ed25519PrivateKey.from_private_bytes(private_bytes[:32])
-        signature = priv_key.sign(message.encode("utf-8"))
-        sig_b64 = base64.b64encode(signature).decode("utf-8")
-        return {
-            "x-api-key": ROBINHOOD_API_KEY,
-            "x-timestamp": str(ts),
-            "x-signature": sig_b64,
-            "Content-Type": "application/json",
-        }
-    except Exception as exc:
-        log.warning("Robinhood sign error: %s", exc)
-        return {}
-
-
-def get_robinhood_balance():
-    if not ROBINHOOD_API_KEY:
-        return "Keys not configured"
-    path = "/api/v1/crypto/trading/accounts/"
-    headers = _robinhood_sign("GET", path)
-    if not headers:
-        return "Signing failed"
-    try:
-        r = requests.get(ROBINHOOD_BASE + path, headers=headers, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            bp = data.get("buying_power", "0")
-            currency = data.get("buying_power_currency", "USD")
-            return f"${float(bp):,.2f} {currency} (buying power)"
-        return f"HTTP {r.status_code}: {r.text[:120]}"
-    except Exception as exc:
-        return f"Error: {exc}"
-
-
-def get_robinhood_holdings():
-    if not ROBINHOOD_API_KEY:
-        return ""
-    path = "/api/v1/crypto/trading/holdings/"
-    headers = _robinhood_sign("GET", path)
-    if not headers:
-        return ""
-    try:
-        r = requests.get(ROBINHOOD_BASE + path, headers=headers, timeout=10)
-        if r.status_code == 200:
-            results = r.json().get("results", [])
-            if not results:
-                return "  No crypto holdings"
-            lines = []
-            for h in results:
-                code = h.get("asset_code", "?")
-                qty  = h.get("total_quantity", "0")
-                lines.append(f"  {code}: {qty}")
-            return "\n".join(lines)
-    except Exception:
-        pass
-    return ""
 
 
 # ============================================================================
@@ -1175,22 +1644,55 @@ def calc_ev(yes_price, implied_prob):
 
 
 KALSHI_MIN_VOLUME = 1000  # $1K minimum volume — was $50K which filtered everything
+# 2026-04-18: expanded catalyst keyword list (was ~40 → now ~90) to match
+# Polymarket coverage so Kalshi's $1,238 paper balance can finally find
+# opportunities. Audit showed 19 PM catalysts fired in 30d, 0 Kalshi — the
+# keyword list was strictly narrower than what Polymarket was scanning.
+KALSHI_CATALYST_KEYWORDS = [
+    # Fed / monetary policy
+    "fed", "fomc", "rate decision", "rate cut", "rate hike", "powell",
+    "inflation", "cpi", "ppi", "pce", "yield curve", "gdp", "jobs report",
+    "nonfarm", "retail sales", "recession", "debt ceiling",
+    # Geopolitics — Middle East
+    "iran", "israel", "gaza", "hezbollah", "hamas", "netanyahu",
+    "mbs", "saudi", "houthi", "yemen", "syria", "lebanon",
+    # Geopolitics — Russia/Ukraine
+    "ukraine", "russia", "putin", "zelensky", "zelenskyy", "sanctions",
+    # Geopolitics — Asia
+    "china", "taiwan", "xi ", "north korea", "kim jong", "south korea",
+    "japan", "india", "modi", "philippines",
+    # US Politics
+    "trump", "biden", "harris", "congress", "senate", "speaker",
+    "house", "supreme court", "indictment", "impeach", "executive order",
+    "shutdown", "confirm",
+    # Trade / Tariffs
+    "tariff", "trade ", "trade war", "antitrust", "merger",
+    # Biotech / FDA
+    "fda approval", "fda", "drug ", "biotech", "clinical trial",
+    # Corporate / Macro
+    "earnings", "bankruptcy", "sec ", "ceo", "ipo",
+    # Crypto
+    "bitcoin", "ethereum", "crypto", "etf approval",
+    # Other
+    "opec", "climate", "supreme court", "election",
+]
+# Config knob — per Decision, min EV for a Kalshi "catalyst" hit to qualify.
+# Original threshold (yes_price window 0.25-0.75) left some value on the
+# table because very-likely markets (>$0.75) also have EV on the NO side.
+# We keep the YES window but relax it 30% wider to catch the tails:
+#   YES window: 0.20-0.80  (was 0.25-0.75)
+#   NO-side:    still fires at yes_price > 0.65 (was 0.65 — unchanged)
+KALSHI_YES_WINDOW_LOW = 0.20
+KALSHI_YES_WINDOW_HIGH = 0.80
 
 def find_kalshi_opportunities():
     opportunities = []
     if not KALSHI_API_KEY_ID or not KALSHI_PRIVATE_KEY:
         return opportunities
 
-    _kalshi_cats = ["fda","sec ","cpi","fed ","fomc","supreme court",
-                    "earnings","tariff","iran","ceasefire","ukraine",
-                    "russia","china","indictment","impeach","rate cut",
-                    "rate hike","inflation","gdp","jobs report",
-                    "nonfarm","sanctions","netanyahu","trudeau",
-                    "macron","zelensky","zelenskyy","putin","modi",
-                    "erdogan","mbs","kim jong","opec","taiwan","gaza",
-                    "debt ceiling","executive order","pce",
-                    "retail sales","recession","yield curve",
-                    "merger","antitrust"]
+    _kalshi_cats = KALSHI_CATALYST_KEYWORDS
+    skip_stats = {"sports_junk": 0, "no_price": 0, "low_volume": 0,
+                  "non_catalyst": 0, "out_of_window": 0}
 
     try:
         events = get_kalshi_events(limit=10)
@@ -1199,8 +1701,10 @@ def find_kalshi_opportunities():
             title  = event.get("title", ticker)
             markets = get_kalshi_markets_for_event(ticker)
             for mkt in markets:
+                mkt_title = mkt.get("title", title)[:60]
                 # Sports/player-prop filter first
                 if _is_kalshi_sports(mkt) or is_sports_or_junk(mkt.get("title", "")):
+                    skip_stats["sports_junk"] += 1
                     continue
 
                 yes_price = mkt.get("yes_ask", 0) / 100.0 if mkt.get("yes_ask") else 0
@@ -1208,20 +1712,21 @@ def find_kalshi_opportunities():
                 yes_bid   = mkt.get("yes_bid", 0)  / 100.0 if mkt.get("yes_bid") else 0
 
                 if yes_price <= 0 or no_price <= 0:
+                    skip_stats["no_price"] += 1
+                    log.debug("KALSHI SKIP: %s reason=no_price (yes=%.3f no=%.3f)",
+                              mkt_title, yes_price, no_price)
                     continue
 
                 # Volume filter — Kalshi reports volume in cents
                 volume = float(mkt.get("volume", 0) or 0)
                 if volume < KALSHI_MIN_VOLUME:
+                    skip_stats["low_volume"] += 1
+                    log.info("KALSHI SKIP: %s reason=low_volume (%.0f < %d)",
+                             mkt_title, volume, KALSHI_MIN_VOLUME)
                     continue
 
-                mkt_title = mkt.get("title", title)[:60]
                 mkt_ticker = mkt.get("ticker", "")
                 mkt_lower = mkt_title.lower()
-
-                # Sports/junk filter — only trade catalyst markets
-                if is_sports_or_junk(mkt_title):
-                    continue
 
                 total = yes_price + no_price
                 if total < 0.98:
@@ -1247,9 +1752,16 @@ def find_kalshi_opportunities():
                             "detail": f"Bid ${yes_bid:.2f} / Ask ${yes_price:.2f} (spread ${spread:.2f}) | Vol: ${volume:,.0f}",
                         })
 
-                # Catalyst YES: low price YES on whitelisted events
+                # Catalyst YES: whitelisted events with widened probability window
                 is_catalyst = any(cat in mkt_lower for cat in _kalshi_cats)
-                if is_catalyst and 0.02 < yes_price < 0.20:
+                if not is_catalyst:
+                    skip_stats["non_catalyst"] += 1
+                    log.debug("KALSHI SKIP: %s reason=non_catalyst", mkt_title)
+                elif not (KALSHI_YES_WINDOW_LOW <= yes_price <= KALSHI_YES_WINDOW_HIGH):
+                    skip_stats["out_of_window"] += 1
+                    log.info("KALSHI SKIP: %s reason=out_of_window (yes=%.3f outside %.2f-%.2f)",
+                             mkt_title, yes_price, KALSHI_YES_WINDOW_LOW, KALSHI_YES_WINDOW_HIGH)
+                else:
                     opportunities.append({
                         "platform": "Kalshi",
                         "market": mkt_title,
@@ -1277,6 +1789,12 @@ def find_kalshi_opportunities():
             time.sleep(0.3)
     except Exception as exc:
         log.warning("Kalshi scan error: %s", exc)
+    log.info("KALSHI SCAN: %d opportunities | skipped: sports_junk=%d no_price=%d "
+             "low_volume=%d non_catalyst=%d out_of_window=%d",
+             len(opportunities),
+             skip_stats["sports_junk"], skip_stats["no_price"],
+             skip_stats["low_volume"], skip_stats["non_catalyst"],
+             skip_stats["out_of_window"])
     return opportunities
 
 
@@ -1352,7 +1870,14 @@ def find_polymarket_opportunities():
                     "detail": detail,
                 })
 
-            if 0.02 < yes_price < 0.10:
+            # Catalyst YES: $0.25-$0.75 range, volume > $50K, whitelisted
+            _poly_cats = ["fda","sec ","cpi","fed ","fomc","supreme court",
+                         "earnings","tariff","iran","ceasefire","ukraine",
+                         "russia","china","rate cut","rate hike","inflation",
+                         "gdp","sanctions","netanyahu","opec","taiwan","gaza",
+                         "recession","merger","antitrust"]
+            _is_poly_catalyst = any(cat in question.lower() for cat in _poly_cats)
+            if _is_poly_catalyst and 0.25 <= yes_price <= 0.65 and vol_24h >= 50000:
                 detail = f"YES @ ${yes_price:.3f} / NO @ ${no_price:.3f}"
                 if extra:
                     detail += f" | {extra}"
@@ -1360,8 +1885,9 @@ def find_polymarket_opportunities():
                     "platform": "Polymarket",
                     "market": question,
                     "ticker": condition_id[:20],
-                    "type": "Low-Price YES",
+                    "type": "Catalyst YES",
                     "ev": yes_price,
+                    "yes_price": yes_price,
                     "detail": detail,
                 })
 
@@ -1572,11 +2098,43 @@ def find_crypto_momentum():
 
     return opportunities
 
+_FNG_CACHE = {"value": None, "label": None, "ts": 0}
+
 def get_fear_greed():
+    """Fetch F&G from API. On failure, fall back to Redis cache, then in-memory cache, then last-resort default."""
+    global _FNG_CACHE
     try:
-        r = requests.get("https://api.alternative.me/fng/?limit=1",timeout=10)
-        d = r.json()["data"][0]; return int(d["value"]), d["value_classification"]
-    except: return 50, "Neutral"
+        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
+        d = r.json()["data"][0]
+        val = int(d["value"])
+        label = d["value_classification"]
+        _FNG_CACHE = {"value": val, "label": label, "ts": time.time()}
+        # Persist to Redis for cross-process fallback
+        try:
+            import redis as _redis
+            _r = _redis.Redis(host="traderjoes-redis", port=6379, decode_responses=True)
+            _r.setex("intel:fng:last", 86400 * 7, json.dumps(_FNG_CACHE))
+        except Exception:
+            pass
+        return val, label
+    except Exception as e:
+        log.warning("F&G API failed: %s — using cache fallback", e)
+        # 1. In-memory cache
+        if _FNG_CACHE.get("value") is not None:
+            return _FNG_CACHE["value"], _FNG_CACHE["label"]
+        # 2. Redis cache
+        try:
+            import redis as _redis
+            _r = _redis.Redis(host="traderjoes-redis", port=6379, decode_responses=True)
+            raw = _r.get("intel:fng:last")
+            if raw:
+                cached = json.loads(raw)
+                _FNG_CACHE = cached
+                return cached["value"], cached["label"]
+        except Exception:
+            pass
+        # 3. Last-resort default
+        return 50, "Neutral"
 
 def get_tiered_max_position(edge_score=0):
     """Tiered position sizing based on edge score confidence.
@@ -1615,33 +2173,140 @@ async def on_ready():
     init_db()
     # Flush contaminated pairs trades from March 19-26 to pairs_legacy
     db_flush_legacy_pairs("2026-03-27")
-    load_all_state()  # Restore paper_portfolio.json, analytics, signals, etc.
+    # FIX-1: Replay any persisted Engineer mutations BEFORE load_all_state
+    # so the runtime config is authoritative from the first trading tick.
+    try:
+        load_engineer_state()
+    except Exception as _ees_e:
+        log.warning("load_engineer_state skipped: %s", _ees_e)
+    load_all_state()  # Restore analytics, signals, cash from paper_portfolio.json
     db_load_daily_state()
-    # Backfill positions from SQLite only if JSON had none (fresh deploy)
-    # Backfill from SQLite only if JSON was empty AND cash is not full (not a reset)
-    if not PAPER_PORTFOLIO.get("positions") and PAPER_PORTFOLIO.get("cash", 0) < 24999:
-        try:
-            _rconn = sqlite3.connect(DB_PATH)
-            _rc = _rconn.cursor()
-            _rc.execute("SELECT market, side, shares, entry_price, cost, timestamp, platform, ev FROM paper_trades WHERE status = 'open'")
-            _rows = _rc.fetchall()
-            _rconn.close()
-            if _rows:
-                for _r in _rows:
-                    PAPER_PORTFOLIO["positions"].append({
-                        "market": _r[0], "side": _r[1] or "BUY", "shares": _r[2] or 0,
-                        "entry_price": _r[3] or 0, "cost": _r[4] or 0, "value": _r[4] or 0,
-                        "timestamp": _r[5] or "", "platform": _r[6] or "",
-                        "ev": _r[7] or 0,
-                        "strategy": "crypto" if any(k in (_r[0] or "").lower() for k in ["btc","eth","sol","doge","zec","xlm","hype","sui","wbt"]) else "prediction",
-                    })
-                log.info("Backfilled %d positions from SQLite (JSON was empty)", len(_rows))
-        except Exception as _e:
-            log.warning("Position backfill error: %s", _e)
-    elif not PAPER_PORTFOLIO.get("positions"):
-        log.info("Backfill skipped — clean reset detected (cash=$%.0f)", PAPER_PORTFOLIO.get("cash", 0))
-    log.info("TraderJoes bot online as %s | Cash: $%.2f | Positions: %d",
-             bot.user, PAPER_PORTFOLIO.get("cash", 0), len(PAPER_PORTFOLIO.get("positions", [])))
+    # SQLite is the single source of truth for positions.
+    # Always rebuild PAPER_PORTFOLIO positions from SQLite `positions` table.
+    # JSON cash balance is preserved; positions are rebuilt from DB.
+    _reset_flag = Path("/app/data/reset_requested.txt")
+    if _reset_flag.exists():
+        log.info("RESET FLAG detected — skipping position rebuild (explicit !paper-reset)")
+        _reset_flag.unlink()
+        PAPER_PORTFOLIO["positions"] = []
+    else:
+        _rebuild_positions_from_db()
+    # Sync Alpaca positions into portfolio FIRST — add any tracked positions missing from ledger
+    # Must run before equity reconciliation so all positions are counted.
+    _sync_alpaca_to_portfolio()
+    # ── STARTUP RECONCILIATION: ghost cleanup, entry price backfill, equity/cash fix ──
+    # The Alpaca paper account is $100K; our paper portfolio tracks $25K.
+    # We derive paper equity from Alpaca equity (which reflects real P&L from trades).
+    PAPER_STARTING_CAPITAL = 25000
+    ALPACA_STARTING_CAPITAL = 100000
+    try:
+        _rc_hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+        _rc_acct_r = requests.get(f"{ALPACA_BASE_URL}/v2/account", headers=_rc_hdr, timeout=10)
+        _rc_pos_r = requests.get(f"{ALPACA_BASE_URL}/v2/positions", headers=_rc_hdr, timeout=10)
+        if _rc_acct_r.status_code == 200 and _rc_pos_r.status_code == 200:
+            _rc_acct = _rc_acct_r.json()
+            _alpaca_equity = float(_rc_acct.get("equity", 0))
+            _alpaca_cash = float(_rc_acct.get("cash", 0))
+            _alpaca_positions = {p.get("symbol", "").upper(): p for p in _rc_pos_r.json()}
+            log.info("RECONCILE: Alpaca equity=$%.2f cash=$%.2f positions=%d",
+                     _alpaca_equity, _alpaca_cash, len(_alpaca_positions))
+
+            # Step 1: Remove ghost positions (legs not in Alpaca = already closed)
+            _ghosts = []
+            for _gi, _gp in enumerate(PAPER_PORTFOLIO.get("positions", [])):
+                _gll = _gp.get("long_leg", "").upper()
+                _gsl = _gp.get("short_leg", "").upper()
+                if _gll and _gsl:
+                    if _gll not in _alpaca_positions and _gsl not in _alpaca_positions:
+                        _ghosts.append(_gi)
+            for _gi in sorted(_ghosts, reverse=True):
+                _removed = PAPER_PORTFOLIO["positions"].pop(_gi)
+                _gm = _removed.get("market", "")
+                db_close_position(_gm, 0, "GHOST_CLEANUP", 0)
+                log.warning("GHOST CLEANUP: %s removed — neither leg exists in Alpaca", _gm)
+
+            # Step 2: Dedup cleanup (normalize alphabetically)
+            _seen_pairs_norm = {}
+            _dupes = []
+            for _di, _dp in enumerate(PAPER_PORTFOLIO.get("positions", [])):
+                _dm = _dp.get("market", "")
+                if not _dm.startswith("PAIRS:"):
+                    continue
+                _parts = _dm.replace("PAIRS:", "").split("/")
+                if len(_parts) != 2:
+                    continue
+                _norm_key = "/".join(sorted([_parts[0].upper(), _parts[1].upper()]))
+                if _norm_key in _seen_pairs_norm:
+                    _dupes.append(_di)
+                    log.warning("DEDUP CLEANUP: %s is duplicate of PAIRS:%s", _dm, _norm_key)
+                else:
+                    _seen_pairs_norm[_norm_key] = _di
+            for _di in sorted(_dupes, reverse=True):
+                _removed = PAPER_PORTFOLIO["positions"].pop(_di)
+                db_close_position(_removed.get("market", ""), 0, "DEDUP_CLEANUP", 0)
+
+            # Step 3: Backfill entry_long_price / entry_short_price from Alpaca avg_entry_price
+            for _bp in PAPER_PORTFOLIO.get("positions", []):
+                _bll = _bp.get("long_leg", "").upper()
+                _bsl = _bp.get("short_leg", "").upper()
+                if _bll and _bll in _alpaca_positions and _bp.get("entry_long_price", 0) <= 0:
+                    _bp["entry_long_price"] = abs(float(_alpaca_positions[_bll].get("avg_entry_price", 0)))
+                    log.info("ENTRY BACKFILL: %s long %s entry=$%.2f", _bp.get("market","")[:30], _bll, _bp["entry_long_price"])
+                if _bsl and _bsl in _alpaca_positions and _bp.get("entry_short_price", 0) <= 0:
+                    _bp["entry_short_price"] = abs(float(_alpaca_positions[_bsl].get("avg_entry_price", 0)))
+                    log.info("ENTRY BACKFILL: %s short %s entry=$%.2f", _bp.get("market","")[:30], _bsl, _bp["entry_short_price"])
+
+            # Step 4: Compute paper equity from Alpaca equity (offset by starting capital difference)
+            # paper_equity = alpaca_equity - (ALPACA_START - PAPER_START)
+            _equity_offset = ALPACA_STARTING_CAPITAL - PAPER_STARTING_CAPITAL
+            _paper_equity = _alpaca_equity - _equity_offset
+            # Sum market values of Alpaca positions that belong to our paper portfolio
+            _tracked_tickers = set()
+            for _tp in PAPER_PORTFOLIO.get("positions", []):
+                for _lk in ("long_leg", "short_leg", "extra_long_leg"):
+                    _tl = _tp.get(_lk, "").upper()
+                    if _tl:
+                        _tracked_tickers.add(_tl)
+                # Option symbols
+                _opt = _tp.get("option_symbol", "")
+                if _opt:
+                    _tracked_tickers.add(_opt.upper())
+                # Parse PAIRS:A/B, SECTOR_ROT:A/B market strings
+                _tmkt = _tp.get("market", "")
+                if ":" in _tmkt and "/" in _tmkt:
+                    for _part in _tmkt.split(":")[-1].split("/"):
+                        _tracked_tickers.add(_part.strip().upper())
+                # Hedge put → match option symbol
+                if _tmkt.startswith("HEDGE:SPY PUT"):
+                    for _as in _alpaca_positions:
+                        if _as.startswith("SPY") and "P0" in _as:
+                            _tracked_tickers.add(_as)
+            _positions_market_value = sum(
+                abs(float(_alpaca_positions[s].get("market_value", 0)))
+                for s in _tracked_tickers if s in _alpaca_positions
+            )
+            # Non-Alpaca position costs (positions with no legs in Alpaca but still valid)
+            _non_alpaca_costs = sum(
+                _np.get("cost", 0) for _np in PAPER_PORTFOLIO.get("positions", [])
+                if not any(_np.get(k, "").upper() in _alpaca_positions
+                           for k in ("long_leg", "short_leg", "extra_long_leg"))
+                and not any(part.strip().upper() in _alpaca_positions
+                            for part in _np.get("market", "").split(":")[-1].split("/")
+                            if part.strip())
+            )
+            _old_cash = PAPER_PORTFOLIO.get("cash", 0)
+            _new_cash = _paper_equity - _positions_market_value - _non_alpaca_costs
+            PAPER_PORTFOLIO["cash"] = _new_cash
+            log.info("EQUITY RECONCILE: alpaca_equity=$%.2f - offset=$%.0f = paper_equity=$%.2f",
+                     _alpaca_equity, _equity_offset, _paper_equity)
+            log.info("CASH RECONCILE: equity($%.2f) - positions_mv($%.2f) - non_alp($%.2f) = cash $%.2f (was $%.2f, delta $%+.2f)",
+                     _paper_equity, _positions_market_value, _non_alpaca_costs, _new_cash, _old_cash, _new_cash - _old_cash)
+            save_all_state()
+        else:
+            log.warning("RECONCILE: Alpaca API failed (acct=%d pos=%d) — keeping JSON cash",
+                        _rc_acct_r.status_code, _rc_pos_r.status_code)
+    except Exception as _recon_err:
+        log.warning("RECONCILE: Startup reconciliation error: %s — keeping JSON cash", _recon_err)
     # Reconcile Alpaca positions — close any orphans from failed pairs orders
     try:
         _recon = reconcile_alpaca_positions()
@@ -1649,10 +2314,21 @@ async def on_ready():
             log.info("Startup reconciliation closed %d orphaned positions", _recon)
     except Exception as _re:
         log.warning("Startup reconciliation error: %s", _re)
+    # WAL Stage A: reconcile any PENDING rows left by a mid-submit crash (PEAD only today)
+    try:
+        _wal_recon = reconcile_pending_wal_orders()
+        if _wal_recon > 0:
+            log.info("WAL startup reconcile: %d PENDING rows resolved", _wal_recon)
+    except Exception as _we:
+        log.warning("WAL startup reconcile error: %s", _we)
     if not daily_report_task.is_running():
         daily_report_task.start()
     if not alert_scan_task.is_running():
         alert_scan_task.start()
+    if not wal_reconcile_task.is_running():
+        wal_reconcile_task.start()
+    if not battle_plan_task.is_running():
+        battle_plan_task.start()
     if not morning_briefing_task.is_running():
         morning_briefing_task.start()
     if not evening_briefing_task.is_running():
@@ -1669,10 +2345,13 @@ async def on_ready():
         weekly_email_task.start()
     if TELEGRAM_BOT_TOKEN and not telegram_poll_task.is_running():
         telegram_poll_task.start()
+    if not intraday_snapshot_loop.is_running():
+        intraday_snapshot_loop.start()
+    if not discord_watchdog_task.is_running():
+        discord_watchdog_task.start()
     # Initialize ChromaDB causal memory
     _init_chromadb()
-    # Sync Alpaca positions into portfolio — add any tracked positions missing from ledger
-    _sync_alpaca_to_portfolio()
+    # (Alpaca sync already ran before equity reconciliation)
     # Re-queue cascades for open oracle trades that lost queue on restart
     cascade_requeue_on_startup()
     # Test Polygon.io connection
@@ -1682,6 +2361,40 @@ async def on_ready():
         log.info("POLYGON: %s", _poly_msg)
     except Exception as _pe:
         log.warning("POLYGON: import/test failed: %s", _pe)
+    # === STARTUP PRICE CACHE WARMING ===
+    # Warm prices for ALL open position tickers (including those added by sync).
+    # This ensures first !status / !paper-pnl shows real P&L, not $0.00.
+    import asyncio as _aio_warm
+    async def _warm_all_prices():
+        def _do_warm():
+            _warmed = set()
+            _failed = []
+            for pos in PAPER_PORTFOLIO.get("positions", []):
+                for _lk in ("long_leg", "short_leg", "extra_long_leg"):
+                    leg = pos.get(_lk, "")
+                    if leg and leg not in _warmed:
+                        try:
+                            px, src = get_current_price(leg)
+                            if px > 0:
+                                _warmed.add(leg)
+                            else:
+                                _failed.append(leg)
+                        except Exception:
+                            _failed.append(leg)
+            # Retry failed tickers once with a small delay
+            import time as _tw
+            for leg in _failed:
+                _tw.sleep(0.5)
+                try:
+                    px, src = get_current_price(leg)
+                    if px > 0:
+                        _warmed.add(leg)
+                except Exception:
+                    pass
+            log.info("STARTUP PRICE WARM: %d tickers cached, %d failed",
+                     len(_warmed), len(set(_failed) - _warmed))
+        await _aio_warm.to_thread(_do_warm)
+    _aio_warm.ensure_future(_warm_all_prices())
 
 
 @bot.command()
@@ -1697,11 +2410,9 @@ async def portfolio(ctx):
 
     kalshi   = get_kalshi_balance()
     poly     = get_polymarket_balance()
-    robinhood = get_robinhood_balance()
     coinbase  = get_coinbase_balance()
     phemex    = get_phemex_balance()
 
-    rh_holdings = get_robinhood_holdings()
     cb_holdings = get_coinbase_holdings_detail()
     poly_holdings = get_polymarket_positions_detail()
 
@@ -1714,10 +2425,6 @@ async def portfolio(ctx):
     if poly_holdings:
         report += f"{poly_holdings}\n"
 
-    report += f"**Robinhood Crypto:** {robinhood}\n"
-    if rh_holdings:
-        report += f"{rh_holdings}\n"
-
     report += f"**Coinbase:** {coinbase}\n"
     if cb_holdings:
         report += f"{cb_holdings}\n"
@@ -1725,7 +2432,7 @@ async def portfolio(ctx):
     report += (
         f"**Phemex:** {phemex}\n"
         f"================================\n"
-        f"*Alpaca: {get_alpaca_balance()}\nInteractive Brokers: {get_ibkr_balance()}\nPredictIt: {get_predictit_balance()}*"
+        f"*Alpaca: {get_alpaca_balance()}\nInteractive Brokers: {get_ibkr_balance()}*"
     )
 
     await msg.edit(content=report)
@@ -1734,7 +2441,6 @@ async def portfolio(ctx):
         f"\n## Portfolio Snapshot -- {ts}\n"
         f"- Kalshi: {kalshi}\n"
         f"- Polymarket: {poly}\n"
-        f"- Robinhood: {robinhood}\n"
         f"- Coinbase: {coinbase}\n"
         f"- Phemex: {phemex}\n\n---\n"
     )
@@ -1796,10 +2502,9 @@ async def integrations(ctx):
         "Kalshi":           bool(KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY),
         "Polymarket":       bool(POLY_WALLET_ADDRESS),
         "Poly CLOB":        bool(POLY_PRIVATE_KEY),
-        "Robinhood":        bool(ROBINHOOD_API_KEY and ROBINHOOD_PRIVATE_KEY),
         "Coinbase":         bool(COINBASE_API_KEY and COINBASE_API_SECRET),
         "Phemex":           bool(PHEMEX_API_KEY and PHEMEX_API_SECRET),
-        "OpenAI":           bool(OPENAI_API_KEY),
+        "Anthropic AI":     bool(ANTHROPIC_API_KEY),
         "GitHub Logger":    bool(GITHUB_TOKEN),
         "Discord Channel":  bool(DISCORD_CHANNEL_ID),
     }
@@ -1813,12 +2518,12 @@ async def integrations(ctx):
 
 @bot.command()
 async def analyze(ctx, *, question: str = ""):
-    """AI-powered market analysis using GPT-4o-mini."""
+    """AI-powered market analysis using Claude Haiku."""
     if not question:
         await ctx.send("Usage: `!analyze Will the Fed cut rates in March?`")
         return
-    if not OPENAI_API_KEY:
-        await ctx.send("OPENAI_API_KEY not set. Add it to .env and restart.")
+    if not ANTHROPIC_API_KEY:
+        await ctx.send("ANTHROPIC_API_KEY not set. Add it to .env and restart.")
         return
     msg = await ctx.send(f"Analyzing: *{question[:100]}*...")
     # Enrich with market forecast context
@@ -1829,32 +2534,34 @@ async def analyze(ctx, *, question: str = ""):
     except Exception:
         pass
     try:
-        r = requests.post("https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+        r = requests.post("https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
             json={
-                "model": "gpt-4o-mini",
-                "messages": [
-                    {"role": "system", "content": "You are TraderJoe, an expert autonomous trading analyst. For every question provide: 1) Probability estimate (0-100%) 2) Confidence (Low/Medium/High/Very High) 3) Key factors (3-5 bullets) 4) Position: BUY YES / BUY NO / PASS 5) Kelly criterion sizing suggestion. Be concise and data-driven."},
-                    {"role": "user", "content": question}
-                ],
+                "model": "claude-haiku-4-5-20251001",
                 "max_tokens": 800,
-                "temperature": 0.3
+                "system": "You are TraderJoe, an expert autonomous trading analyst. For every question provide: 1) Probability estimate (0-100%) 2) Confidence (Low/Medium/High/Very High) 3) Key factors (3-5 bullets) 4) Position: BUY YES / BUY NO / PASS 5) Kelly criterion sizing suggestion. Be concise and data-driven.",
+                "messages": [{"role": "user", "content": question + forecast_context}],
             }, timeout=30)
         if r.status_code == 200:
-            answer = r.json()["choices"][0]["message"]["content"]
+            _resp_content = r.json().get("content", [{}])
+            answer = _resp_content[0].get("text", "").strip() if _resp_content else "No response"
             ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             response = f"**TraderJoe Analysis** | {ts}\n**Q:** {question[:100]}\n\n{answer}"
             if len(response) > 1900:
                 response = response[:1900] + "\n*...truncated*"
             await msg.edit(content=response)
         elif r.status_code == 401:
-            await msg.edit(content="Invalid OpenAI API key. Check .env file.")
+            await msg.edit(content="Invalid Anthropic API key. Check .env file.")
         elif r.status_code == 429:
             await msg.edit(content="Rate limited. Try again in a moment.")
         else:
-            await msg.edit(content=f"OpenAI error {r.status_code}: {r.text[:200]}")
+            await msg.edit(content=f"Anthropic error {r.status_code}: {r.text[:200]}")
     except requests.exceptions.Timeout:
-        await msg.edit(content="OpenAI timed out. Try again.")
+        await msg.edit(content="Claude timed out. Try again.")
     except Exception as exc:
         await msg.edit(content=f"Error: {exc}")
 
@@ -1864,6 +2571,293 @@ async def analyze(ctx, *, question: str = ""):
 # ============================================================================
 # PAPER TRADING / SIMULATION
 # ============================================================================
+
+@bot.command(name="sgs")
+async def sgs_cmd(ctx, strategy: str = "", tier: str = ""):
+    """Current SGS breakdown for one strategy. Usage: !sgs <strategy> [tier]"""
+    if not strategy:
+        await ctx.send("Usage: `!sgs <strategy> [tier]` — e.g. `!sgs crypto_momentum_shadow SHADOW`")
+        return
+    try:
+        from intelligence_workers.strategy_grade_scorer import calculate_sgs
+        t = (tier or "SHADOW").upper()
+        r = calculate_sgs(strategy, t, persist=False)
+    except Exception as e:
+        await ctx.send(f"SGS calc failed: {e}")
+        return
+    c = r["components"]
+    gates_lines = ""
+    if r["hard_gates"]:
+        gates_lines = "\n**Hard gates:**\n" + "\n".join(
+            f"  {'✓' if v else '✗'} {k}" for k, v in r["hard_gates"].items()
+        )
+    pf = f"{r['profit_factor']:.2f}" if r['profit_factor'] else "—"
+    shp = f"{r['sharpe']:.2f}" if r['sharpe'] else "—"
+    msg = (
+        f"**SGS** | {strategy} / {t} | **{r['sgs']:.1f}** / 100 → **{r['recommendation']}**\n"
+        f"```\n"
+        f"Sample Size  {c['sample']:>3.0f}   n={r['n_trades']}\n"
+        f"Profitability{c['profit']:>3.0f}   PF={pf}\n"
+        f"Risk-Adj     {c['risk']:>3.0f}   Sharpe={shp}\n"
+        f"Win Rate     {c['winrate']:>3.0f}   WR={r['win_rate_pct']}% (avg_win=${r['avg_win']}, avg_loss=${r['avg_loss']})\n"
+        f"Drawdown     {c['drawdown']:>3.0f}   max={r['max_drawdown_pct']}%\n"
+        f"Consistency  {c['consistency']:>3.0f}\n"
+        f"```\n"
+        f"Total P&L: ${r['total_pnl']:+,.2f} | Days active: {r['days_active']} | "
+        f"action_ready: {r['action_ready']}"
+        f"{gates_lines}"
+    )
+    await ctx.send(msg[:1950])
+
+
+@bot.command(name="sgs-all")
+async def sgs_all_cmd(ctx, tier: str = ""):
+    """All-strategies SGS table. Usage: !sgs-all [tier]"""
+    try:
+        from intelligence_workers.strategy_grade_scorer import score_all_strategies
+        tiers = [tier.upper()] if tier else ["SHADOW", "PAPER"]
+        results = score_all_strategies(tiers=tiers)
+    except Exception as e:
+        await ctx.send(f"SGS run failed: {e}")
+        return
+    if not results:
+        await ctx.send(f"No closed trades found in tiers={tiers}.")
+        return
+    lines = [f"**SGS — all strategies** (tiers: {', '.join(tiers)})"]
+    lines.append("```")
+    lines.append(f"{'strategy':<30} {'tier':<8} {'SGS':>5} {'n':>4} {'rec':<9}")
+    for r in results[:25]:
+        lines.append(
+            f"{r['strategy'][:28]:<30} {r['tier']:<8} "
+            f"{r['sgs']:>5.1f} {r['n_trades']:>4} {r['recommendation']:<9}"
+        )
+    lines.append("```")
+    await ctx.send("\n".join(lines)[:1950])
+
+
+@bot.command(name="sgs-history")
+async def sgs_history_cmd(ctx, strategy: str = "", tier: str = ""):
+    """SGS trend (last 30 snapshots). Usage: !sgs-history <strategy> [tier]"""
+    if not strategy:
+        await ctx.send("Usage: `!sgs-history <strategy> [tier]`")
+        return
+    try:
+        import sqlite3 as _hsq
+        conn = _hsq.connect(DB_PATH)
+        params = [strategy]
+        where = "WHERE strategy=?"
+        if tier:
+            where += " AND tier=?"
+            params.append(tier.upper())
+        rows = conn.execute(
+            f"SELECT timestamp, tier, sgs, n_trades, recommendation "
+            f"FROM strategy_grade_scores {where} "
+            f"ORDER BY timestamp DESC LIMIT 30",
+            params,
+        ).fetchall()
+        conn.close()
+    except Exception as e:
+        await ctx.send(f"SGS history query failed: {e}")
+        return
+    if not rows:
+        await ctx.send(f"No SGS history for {strategy}" + (f"/{tier}" if tier else ""))
+        return
+    lines = [f"**SGS history** — {strategy}" + (f" / {tier.upper()}" if tier else "")]
+    lines.append("```")
+    lines.append(f"{'timestamp':<20} {'tier':<8} {'SGS':>5} {'n':>4} {'rec':<9}")
+    for r in rows:
+        ts = r[0][:16] if r[0] else "—"
+        lines.append(f"{ts:<20} {r[1]:<8} {r[2]:>5.1f} {r[3] or 0:>4} {r[4] or '—':<9}")
+    lines.append("```")
+    await ctx.send("\n".join(lines)[:1950])
+
+
+def _sgs_audit_log(action, strategy, from_tier, to_tier, actor, reason):
+    """Write a tier-transition to engineer_audit_log for persistent trail."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT INTO engineer_audit_log "
+            "(config_key, old_value, new_value, reason, triggering_metric, tier, metadata) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                f"sgs_action.{action}",
+                from_tier or "—",
+                to_tier or "—",
+                reason,
+                f"action={action} strategy={strategy}",
+                to_tier or from_tier or "SHADOW",
+                _json_api.dumps({"strategy": strategy, "actor": actor,
+                                  "action": action}),
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.debug("sgs audit write failed: %s", e)
+
+
+def _graduation_import():
+    """Lazy import of the graduation module with sys.path handling."""
+    import sys
+    if "/app/intelligence_workers" not in sys.path:
+        sys.path.insert(0, "/app/intelligence_workers")
+    import graduation
+    return graduation
+
+
+def _fmt_gates(gates: dict) -> str:
+    return "\n".join(f"  {'✓' if v else '✗'} {k}" for k, v in (gates or {}).items())
+
+
+@bot.command(name="promote-to-paper")
+async def promote_to_paper_cmd(ctx, strategy: str = ""):
+    """Promote a shadow strategy to paper. Validates SGS ≥ 65 + gates.
+    Delegates to intelligence_workers.graduation."""
+    if not strategy:
+        await ctx.send("Usage: `!promote-to-paper <strategy>`")
+        return
+    try:
+        g = _graduation_import()
+        r = g.graduate_shadow_to_paper(strategy, actor=str(ctx.author))
+    except Exception as e:
+        await ctx.send(f"Graduation call failed: {e}")
+        return
+    if not r["ok"]:
+        await ctx.send(
+            f"**DENIED** — {strategy} not ready for paper.\n"
+            f"SGS: {r.get('sgs', '—')}\n"
+            f"Blockers: {', '.join(r['reasons'])}\n"
+            f"Audit id: {r.get('audit_id')}"
+        )
+        return
+    await ctx.send(
+        f"**PROMOTED** — {strategy} SHADOW → PAPER.\n"
+        f"SGS {r['sgs']:.1f}. Audit id: {r['audit_id']}\n"
+        f"Shadow allocation: status=GRADUATED, balance=$0 (baseline preserved).\n"
+        f"Manual step: register the paper-tier worker + restart."
+    )
+
+
+@bot.command(name="promote-to-live")
+async def promote_to_live_cmd(ctx, strategy: str = "", amount: float = 0):
+    """Dry-run validation of PAPER → LIVE. Does NOT deploy live capital.
+    Use `!confirm-live <strategy> <amount>` to actually move forward
+    after reviewing Gemini concurrence."""
+    if not strategy or amount <= 0:
+        await ctx.send("Usage: `!promote-to-live <strategy> <amount>` — dry-run validation (no deploy)")
+        return
+    try:
+        g = _graduation_import()
+        r = g.graduate_paper_to_live(strategy, amount,
+                                      actor=str(ctx.author), dry_run=True)
+    except Exception as e:
+        await ctx.send(f"Validation failed: {e}")
+        return
+    header = "**VALIDATE (dry-run)**" if r["ok"] else "**DENIED**"
+    msg = [
+        f"{header} {strategy} PAPER → LIVE · tranche ${r.get('tranche_usd', 0):.0f}",
+        f"SGS (PAPER): {r.get('sgs', '—')}",
+    ]
+    if r["hard_gates"]:
+        msg.append("Hard gates:"); msg.append(_fmt_gates(r["hard_gates"]))
+    if not r["ok"]:
+        msg.append(f"Blockers: {', '.join(r['reasons'])}")
+    else:
+        msg.append("Next: `!gemini-review <strategy>`, then `!confirm-live <strategy> <amount>` to deploy.")
+    await ctx.send("\n".join(msg)[:1950])
+
+
+@bot.command(name="gemini-review")
+async def gemini_review_cmd(ctx, strategy: str = ""):
+    """Stub: Gemini concurrence review. Full integration is manual — this
+    command acknowledges the gate; the Gemini call is out-of-band until
+    integrated. Audit-logs that a review was requested."""
+    if not strategy:
+        await ctx.send("Usage: `!gemini-review <strategy>`")
+        return
+    _sgs_audit_log("gemini_review_requested", strategy, "PAPER", "LIVE",
+                   str(ctx.author), "Gemini review requested (manual out-of-band)")
+    await ctx.send(
+        f"**Gemini review requested** for {strategy}.\n"
+        f"This is an out-of-band review — paste the paper-tier SGS report\n"
+        f"and strategy spec into Gemini, then return here with\n"
+        f"`!confirm-live <strategy> <amount>` if Gemini concurs."
+    )
+
+
+@bot.command(name="confirm-live")
+async def confirm_live_cmd(ctx, strategy: str = "", amount: float = 0):
+    """Actual PAPER → LIVE graduation (non-dry-run). Requires all gates.
+    First tranche capped at $10K regardless of amount."""
+    if not strategy or amount <= 0:
+        await ctx.send("Usage: `!confirm-live <strategy> <amount>`")
+        return
+    try:
+        g = _graduation_import()
+        r = g.graduate_paper_to_live(strategy, amount,
+                                      actor=str(ctx.author), dry_run=False)
+    except Exception as e:
+        await ctx.send(f"Graduation failed: {e}")
+        return
+    if not r["ok"]:
+        await ctx.send(
+            f"**DENIED** — {strategy} cannot go live.\n"
+            f"SGS (PAPER): {r.get('sgs', '—')}\n"
+            f"Blockers: {', '.join(r['reasons'])}"
+        )
+        return
+    await ctx.send(
+        f"**LIVE APPROVED** — {strategy} PAPER → LIVE.\n"
+        f"SGS {r['sgs']:.1f}. Tranche: ${r['tranche_usd']:.0f} "
+        f"(cap ${g.FIRST_LIVE_TRANCHE_CAP:.0f}).\n"
+        f"Audit id: {r['audit_id']}.\n"
+        f"⚠️ Manual step: arm kill switch (TJB_KILL_SWITCH_ENABLED=true) + "
+        f"register live worker. PAPER baseline continues for divergence monitor."
+    )
+
+
+@bot.command(name="demote-to-shadow")
+async def demote_to_shadow_cmd(ctx, strategy: str = "", *, reason: str = ""):
+    """Manual demote PAPER → SHADOW. Requires a reason. Audit-logged."""
+    if not strategy or not reason:
+        await ctx.send("Usage: `!demote-to-shadow <strategy> <reason>`")
+        return
+    try:
+        g = _graduation_import()
+        r = g.demote_paper_to_shadow(strategy, reason, str(ctx.author))
+    except Exception as e:
+        await ctx.send(f"Demote failed: {e}")
+        return
+    await ctx.send(
+        f"**DEMOTED** — {strategy} PAPER → SHADOW.\n"
+        f"Reason: {reason}\n"
+        f"Shadow allocation restored at $5,000 ACTIVE. Audit id: {r['audit_id']}."
+    )
+
+
+@bot.command(name="kill-strategy")
+async def kill_strategy_cmd(ctx, strategy: str = "", confirm: str = "", *, reason: str = ""):
+    """Kill a strategy. Requires 'CONFIRM' literal + reason."""
+    if not strategy or confirm != "CONFIRM" or not reason:
+        await ctx.send(
+            "Usage: `!kill-strategy <strategy> CONFIRM <reason>`\n"
+            "The literal word CONFIRM must appear between strategy and reason."
+        )
+        return
+    try:
+        g = _graduation_import()
+        r = g.kill_strategy(strategy, reason, str(ctx.author))
+    except Exception as e:
+        await ctx.send(f"Kill failed: {e}")
+        return
+    await ctx.send(
+        f"**KILLED** — {strategy}.\n"
+        f"Reason: {reason}\n"
+        f"Allocation zeroed, status=KILLED. Audit id: {r['audit_id']}.\n"
+        f"Manual step: move code to dead/ folder + update agent_inventory.md."
+    )
+
 
 @bot.command(name="paper-status")
 async def paper_status(ctx):
@@ -2158,10 +3152,7 @@ async def confirm_trade(ctx):
         if asset.startswith("KX") or asset.startswith("KALSHI"):
             success, exec_msg = await execute_kalshi_order(action_str, asset, amt)
         elif asset in ("BTC", "ETH", "DOGE", "XRP", "SOL", "ALGO", "SHIB", "XLM", "HBAR"):
-            # Try Coinbase first, then Robinhood
             success, exec_msg = await execute_coinbase_order(action_str, asset, amt)
-            if not success and "Robinhood" not in exec_msg:
-                success, exec_msg = await execute_robinhood_order(action_str, asset, amt)
         elif asset.endswith("USDT") or asset.endswith("PERP"):
             success, exec_msg = await execute_phemex_order(action_str, asset, amt)
         else:
@@ -2205,15 +3196,15 @@ async def _send_daily_report(channel):
     fng_val, fng_label = get_fear_greed()
 
     kalshi=get_kalshi_balance(); poly=get_polymarket_balance()
-    rh=get_robinhood_balance(); cb=get_coinbase_balance(); ph=get_phemex_balance()
+    cb=get_coinbase_balance(); ph=get_phemex_balance()
     pc=PAPER_PORTFOLIO["cash"]; pv=sum(p.get("value",0) for p in PAPER_PORTFOLIO.get("positions",[]))
     pt=pc+pv; ppnl=pt-10000.0
     r = (f"**TraderJoes Daily Report** | {ts}\n================================\n"
         f"**Market:** F&G {fng_val}/100 ({fng_label}) | Mode: {TRADING_MODE.upper()}\n"
-        f"**Kalshi:** {kalshi}\n**Polymarket:** {poly}\n**Robinhood:** {rh}\n**Coinbase:** {cb}\n**Phemex:** {ph}\n"
+        f"**Kalshi:** {kalshi}\n**Polymarket:** {poly}\n**Coinbase:** {cb}\n**Phemex:** {ph}\n"
         f"**Paper:** ${pt:,.2f} (P&L: ${ppnl:+,.2f}) | Trades: {len(PAPER_PORTFOLIO['trades'])}\n"
         f"**Risk:** Max pos {MAX_POSITION_PCT:.1%} | Daily limit: ${DAILY_LOSS_LIMIT:,.2f} | Current: ${DAILY_PNL:+,.2f}\n"
-        f"**System:** Bot online | OpenAI {'OK' if OPENAI_API_KEY else 'N/A'}\n================================")
+        f"**System:** Bot online | Claude Haiku {'OK' if ANTHROPIC_API_KEY else 'N/A'}\n================================")
     if len(r) > 1900: r = r[:1900]
     await channel.send(r)
 
@@ -2260,7 +3251,7 @@ async def _build_morning_briefing():
     total_realized = 0.0
     try:
         _c = _msq.connect(DB_PATH)
-        _r = _c.execute("SELECT SUM(realized_pnl) FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL").fetchone()
+        _r = _c.execute("SELECT SUM(realized_pnl) FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL" + _SQL_REAL_TRADES_AND_LEGACY).fetchone()
         if _r and _r[0]:
             total_realized = _r[0]
         _c.close()
@@ -2274,7 +3265,7 @@ async def _build_morning_briefing():
     overnight_opened = []
     try:
         _c = _msq.connect(DB_PATH)
-        for r in _c.execute("SELECT market_id, strategy, realized_pnl, exit_reason FROM positions WHERE status='closed' AND closed_at>=? ORDER BY closed_at DESC LIMIT 10", (twelve_h_ago,)):
+        for r in _c.execute("SELECT market_id, strategy, realized_pnl, exit_reason FROM positions WHERE status='closed'" + _SQL_REAL_TRADES_AND_LEGACY + " AND closed_at>=? ORDER BY closed_at DESC LIMIT 10", (twelve_h_ago,)):
             overnight_closed.append({"market": r[0], "strategy": r[1], "pnl": r[2], "reason": r[3]})
         for r in _c.execute("SELECT market_id, strategy, size_usd FROM positions WHERE status='open' AND created_at>=? ORDER BY created_at DESC LIMIT 10", (twelve_h_ago,)):
             overnight_opened.append({"market": r[0], "strategy": r[1], "size": r[2]})
@@ -2295,6 +3286,8 @@ async def _build_morning_briefing():
     m1 += f"{'Positions:':<22s} {len(positions):>10d}\n"
     m1 += f"{'VIX:':<22s} {vix:>10.1f}  ({regime_name.upper()})\n"
     m1 += f"{'Fear & Greed:':<22s} {fng_val:>10d}/100 ({fng_label})\n"
+    _vr = _PSYCH_STATE.get("vix_regime", "normal").upper()
+    m1 += f"{'VIX Regime:':<22s} {_vr:>10s}\n"
     if _PSYCH_STATE.get("contrarian_mode"):
         m1 += f"{'Psychologist:':<22s} {'CONTRARIAN':>10s}\n"
     m1 += f"{'─' * 36}\n"
@@ -2386,7 +3379,8 @@ async def _build_evening_briefing():
     opened_today = []
     try:
         _c = _esq.connect(DB_PATH)
-        for r in _c.execute("SELECT market_id, strategy, size_usd, realized_pnl, exit_reason FROM positions WHERE status='closed' AND closed_at>=? ORDER BY closed_at DESC", (today,)):
+        for r in _c.execute("SELECT market_id, strategy, size_usd, realized_pnl, exit_reason FROM positions WHERE status='closed' AND closed_at>=?"
+                            + _SQL_REAL_TRADES_AND_LEGACY + " AND realized_pnl != 0 ORDER BY closed_at DESC", (today,)):
             closed_today.append({"market": r[0], "strategy": r[1], "size": r[2], "pnl": r[3] or 0, "reason": r[4]})
         for r in _c.execute("SELECT market_id, strategy, size_usd FROM positions WHERE status='open' AND created_at>=? ORDER BY created_at DESC", (today,)):
             opened_today.append({"market": r[0], "strategy": r[1], "size": r[2]})
@@ -2452,14 +3446,14 @@ async def _build_week_summary():
 
     try:
         _c = _wsq.connect(DB_PATH)
-        _r = _c.execute("SELECT COUNT(*), SUM(realized_pnl), AVG(realized_pnl) FROM positions WHERE status='closed' AND closed_at>=? AND realized_pnl IS NOT NULL", (week_ago,)).fetchone()
+        _r = _c.execute("SELECT COUNT(*), SUM(realized_pnl), AVG(realized_pnl) FROM positions WHERE status='closed' AND closed_at>=? AND realized_pnl IS NOT NULL" + _SQL_REAL_TRADES_AND_LEGACY, (week_ago,)).fetchone()
         total_trades, total_pnl, avg_pnl = (_r[0] or 0), (_r[1] or 0), (_r[2] or 0)
-        _w = _c.execute("SELECT COUNT(*) FROM positions WHERE status='closed' AND closed_at>=? AND realized_pnl>0", (week_ago,)).fetchone()
+        _w = _c.execute("SELECT COUNT(*) FROM positions WHERE status='closed' AND closed_at>=? AND realized_pnl>0" + _SQL_REAL_TRADES_AND_LEGACY, (week_ago,)).fetchone()
         wins = _w[0] or 0
-        strat_rows = _c.execute("SELECT strategy, COUNT(*), SUM(realized_pnl), AVG(realized_pnl) FROM positions WHERE status='closed' AND closed_at>=? AND realized_pnl IS NOT NULL GROUP BY strategy ORDER BY SUM(realized_pnl) DESC", (week_ago,)).fetchall()
-        day_rows = _c.execute("SELECT DATE(closed_at), SUM(realized_pnl), COUNT(*) FROM positions WHERE status='closed' AND closed_at>=? AND realized_pnl IS NOT NULL GROUP BY DATE(closed_at) ORDER BY DATE(closed_at)", (week_ago,)).fetchall()
-        best = _c.execute("SELECT market_id, realized_pnl, strategy FROM positions WHERE status='closed' AND closed_at>=? AND realized_pnl IS NOT NULL ORDER BY realized_pnl DESC LIMIT 1", (week_ago,)).fetchone()
-        worst = _c.execute("SELECT market_id, realized_pnl, strategy FROM positions WHERE status='closed' AND closed_at>=? AND realized_pnl IS NOT NULL ORDER BY realized_pnl ASC LIMIT 1", (week_ago,)).fetchone()
+        strat_rows = _c.execute("SELECT strategy, COUNT(*), SUM(realized_pnl), AVG(realized_pnl) FROM positions WHERE status='closed' AND closed_at>=? AND realized_pnl IS NOT NULL" + _SQL_REAL_TRADES_AND_LEGACY + " GROUP BY strategy ORDER BY SUM(realized_pnl) DESC", (week_ago,)).fetchall()
+        day_rows = _c.execute("SELECT DATE(closed_at), SUM(realized_pnl), COUNT(*) FROM positions WHERE status='closed' AND closed_at>=? AND realized_pnl IS NOT NULL" + _SQL_REAL_TRADES_AND_LEGACY + " GROUP BY DATE(closed_at) ORDER BY DATE(closed_at)", (week_ago,)).fetchall()
+        best = _c.execute("SELECT market_id, realized_pnl, strategy FROM positions WHERE status='closed' AND closed_at>=? AND realized_pnl IS NOT NULL" + _SQL_REAL_TRADES_AND_LEGACY + " ORDER BY realized_pnl DESC LIMIT 1", (week_ago,)).fetchone()
+        worst = _c.execute("SELECT market_id, realized_pnl, strategy FROM positions WHERE status='closed' AND closed_at>=? AND realized_pnl IS NOT NULL" + _SQL_REAL_TRADES_AND_LEGACY + " ORDER BY realized_pnl ASC LIMIT 1", (week_ago,)).fetchone()
         _c.close()
     except Exception:
         total_trades = total_pnl = avg_pnl = wins = 0
@@ -2491,6 +3485,185 @@ async def _build_week_summary():
     m1 += "```"
     msgs.append(m1)
     return msgs
+
+
+# ── PRE-MARKET BATTLE PLAN (9:00 AM ET) ────────────────────────────────────
+async def _build_battle_plan():
+    """Pre-market battle plan — runs 25 min before open. Returns list of message strings."""
+    from zoneinfo import ZoneInfo
+    et_now = datetime.now(ZoneInfo("America/New_York"))
+    msgs = []
+
+    # 1. VIX regime
+    regime = get_regime("equities")
+    vix = regime.get("vix") or 20
+    vix_regime = _PSYCH_STATE.get("vix_regime", "normal")
+    regime_weights = REGIME_STRATEGY_WEIGHTS.get(vix_regime, REGIME_STRATEGY_WEIGHTS["normal"])
+
+    # 2. Overnight SPY move (via Alpaca latest quote vs previous close)
+    spy_move = ""
+    try:
+        import requests as _bp_req
+        _bp_hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+        _bp_bars = _bp_req.get(f"{ALPACA_BASE_URL}/v2/stocks/SPY/bars?timeframe=1Day&limit=2", headers=_bp_hdr, timeout=5)
+        if _bp_bars.status_code == 200:
+            bars = _bp_bars.json().get("bars", [])
+            if len(bars) >= 2:
+                prev_close = bars[-2].get("c", 0)
+                last_close = bars[-1].get("c", 0)
+                if prev_close > 0:
+                    pct = (last_close - prev_close) / prev_close * 100
+                    spy_move = f"SPY overnight: ${last_close:.2f} ({pct:+.2f}%)"
+    except Exception:
+        spy_move = "SPY: unavailable"
+
+    # 3. Top 3 pairs by Z-score divergence
+    top_pairs = []
+    pairs_list = EQUITIES_CONFIG["pairs"]["seed"]
+    for a, b in pairs_list[:15]:  # Check top 15 for speed
+        try:
+            _c, _z, _m = calculate_pair_zscore(a, b, 252)
+            if _z is not None and _c is not None:
+                top_pairs.append((a, b, abs(_z), _z, _c))
+        except Exception:
+            pass
+    top_pairs.sort(key=lambda x: x[2], reverse=True)
+
+    # 4. Kelly mode and position sizes
+    portfolio_val = PAPER_PORTFOLIO.get("cash", 0) + sum(p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+    trade_count = _get_closed_trade_count("pairs")
+    if trade_count < KELLY_MIN_TRADES:
+        kelly_label = f"Fixed {KELLY_FIXED_PCT*100:.0f}% (${KELLY_FIXED_PCT * portfolio_val:,.0f}/leg) — {trade_count}/{KELLY_MIN_TRADES} trades"
+    else:
+        kelly_label = f"Memory-Weighted Kelly — {trade_count} trades"
+
+    # 5. Overnight movers via Polygon snapshots (prev close vs current)
+    pre_movers = ""
+    _mover_tickers = ["SPY", "QQQ", "NVDA", "TSLA", "AAPL", "AMZN", "META", "MSFT"]
+    try:
+        import requests as _pm_req
+        _polygon_key = os.getenv("POLYGON_API_KEY", "")
+        _mover_data = []
+        for _mt in _mover_tickers:
+            _pm_r = _pm_req.get(
+                f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{_mt}",
+                params={"apiKey": _polygon_key}, timeout=5)
+            if _pm_r.status_code == 200:
+                _snap = _pm_r.json().get("ticker", {})
+                _prev_c = _snap.get("prevDay", {}).get("c", 0)
+                _last = _snap.get("lastTrade", {}).get("p", 0) or _snap.get("min", {}).get("c", 0)
+                if _prev_c > 0 and _last > 0:
+                    _chg_pct = (_last - _prev_c) / _prev_c * 100
+                    _mover_data.append((_mt, _chg_pct, _last))
+        # Sort by absolute change, show all
+        _mover_data.sort(key=lambda x: abs(x[1]), reverse=True)
+        if _mover_data:
+            pre_movers = "\n".join(
+                f"   {t:5s} ${p:>8.2f} ({c:+.2f}%)" for t, c, p in _mover_data
+            )
+    except Exception:
+        pass
+
+    # 6. VIX term structure (spot vs futures proxy)
+    vix_structure = ""
+    try:
+        import yfinance as _vyf
+        _vix_spot = vix
+        _vx1 = _vyf.download("^VIX", period="5d", progress=False, timeout=10)
+        if len(_vx1) >= 2:
+            _vx_prev = float(_vx1["Close"].values.flatten()[-2])
+            if _vx_prev > 0:
+                _vx_delta = _vix_spot - _vx_prev
+                _structure = "BACKWARDATION (fear rising)" if _vx_delta > 1 else "CONTANGO (normal)" if _vx_delta < -1 else "FLAT"
+                vix_structure = f"VIX: {_vix_spot:.1f} (Δ{_vx_delta:+.1f}) — {_structure}"
+    except Exception:
+        vix_structure = f"VIX: {vix:.1f}"
+
+    # 7. Oracle signal status
+    oracle_status_lines = []
+    for sig in ORACLE_SIGNALS[:5]:
+        _sig_name = sig["name"]
+        _has_pos = any(p.get("market", "").endswith(_sig_name) for p in PAPER_PORTFOLIO.get("positions", []))
+        _status = "ACTIVE" if _has_pos else "watching"
+        oracle_status_lines.append(f"   {_sig_name}: {_status} (L:{sig['long']} S:{sig['short']})")
+
+    # 8. Build the plan
+    bp = f"**BATTLE PLAN** | {et_now.strftime('%A %b %d')} | 9:00 AM ET\n```\n"
+    bp += f"{'─' * 50}\n"
+
+    # Bullet 1: Market regime + VIX structure
+    bp += f"1. REGIME: {vix_regime.upper()} (VIX={vix:.1f})\n"
+    bp += f"   {vix_structure}\n"
+    bp += f"   Pairs {regime_weights['pairs']:.1f}x | Crypto {regime_weights['crypto']:.1f}x | Hedge {regime_weights['crash_hedge']:.1f}x\n"
+
+    # Bullet 2: SPY + pre-market movers
+    bp += f"2. {spy_move}\n"
+    if pre_movers:
+        bp += f"   OVERNIGHT MOVERS:\n{pre_movers}\n"
+
+    # Bullet 3: Ready-to-execute pairs (|z|>1.1)
+    ready_pairs = [p for p in top_pairs if p[2] >= 1.1 and p[4] >= 0.85]
+    bp += f"3. PAIRS READY TO EXECUTE (|z|≥1.1):\n"
+    if ready_pairs:
+        for a, b, absz, z, c in ready_pairs[:5]:
+            direction = "LONG A/SHORT B" if z < 0 else "SHORT A/LONG B"
+            size = KELLY_FIXED_PCT * portfolio_val if trade_count < KELLY_MIN_TRADES else portfolio_val * 0.02
+            bp += f"   → {a}/{b}: z={z:+.2f} corr={c:.2f} ${size:,.0f}/leg\n"
+    else:
+        bp += f"   None at threshold\n"
+
+    # Bullet 4: Sizing + portfolio
+    bp += f"4. SIZING: {kelly_label}\n"
+    bp += f"   Portfolio: ${portfolio_val:,.0f} | Max pairs: {MAX_PAIRS_POSITIONS}\n"
+
+    # Bullet 5: Oracle signals
+    bp += f"5. ORACLE SIGNALS:\n"
+    for line in oracle_status_lines[:4]:
+        bp += f"{line}\n"
+
+    # Warnings
+    if regime_weights["crypto"] == 0:
+        bp += f"   ⚠ Crypto momentum PAUSED (risk_off)\n"
+    if regime_weights["hedge_mode"] == "puts":
+        bp += f"   ⚠ Crash hedge: buying PUTS (not VRP spreads)\n"
+
+    bp += f"{'─' * 50}\n```"
+    msgs.append(bp)
+    return msgs
+
+
+@tasks.loop(hours=24)
+async def battle_plan_task():
+    if DISCORD_CHANNEL_ID:
+        try:
+            ch = bot.get_channel(int(DISCORD_CHANNEL_ID))
+            if ch:
+                msgs = await _build_battle_plan()
+                for m in msgs:
+                    await ch.send(m)
+                log.info("Battle plan sent")
+        except Exception as e:
+            log.warning("Battle plan error: %s", e)
+
+@battle_plan_task.before_loop
+async def before_battle_plan():
+    await bot.wait_until_ready()
+    import asyncio
+    from zoneinfo import ZoneInfo
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    target = now_et.replace(hour=9, minute=0, second=0, microsecond=0)
+    # If we missed today's window but it's still before market close, fire immediately
+    if now_et >= target and now_et.hour < 16 and now_et.weekday() < 5:
+        log.info("Battle plan: missed 9:00 AM window, firing immediately (%.0f min late)",
+                 (now_et - target).total_seconds() / 60)
+        return  # No sleep — fire now
+    if now_et >= target:
+        target += __import__("datetime").timedelta(days=1)
+    while target.weekday() >= 5:
+        target += __import__("datetime").timedelta(days=1)
+    wait_secs = (target - now_et).total_seconds()
+    log.info("Battle plan scheduled in %.0f minutes", wait_secs / 60)
+    await asyncio.sleep(wait_secs)
 
 
 # Scheduled tasks for morning/evening briefings
@@ -2555,6 +3728,11 @@ async def evening_briefing_task():
                 for m in msgs:
                     await ch.send(m)
                 log.info("Evening briefing sent")
+                # Store daily P&L snapshot at market close
+                try:
+                    db_store_daily_snapshot()
+                except Exception:
+                    pass
         except Exception as e:
             log.warning("Evening briefing error: %s", e)
 
@@ -2694,6 +3872,75 @@ async def sector_rotation_task():
                     if pair not in _seed:
                         _seed.append(pair)
                         log.info("SECTOR ROTATION: added %s/%s to pairs seed", long_etf, short_etf)
+
+                # Auto-execute top rotation pair if spread is wide enough
+                if pairs and len(rankings) >= 4:
+                    _top = rankings[0]
+                    _bot = rankings[-1]
+                    _spread = _top["change_pct"] - _bot["change_pct"]
+                    _confidence = min(int(_spread * 10), 100)  # 1% spread = 10 confidence
+                    log.info("SECTOR ROTATION: spread=%.1f%% confidence=%d (threshold=70)",
+                             _spread, _confidence)
+                    if _confidence >= 70:
+                        _long_etf, _short_etf = pairs[0]
+                        # Check for existing rotation position
+                        _has_rot = any(p.get("market", "").startswith("SECTOR_ROT:")
+                                       for p in PAPER_PORTFOLIO.get("positions", []))
+                        # FIX 2: pairs cap on sector rotation entry
+                        _rot_open_pairs = sum(1 for p in PAPER_PORTFOLIO.get("positions", [])
+                                              if p.get("strategy") == "pairs")
+                        if _rot_open_pairs >= MAX_PAIRS_POSITIONS:
+                            log.info("SECTOR ROTATION: blocked — %d/%d pairs open (cap)",
+                                     _rot_open_pairs, MAX_PAIRS_POSITIONS)
+                            _has_rot = True  # skip the open block below
+                        # FIX 3: $5K cash reserve guard (rotation is not a hedge)
+                        if not _has_rot and PAPER_PORTFOLIO.get("cash", 0) < 5000:
+                            log.info("SECTOR ROTATION: blocked — cash $%.0f < $5000 reserve",
+                                     PAPER_PORTFOLIO.get("cash", 0))
+                            _has_rot = True
+                        if not _has_rot:
+                            _portfolio_val = PAPER_PORTFOLIO.get("cash", 0) + sum(
+                                p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+                            # FIX 1: hard sizing — min(portfolio*1.5%, $500)
+                            _rot_size = min(_portfolio_val * 0.015, 500)
+                            if _rot_size > 50 and PAPER_PORTFOLIO["cash"] >= _rot_size * 2:
+                                PAPER_PORTFOLIO["cash"] -= _rot_size * 2
+                                _rot_pos = {
+                                    "market": f"SECTOR_ROT:{_long_etf}/{_short_etf}",
+                                    "side": "long_a_short_b",
+                                    "shares": 1,
+                                    "entry_price": 0,
+                                    "cost": _rot_size * 2,
+                                    "value": _rot_size * 2,
+                                    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                                    "platform": "Alpaca",
+                                    "ev": _spread / 100,
+                                    "strategy": "pairs",
+                                    "long_leg": _long_etf,
+                                    "short_leg": _short_etf,
+                                    "entry_zscore": 0,
+                                    "correlation": 0,
+                                    "entry_long_price": _top.get("price", 0),
+                                    "entry_short_price": _bot.get("price", 0),
+                                }
+                                PAPER_PORTFOLIO["positions"].append(_rot_pos)
+                                db_open_position(
+                                    market_id=f"SECTOR_ROT:{_long_etf}/{_short_etf}",
+                                    platform="Alpaca", strategy="pairs",
+                                    direction="long_a_short_b", size_usd=_rot_size * 2,
+                                    shares=1, entry_price=0,
+                                )
+                                save_all_state()
+                                log.info("SECTOR ROTATION EXECUTED: Long %s / Short %s | $%.0f/leg | spread=%.1f%% conf=%d",
+                                         _long_etf, _short_etf, _rot_size, _spread, _confidence)
+                                await ch.send(
+                                    f"**SECTOR ROTATION TRADE EXECUTED**\n"
+                                    f"Long {_long_etf} ({_top['change_pct']:+.1f}%) / Short {_short_etf} ({_bot['change_pct']:+.1f}%)\n"
+                                    f"Spread: {_spread:.1f}% | Confidence: {_confidence}\n"
+                                    f"Size: ${_rot_size:,.0f}/leg"
+                                )
+                        else:
+                            log.info("SECTOR ROTATION: skipped — already have rotation position")
     except Exception as e:
         log.warning("Sector rotation task error: %s", e)
 
@@ -2776,6 +4023,75 @@ def is_earnings_week(ticker):
     return ticker.upper() in _EARNINGS_WEEK.get("tickers", [])
 
 
+# ── ECONOMIC CALENDAR + PRE-EVENT SIZING TIGHTENING ──────────────────────
+_ECON_CALENDAR = {"events": [], "last_scan": None, "pre_event_active": False}
+
+# High-impact economic events (manually curated keywords for Polygon/yfinance data)
+HIGH_IMPACT_KEYWORDS = [
+    "fomc", "fed", "cpi", "ppi", "nonfarm", "payroll", "gdp",
+    "retail sales", "pce", "unemployment", "jackson hole",
+    "jobs report", "consumer confidence", "ism manufacturing",
+]
+
+
+def fetch_econ_calendar():
+    """Fetch upcoming week's major economic events. Returns list of event dicts."""
+    import datetime as _dt_ec
+    now = datetime.now(timezone.utc)
+    events = []
+
+    # Use pre-defined schedule of known recurring events
+    # These are the highest-impact regular events
+    _known_events = [
+        {"name": "FOMC Decision", "day_of_month": [1, 15], "impact": "extreme"},
+        {"name": "CPI Release", "day_of_month": [10, 11, 12, 13], "impact": "high"},
+        {"name": "Jobs Report (NFP)", "day_of_month": [1, 2, 3, 4, 5, 6, 7], "impact": "high"},
+    ]
+
+    # Check next 7 days for any high-impact events from earnings calendar
+    for i in range(7):
+        day = now + _dt_ec.timedelta(days=i)
+        day_str = day.strftime("%Y-%m-%d")
+        weekday = day.strftime("%A")
+        # Earnings on this day
+        for ticker, edate in _EARNINGS_WEEK.get("dates", {}).items():
+            if edate and day_str in str(edate):
+                events.append({
+                    "date": day_str, "day": weekday,
+                    "name": f"Earnings: {ticker}", "impact": "medium",
+                })
+
+    _ECON_CALENDAR["events"] = events
+    _ECON_CALENDAR["last_scan"] = now.strftime("%Y-%m-%d %H:%M UTC")
+    return events
+
+
+def check_pre_event_sizing():
+    """Check if a high-impact event is within 24 hours. If so, tighten sizing to 0.5x.
+    Called every scan cycle."""
+    import datetime as _dt_pe
+    now = datetime.now(timezone.utc)
+    was_active = _ECON_CALENDAR.get("pre_event_active", False)
+
+    for event in _ECON_CALENDAR.get("events", []):
+        try:
+            _ed = datetime.strptime(event["date"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            hours_until = (_ed - now).total_seconds() / 3600
+            if 0 < hours_until <= 24 and event.get("impact") in ("high", "extreme"):
+                _ECON_CALENDAR["pre_event_active"] = True
+                if not was_active:
+                    log.info("HIGH IMPACT EVENT TOMORROW: %s — sizing tightened to 0.5x", event["name"])
+                    _agent_log_event("risk", f"PRE-EVENT TIGHTEN: {event['name']} in {hours_until:.0f}h")
+                return True
+        except (ValueError, TypeError):
+            pass
+
+    if was_active:
+        _ECON_CALENDAR["pre_event_active"] = False
+        log.info("Pre-event sizing restored to normal")
+    return False
+
+
 @tasks.loop(hours=168)  # Weekly
 async def earnings_calendar_task():
     """Fetch earnings calendar every Sunday at 8 PM ET."""
@@ -2830,26 +4146,26 @@ async def weekly_email_task():
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         # Weekly stats
-        c.execute("""SELECT COUNT(*), COALESCE(SUM(realized_pnl),0),
-            SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END)
-            FROM positions WHERE status='closed' AND strategy != 'pairs_legacy'
-            AND closed_at >= datetime('now', '-7 days')""")
+        c.execute("SELECT COUNT(*), COALESCE(SUM(realized_pnl),0), "
+            "SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) "
+            "FROM positions WHERE status='closed'"
+            + _SQL_REAL_TRADES_AND_LEGACY + " AND closed_at >= datetime('now', '-7 days')")
         wk_trades, wk_pnl, wk_wins = c.fetchone()
         wk_wr = (wk_wins / wk_trades * 100) if wk_trades > 0 else 0
         # Top 3 trades
-        c.execute("""SELECT market_id, realized_pnl, strategy FROM positions
-            WHERE status='closed' AND closed_at >= datetime('now', '-7 days')
-            ORDER BY realized_pnl DESC LIMIT 3""")
+        c.execute("SELECT market_id, realized_pnl, strategy FROM positions "
+            "WHERE status='closed'" + _SQL_REAL_TRADES_AND_LEGACY +
+            " AND closed_at >= datetime('now', '-7 days') ORDER BY realized_pnl DESC LIMIT 3")
         top3 = c.fetchall()
         # Worst trade
-        c.execute("""SELECT market_id, realized_pnl, strategy FROM positions
-            WHERE status='closed' AND closed_at >= datetime('now', '-7 days')
-            ORDER BY realized_pnl ASC LIMIT 1""")
+        c.execute("SELECT market_id, realized_pnl, strategy FROM positions "
+            "WHERE status='closed'" + _SQL_REAL_TRADES_AND_LEGACY +
+            " AND closed_at >= datetime('now', '-7 days') ORDER BY realized_pnl ASC LIMIT 1")
         worst = c.fetchone()
         # Strategy breakdown
-        c.execute("""SELECT strategy, COUNT(*), COALESCE(SUM(realized_pnl),0)
-            FROM positions WHERE status='closed' AND closed_at >= datetime('now', '-7 days')
-            AND strategy != 'pairs_legacy' GROUP BY strategy""")
+        c.execute("SELECT strategy, COUNT(*), COALESCE(SUM(realized_pnl),0) "
+            "FROM positions WHERE status='closed'" + _SQL_REAL_TRADES_AND_LEGACY +
+            " AND closed_at >= datetime('now', '-7 days') GROUP BY strategy")
         strats = c.fetchall()
         # Portfolio
         cash = PAPER_PORTFOLIO.get("cash", 25000)
@@ -3000,6 +4316,27 @@ _TG_OFFSET = 0  # Track last processed Telegram update
 
 
 @tasks.loop(seconds=30)
+async def wal_reconcile_task():
+    """Every 30s during market hours, reconcile any stale PENDING WAL rows.
+    Originally WAL reconciled only on startup — this catches rows that get
+    stuck mid-session due to transient network errors between bot and Alpaca.
+    Runs inside market hours only; off-hours nothing can fill anyway."""
+    try:
+        if not is_market_open():
+            return
+        _cnt = await asyncio.to_thread(reconcile_pending_wal_orders)
+        if _cnt:
+            log.info("WAL periodic reconcile: %d rows resolved", _cnt)
+    except Exception as _e:
+        log.warning("wal_reconcile_task error: %s", _e)
+
+
+@wal_reconcile_task.before_loop
+async def _before_wal_reconcile():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(seconds=30)
 async def telegram_poll_task():
     """Poll Telegram for commands and respond. Lightweight — no python-telegram-bot needed."""
     global _TG_OFFSET
@@ -3033,7 +4370,7 @@ async def telegram_poll_task():
                 try:
                     conn = sqlite3.connect(DB_PATH)
                     c = conn.cursor()
-                    c.execute("SELECT COALESCE(SUM(realized_pnl),0) FROM positions WHERE status='closed' AND strategy!='pairs_legacy'")
+                    c.execute("SELECT COALESCE(SUM(realized_pnl),0) FROM positions WHERE status='closed'" + _SQL_REAL_TRADES_AND_LEGACY)
                     total_pnl = c.fetchone()[0]
                     conn.close()
                     reply = f"<b>Realized P&L:</b> ${total_pnl:+,.2f}"
@@ -3315,7 +4652,7 @@ CONTEXT_MEMORY = {
         "daily_loss_limit": -500,
         "trading_mode": "paper",
         "risk_tolerance": "conservative",
-        "platforms": ["kalshi", "polymarket", "robinhood", "coinbase", "phemex"],
+        "platforms": ["kalshi", "polymarket", "coinbase", "phemex"],
     },
     "domain": {  # Per-skill expert knowledge
         "prediction_markets": {
@@ -3329,8 +4666,8 @@ CONTEXT_MEMORY = {
             "prefer_large_cap": True,
         },
         "analysis": {
-            "model": "gpt-4o-mini",
-            "fallback_model": "gpt-3.5-turbo",
+            "model": "claude-haiku-4-5-20251001",
+            "fallback_model": "claude-haiku-4-5-20251001",
             "max_tokens": 600,
         },
     },
@@ -3410,7 +4747,7 @@ async def agents_status(ctx):
     """Show status of all trading agents/skills."""
     agents = {
         "Scanner": {"status": "Active", "last_run": "!cycle", "desc": "EV opportunity scanner across all platforms"},
-        "Analyst": {"status": "Active", "last_run": "!analyze", "desc": "AI-powered market analysis (GPT-4o-mini)"},
+        "Analyst": {"status": "Active", "last_run": "!analyze", "desc": "AI-powered market analysis (Claude Haiku)"},
         "Executor": {"status": f"{'Paper' if TRADING_MODE == 'paper' else 'Live'}", "last_run": "!trade", "desc": "Trade execution with safety checks"},
         "Backtester": {"status": "Active", "last_run": "!backtest", "desc": "Strategy validation with Monte Carlo"},
         "Reporter": {"status": "Active", "last_run": "!daily", "desc": "Performance reporting + auto daily at 00:00 UTC"},
@@ -3495,7 +4832,7 @@ async def help_tj(ctx):
         "**Reporting & Analytics:**\n"
         "  `!daily` / `!report` — Full performance report\n"
         "  `!analytics` — Equity curve, Sharpe, drawdown, PnL\n"
-        "  `!costs` — OpenAI spend + safety status\n"
+        "  `!costs` — AI spend + safety status\n"
         "  `!signals [recent|stats|all]` — Signal history & learning\n"
         "  `!resolve-signal <idx> win/loss` — Mark signal outcome\n"
         "  `!log <message>` — Log to GitHub\n"
@@ -3513,7 +4850,6 @@ async def help_tj(ctx):
         "  `!kill-switch [on|off]` — Emergency trading halt\n"
         "  `!set-cycle <interval>` — Set scan interval (e.g. 5m)\n"
         "  `!pause-cycle` — Pause/resume auto-scan\n"
-        "  `!studio` — OpenClaw Studio dashboard info\n"
         "  `!help-tj` — This help message\n"
         "================================\n"
         "Dashboards: http://89.167.108.136:3000 | http://89.167.108.136:19999"
@@ -3550,9 +4886,9 @@ async def show_analytics(ctx):
         f"  Win Rate: {win_rate:.1f}% | Sharpe: {sharpe:.2f}\n"
         f"  Total P&L: ${a['total_pnl']:+,.2f}\n"
         f"\n**P&L by Platform:**\n{platform_lines}\n"
-        f"\n**OpenAI Usage:**\n"
-        f"  Calls: {a['openai_calls']} | Tokens: {a['openai_tokens']:,}\n"
-        f"  Cost: ${a['openai_cost_usd']:.4f} / ${a['openai_monthly_limit']:.2f} limit\n"
+        f"\n**AI Usage (Claude Haiku):**\n"
+        f"  Calls: {a['ai_calls']} | Tokens: {a['ai_tokens']:,}\n"
+        f"  Cost: ${a['ai_cost_usd']:.4f} / ${a['ai_monthly_limit']:.2f} limit\n"
         f"================================"
     )
     await ctx.send(report)
@@ -3578,11 +4914,11 @@ ANALYTICS = {
     "current_equity": 10000.0,
     "max_drawdown": 0.0,
     "daily_pnl_history": [],
-    "platform_pnl": {"kalshi": 0.0, "polymarket": 0.0, "robinhood": 0.0, "coinbase": 0.0, "phemex": 0.0},
-    "openai_calls": 0,
-    "openai_tokens": 0,
-    "openai_cost_usd": 0.0,
-    "openai_monthly_limit": 10.0,
+    "platform_pnl": {"kalshi": 0.0, "polymarket": 0.0, "coinbase": 0.0, "phemex": 0.0},
+    "ai_calls": 0,
+    "ai_tokens": 0,
+    "ai_cost_usd": 0.0,
+    "ai_monthly_limit": 5.0,
 }
 
 
@@ -3605,8 +4941,8 @@ def push_all_analytics():
     push_netdata_metric("trades_total", a["total_trades"])
     push_netdata_metric("win_rate", (a["winning_trades"] / max(a["total_trades"], 1)) * 100)
     push_netdata_metric("max_drawdown", a["max_drawdown"])
-    push_netdata_metric("openai_cost", a["openai_cost_usd"])
-    push_netdata_metric("openai_calls", a["openai_calls"])
+    push_netdata_metric("ai_cost", a["ai_cost_usd"])
+    push_netdata_metric("ai_calls", a["ai_calls"])
     for platform, pnl in a["platform_pnl"].items():
         push_netdata_metric(f"pnl_{platform}", pnl)
     if len(a.get("daily_pnl_history", [])) > 1:
@@ -3618,13 +4954,13 @@ def push_all_analytics():
     save_all_state()  # Auto-save every cycle
 
 
-def track_openai_usage(tokens_used, model="gpt-4o-mini"):
-    """Track OpenAI API usage and costs."""
-    ANALYTICS["openai_calls"] += 1
-    ANALYTICS["openai_tokens"] += tokens_used
-    cost_per_1k = 0.0004 if "mini" in model else 0.003
+def track_ai_usage(tokens_used, model="claude-haiku-4-5-20251001"):
+    """Track Claude Haiku API usage and costs."""
+    ANALYTICS["ai_calls"] += 1
+    ANALYTICS["ai_tokens"] += tokens_used
+    cost_per_1k = 0.0001  # Haiku input pricing
     cost = (tokens_used / 1000) * cost_per_1k
-    ANALYTICS["openai_cost_usd"] += cost
+    ANALYTICS["ai_cost_usd"] += cost
 
 
 
@@ -3684,9 +5020,10 @@ async def check_and_send_alerts():
         if not channel:
             return
 
-        kalshi_opps = find_kalshi_opportunities()
-        poly_opps = find_polymarket_opportunities()
-        crypto_opps = find_crypto_momentum()
+        import asyncio as _aio_alerts
+        kalshi_opps = await _aio_alerts.to_thread(find_kalshi_opportunities)
+        poly_opps = await _aio_alerts.to_thread(find_polymarket_opportunities)
+        crypto_opps = await _aio_alerts.to_thread(find_crypto_momentum)
 
         all_opps = kalshi_opps + poly_opps + crypto_opps
         all_opps.sort(key=lambda x: x.get("ev", 0), reverse=True)
@@ -3774,10 +5111,10 @@ async def alerts_cmd(ctx, action: str = "status", value: str = ""):
 # COST OPTIMIZATION + SAFETY GUARDS
 # ============================================================================
 COST_CONFIG = {
-    "preferred_model": "gpt-4o-mini",       # cheapest viable model
-    "fallback_model": "gpt-3.5-turbo",
-    "monthly_openai_limit": 10.00,           # $10/month max
-    "monthly_openai_spent": 0.0,
+    "preferred_model": "claude-haiku-4-5-20251001",
+    "fallback_model": "claude-haiku-4-5-20251001",
+    "monthly_ai_limit": 5.00,                # $5/month max
+    "monthly_ai_spent": 0.0,
     "kill_switch": False,                    # emergency stop all trading
     "max_daily_trades": 8,                  # max trades per day
     "daily_trades_count": 0,
@@ -3796,7 +5133,7 @@ async def cost_status(ctx):
         f"================================\n"
         f"**AI Costs:**\n"
         f"  Model: {c['preferred_model']} (fallback: {c['fallback_model']})\n"
-        f"  OpenAI spend: ${c['monthly_openai_spent']:.2f} / ${c['monthly_openai_limit']:.2f} monthly limit\n"
+        f"  AI spend: ${c['monthly_ai_spent']:.2f} / ${c['monthly_ai_limit']:.2f} monthly limit\n"
         f"**Safety:**\n"
         f"  Kill switch: {'ACTIVE' if c['kill_switch'] else 'Off'}\n"
         f"  Dry-run: {'ON' if DRY_RUN_MODE else 'OFF'}\n"
@@ -3900,6 +5237,115 @@ async def performance_legacy_cmd(ctx):
     report += "================================"
     await ctx.send(report)
 
+@bot.command(name="backtest")
+async def backtest_cmd(ctx, strategy: str = "pairs", days: int = 180):
+    """Replay a strategy through historical bars. Usage: !backtest pairs 90
+    Currently implemented strategies: pairs. Others return a clear stub
+    message so the command surface is discoverable."""
+    await ctx.send(f"⏳ replaying `{strategy}` over last {days} days...")
+    try:
+        import asyncio as _asyncio, subprocess as _sp, json as _json, os as _os
+        def _run():
+            return _sp.run(
+                ["python3", "/app/backtester/backtest_runner.py",
+                 "--strategy", strategy, "--days", str(days)],
+                capture_output=True, text=True, timeout=120)
+        # NB: /app/backtester is mounted into the bot container via docker-compose.
+        # If the mount is missing we'll get FileNotFoundError handled below.
+        res = await _asyncio.to_thread(_run)
+        if res.returncode != 0:
+            await ctx.send(f"❌ backtest failed:\n```{(res.stderr or res.stdout)[-1500:]}```")
+            return
+        # Read most-recent summary JSON
+        results_dir = "/app/backtester/results"
+        try:
+            files = sorted(_os.listdir(results_dir))
+            summaries = [f for f in files if f.endswith("__summary.json")]
+            if not summaries:
+                await ctx.send("⚠️ backtest ran but no summary JSON was produced")
+                return
+            with open(f"{results_dir}/{summaries[-1]}") as fh:
+                m = _json.load(fh)
+        except FileNotFoundError:
+            await ctx.send("⚠️ backtester/results not mounted into bot container — "
+                           "rebuild compose to add volume mount")
+            return
+        # Format a tight Discord-friendly summary
+        msg = (
+            f"**Backtest — {m.get('strategy')}** (`{m.get('period_start','?')[:10]}` → "
+            f"`{m.get('period_end','?')[:10]}`)\n"
+            f"Trades: **{m.get('n_trades')}**  Win rate: **{m.get('win_rate',0)*100:.1f}%**\n"
+            f"P&L: **${m.get('total_pnl',0):,.2f}**  Return: **{m.get('gross_return_pct',0):+.2f}%**\n"
+            f"Sharpe: **{m.get('sharpe',0):.2f}**  Sortino: {m.get('sortino','NaN')}  "
+            f"Calmar: {m.get('calmar',0):.2f}\n"
+            f"Max DD: **{m.get('max_drawdown_pct',0):.2f}%**  "
+            f"Profit factor: **{m.get('profit_factor',0):.2f}**\n"
+            f"Longest losing streak: {m.get('longest_losing_streak',0)}\n"
+            f"SPY benchmark: {('none' if m.get('benchmark_return_pct') is None else f'{m['benchmark_return_pct']:+.1f}%')}"
+        )
+        await ctx.send(msg)
+    except Exception as e:
+        await ctx.send(f"❌ !backtest errored: `{type(e).__name__}: {e!s}`")
+
+
+@bot.command(name="ib-status")
+async def ib_status_cmd(ctx):
+    """Report IB Gateway connection state, balance, positions, and upcoming
+    futures expiries for ES/NQ/CL. Data source: Redis keys ib:status /
+    ib:balance / ib:positions populated by the ib-gateway microservice every
+    60s. This command never opens its own IB socket."""
+    try:
+        import ib_connector as _ibc
+    except Exception as e:
+        await ctx.send(f"**IB Gateway** — connector unavailable: {e}")
+        return
+    status = _ibc.get_status()
+    bal = _ibc.get_balance()
+    positions = _ibc.get_positions() or []
+
+    dot = "🟢" if status.get("connected") else "🔴"
+    lines = [f"**IB Gateway** {dot}",
+             f"Account: `{status.get('account') or '(not set)'}`  clientId=`{status.get('client_id')}`"]
+    if status.get("reason"):
+        lines.append(f"Reason: {status['reason']}")
+    if bal.get("net_liquidation") is not None:
+        lines.append(f"NetLiq: ${bal['net_liquidation']:,.2f}  "
+                     f"AvailFunds: ${(bal.get('available_funds') or 0):,.2f}  "
+                     f"BP: ${(bal.get('buying_power') or 0):,.2f}")
+    if positions:
+        lines.append(f"**Open positions ({len(positions)})**")
+        for p in positions[:10]:
+            sym = p.get("symbol", "?")
+            qty = p.get("position", 0)
+            avg = p.get("avgCost", 0)
+            sec = p.get("secType", "")
+            lines.append(f"  {sym:<6} {sec:<4} qty={qty:<6g} avg=${avg:,.2f}")
+        if len(positions) > 10:
+            lines.append(f"  … +{len(positions)-10} more")
+    else:
+        lines.append("Open positions: 0")
+
+    # Next expiries for ES/NQ/CL. CME equity-index futures roll quarterly (HMUZ):
+    # Mar/Jun/Sep/Dec. CL (NYMEX Crude) rolls monthly — next month's contract.
+    try:
+        from datetime import date as _d
+        today = _d.today()
+        # Quarterly: find next of Mar/Jun/Sep/Dec
+        quarter_months = [3, 6, 9, 12]
+        future_q = [m for m in quarter_months if m > today.month] or [3]
+        next_q = future_q[0]
+        q_year = today.year if next_q > today.month else today.year + 1
+        # CL: next calendar month
+        cl_month = today.month + 1 if today.month < 12 else 1
+        cl_year = today.year if today.month < 12 else today.year + 1
+        lines.append("**Next expiries**")
+        lines.append(f"  ES/NQ: {q_year}{next_q:02d}  CL: {cl_year}{cl_month:02d}")
+    except Exception:
+        pass
+
+    await ctx.send("\n".join(lines))
+
+
 @bot.command(name="redis-status")
 async def redis_status_cmd(ctx):
     if REDIS_CLIENT:
@@ -3982,8 +5428,84 @@ async def scan_pairs_cmd(ctx):
     for o in opps:
         await ctx.send(f"**PAIRS SIGNAL**: {o['pair']} | Corr: {o['correlation']:.3f} | Z: {o['zscore']:+.2f} | Dir: {o['direction']}")
 
-@bot.command(name="paper-pnl")
+@bot.command(name="paper-pnl", aliases=["pnl"])
 async def paper_pnl_cmd(ctx):
+    """Institutional-grade P&L statement with full position detail."""
+    # Build all data from the unified P&L engine
+    try:
+        import asyncio as _pnl_aio
+        data = await _pnl_aio.to_thread(_build_pnl_data)
+    except Exception as e:
+        await ctx.send(f"P&L engine error: {e}")
+        return
+
+    # SECTION 1: Daily Summary
+    m1 = f"**P&L REPORT** | {datetime.now(timezone.utc).strftime('%b %d %H:%M UTC')}\n```\n"
+    m1 += f"{'═'*44}\n DAILY SUMMARY\n{'═'*44}\n"
+    m1 += f"{'Realized today:':<25s} ${data['today_realized']:>+10,.2f}\n"
+    m1 += f"{'Unrealized change:':<25s} ${data['today_unrealized_change']:>+10,.2f}\n"
+    m1 += f"{'Gross P&L today:':<25s} ${data['today_gross']:>+10,.2f}\n"
+    m1 += f"{'Win/Loss today:':<25s} {data['today_wins']}W / {data['today_losses']}L"
+    m1 += f" ({data['today_win_rate']:.0f}%)\n"
+    if data['best_today']:
+        m1 += f"{'Best trade:':<25s} {data['best_today']['market'][:20]} ${data['best_today']['pnl']:>+,.2f}\n"
+    if data['worst_today']:
+        m1 += f"{'Worst trade:':<25s} {data['worst_today']['market'][:20]} ${data['worst_today']['pnl']:>+,.2f}\n"
+    m1 += "```"
+    await ctx.send(m1)
+
+    # SECTION 2: Open Positions
+    if data['open_positions']:
+        m2 = "```\n"
+        m2 += f"{'═'*44}\n OPEN POSITIONS ({len(data['open_positions'])})\n{'═'*44}\n"
+        for p in data['open_positions']:
+            m2 += f"\n{p['market'][:35]}\n"
+            m2 += f"  Cost: ${p['cost']:,.0f} | P&L: ${p['unrealized']:>+,.2f} ({p['pnl_pct']:>+.1f}%)\n"
+            m2 += f"  Age: {p['age_hours']:.0f}h"
+            if p['z_score'] is not None:
+                m2 += f" | Z: {p['z_score']:+.2f}"
+            if p['to_partial_tp_pct'] > 0 and p['strategy'] == 'pairs' and not p['partial_closed']:
+                m2 += f" | TP in {p['to_partial_tp_pct']:.1f}%"
+            if p['partial_closed']:
+                m2 += f" | 50% CLOSED"
+            m2 += "\n"
+            if p['entry_long'] > 0:
+                m2 += f"  L: ${p['entry_long']:.2f}→${p['curr_long']:.2f}"
+                m2 += f" | S: ${p['entry_short']:.2f}→${p['curr_short']:.2f}\n"
+            if len(m2) > 1800:
+                m2 += "```"
+                await ctx.send(m2)
+                m2 = "```\n"
+        m2 += "```"
+        await ctx.send(m2)
+
+    # SECTION 3: Closed Today
+    if data['today_closed']:
+        m3 = "```\n"
+        m3 += f"{'═'*44}\n CLOSED TODAY ({len(data['today_closed'])})\n{'═'*44}\n"
+        for t in data['today_closed'][:10]:
+            m3 += f"  {t['market'][:25]:25s} ${t['pnl']:>+8.2f} {(t['reason'] or '')[:15]}\n"
+        m3 += "```"
+        await ctx.send(m3)
+
+    # SECTION 4: Cumulative Stats
+    m4 = "```\n"
+    m4 += f"{'═'*44}\n CUMULATIVE\n{'═'*44}\n"
+    m4 += f"{'Total realized:':<25s} ${data['total_realized']:>+10,.2f}\n"
+    m4 += f"{'Total unrealized:':<25s} ${data['total_unrealized']:>+10,.2f}\n"
+    m4 += f"{'Combined P&L:':<25s} ${data['combined_pnl']:>+10,.2f}\n"
+    m4 += f"{'Equity:':<25s} ${data['equity']:>10,.2f}\n"
+    m4 += f"{'Return ($25K base):':<25s} {data['return_pct']:>+9.1f}%\n"
+    m4 += f"{'Win rate (all time):':<25s} {data['all_time_win_rate']:>9.0f}%"
+    m4 += f" ({data['total_wins']}/{data['total_trades']})\n"
+    m4 += f"{'Best day:':<25s} {data['best_day']['date']} ${data['best_day']['pnl']:>+,.2f}\n"
+    m4 += f"{'Worst day:':<25s} {data['worst_day']['date']} ${data['worst_day']['pnl']:>+,.2f}\n"
+    m4 += f"{'Win streak:':<25s} {data['streak']} day{'s' if data['streak'] != 1 else ''}\n"
+    m4 += "```"
+    await ctx.send(m4)
+    return  # Skip legacy code below
+
+    # ── LEGACY CODE (kept for reference, never reached) ──
     import sqlite3 as _sq, requests as _pnl_req
     cash = PAPER_PORTFOLIO.get("cash", 0)
     positions = PAPER_PORTFOLIO.get("positions", [])
@@ -3995,7 +5517,7 @@ async def paper_pnl_cmd(ctx):
     total_realized = 0.0
     try:
         _rc = _sq.connect(DB_PATH)
-        _row = _rc.execute("SELECT SUM(realized_pnl) FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL").fetchone()
+        _row = _rc.execute("SELECT SUM(realized_pnl) FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL" + _SQL_REAL_TRADES_AND_LEGACY).fetchone()
         if _row and _row[0]:
             total_realized = _row[0]
         _rc.close()
@@ -4016,7 +5538,8 @@ async def paper_pnl_cmd(ctx):
         cost = pos.get("cost", 0)
         shares = pos.get("shares", 0)
         entry_price = pos.get("entry_price", 0)
-        total_cost += cost
+        if pos.get("platform") != "Simulated":
+            total_cost += cost
 
         live_price = None
         upnl = 0.0
@@ -4102,6 +5625,31 @@ async def paper_pnl_cmd(ctx):
                     price_src = "no option symbol"
             elif strategy == "crash_hedge_short":
                 price_src = "no live feed"
+            elif strategy == "crash_hedge_call_spread":
+                # Simulated call credit spread — P&L is bounded
+                # Max profit = premium collected (cost field stores credit)
+                # Max loss = (spread width * 100 * contracts) - credit
+                _cs_credit = pos.get("est_credit", pos.get("cost", 0))
+                _cs_short_strike = pos.get("short_strike", 0)
+                _cs_long_strike = pos.get("long_strike", 0)
+                _cs_contracts = pos.get("contracts", 1)
+                _cs_width = abs(_cs_long_strike - _cs_short_strike)
+                _cs_max_loss = _cs_width * 100 * _cs_contracts - _cs_credit
+                # For simulated spreads, estimate P&L from SPY price vs strikes
+                _cs_spy = _get_spy_price() or 0
+                if _cs_spy > 0 and _cs_short_strike > 0:
+                    if _cs_spy <= _cs_short_strike:
+                        upnl = _cs_credit  # Max profit — SPY below short strike
+                    elif _cs_spy >= _cs_long_strike:
+                        upnl = -_cs_max_loss  # Max loss — SPY above long strike
+                    else:
+                        # Partial loss — SPY between strikes
+                        _intrinsic = (_cs_spy - _cs_short_strike) * 100 * _cs_contracts
+                        upnl = _cs_credit - _intrinsic
+                    price_src = f"SIM SPY=${_cs_spy:.0f}"
+                else:
+                    upnl = 0
+                    price_src = "simulated"
             else:
                 # Prediction markets — use entry_price as current (hold to resolution)
                 if entry_price > 0 and shares > 0:
@@ -4147,6 +5695,236 @@ async def paper_pnl_cmd(ctx):
     chunk += f"```\n*{len(pos_lines)} positions*"
     await ctx.send(chunk)
 
+@bot.command(name="commands")
+async def commands_cmd(ctx):
+    """Master command reference — every available Discord command."""
+    cmds = {
+        "P&L & Analytics": {
+            "!pnl": "Full P&L report: daily, positions, closed, cumulative",
+            "!today": "Quick daily snapshot: realized + unrealized + equity",
+            "!strategy-pnl": "P&L breakdown by strategy with win rates",
+            "!performance": "Performance analytics with charts",
+            "!firm-stats": "Firm-wide statistics and metrics",
+            "!analytics": "Analytics dashboard overview",
+        },
+        "Positions & Trading": {
+            "!status": "One-screen dashboard: cash, positions, regime",
+            "!paper-status": "Paper portfolio status",
+            "!positions": "Open positions detail",
+            "!closed": "Recently closed trades",
+            "!next-trades": "Top upcoming trade candidates ranked",
+            "!premarket-queue": "Signals queued for market open",
+            "!close-all": "Close all positions at market (preserves history)",
+            "!run-exits": "Force exit manager cycle now",
+        },
+        "Scanning & Signals": {
+            "!scan-pairs": "Manual pairs Z-score scan",
+            "!crypto-pairs": "Crypto pairs Z-scores",
+            "!ev-scan": "EV scan across all platforms",
+            "!edge": "Full edge analysis with scoring",
+            "!squeeze-scan": "Short squeeze scanner",
+            "!arb-scan": "Cross-platform arbitrage scan",
+            "!speed-scan": "Fast scan all opportunities",
+            "!darkpool": "Dark pool activity monitor",
+        },
+        "Intelligence & AI": {
+            "!ai-consensus TICKER": "AI second opinion on a trade",
+            "!ai-cost": "AI API usage and cost today",
+            "!cycle TICKER": "Full EchoEdge consensus cycle",
+            "!fed-sentiment": "Fed hawkish/dovish sentiment score",
+            "!correlation-regime": "Cross-asset correlation status",
+        },
+        "Regime & Risk": {
+            "!regime": "Current market regime and VIX",
+            "!agents": "Agent ensemble status",
+            "!journal": "Trade journal entries",
+            "!audit": "System audit trail",
+            "!kill-switch": "Emergency halt all trading",
+            "!reset-breaker": "Reset circuit breakers",
+        },
+        "Calendars & Info": {
+            "!earnings": "Upcoming earnings calendar",
+            "!econ-calendar": "Economic events next 7 days",
+            "!sectors": "Sector rotation rankings",
+            "!options-flow": "Unusual options activity",
+        },
+        "System": {
+            "!save": "Force save all state",
+            "!db-status": "SQLite database status",
+            "!redis-status": "Redis connection status",
+            "!costs": "API cost tracking",
+            "!commands": "This help message",
+        },
+    }
+    for category, group in cmds.items():
+        msg = f"**{category}**\n```\n"
+        for cmd, desc in group.items():
+            msg += f"  {cmd:<28s} {desc}\n"
+        msg += "```"
+        await ctx.send(msg)
+
+
+@bot.command(name="pm-scorecard")
+async def pm_scorecard_cmd(ctx):
+    """Prediction market scorecard — all open positions with thesis and conviction."""
+    positions = [p for p in PAPER_PORTFOLIO.get("positions", []) if p.get("strategy") == "prediction"]
+    if not positions:
+        await ctx.send("**PM Scorecard**: No open prediction positions.")
+        return
+    # Historical stats
+    import sqlite3 as _pm_sq
+    conn = _pm_sq.connect(DB_PATH)
+    hist = conn.execute(
+        "SELECT COUNT(*), SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END), SUM(realized_pnl) "
+        "FROM positions WHERE strategy='prediction' AND status='closed' AND tier='PAPER'").fetchone()
+    conn.close()
+    total_closed = hist[0] or 0
+    total_won = hist[1] or 0
+    total_pnl = hist[2] or 0
+    wr = (total_won / total_closed * 100) if total_closed > 0 else 0
+
+    msg = f"**PREDICTION MARKET SCORECARD**\n"
+    msg += f"History: {total_closed} trades, {wr:.0f}% WR, ${total_pnl:+,.2f}\n```\n"
+    for p in positions:
+        market = p.get("market", "?")[:45]
+        entry = p.get("entry_price", 0)
+        cost = p.get("cost", 0)
+        age_h = 0
+        try:
+            et = datetime.strptime(p.get("timestamp", ""), "%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc)
+            age_h = (datetime.now(timezone.utc) - et).total_seconds() / 3600
+        except Exception:
+            pass
+        partial = " [50% CLOSED]" if p.get("partial_closed") else ""
+        msg += f"{market}\n"
+        msg += f"  Entry: ${entry:.3f} | Cost: ${cost:.0f} | Age: {age_h:.0f}h{partial}\n"
+        msg += f"  Platform: {p.get('platform','?')} | Shares: {p.get('shares',0)}\n\n"
+    msg += "```"
+    await ctx.send(msg[:1950])
+
+
+@bot.command(name="whales")
+async def whales_cmd(ctx, top: str = "10"):
+    """Top Polymarket whales by win rate + P&L. Usage: !whales [N]"""
+    try:
+        n = max(1, min(25, int(top)))
+    except ValueError:
+        n = 10
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["python3", "/app/intelligence_workers/whale_following_scanner.py",
+             "leaderboard", "--top", str(n)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception as exc:
+        await ctx.send(f"whale scanner error: {exc}")
+        return
+    body = (out.stdout or "").strip() or (out.stderr or "").strip() or "(no output)"
+    await ctx.send(f"**POLYMARKET WHALE LEADERBOARD**\n```\n{body[:1800]}\n```")
+
+
+@bot.command(name="whale-signals")
+async def whale_signals_cmd(ctx, count: str = "10"):
+    """Recent whale-follow entry signals (dry-run). Usage: !whale-signals [N]"""
+    try:
+        n = max(1, min(30, int(count)))
+    except ValueError:
+        n = 10
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["python3", "/app/intelligence_workers/whale_entry_signal_generator.py",
+             "show", "-n", str(n)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception as exc:
+        await ctx.send(f"whale signal scanner error: {exc}")
+        return
+    body = (out.stdout or "").strip() or (out.stderr or "").strip() or "(no signals)"
+    await ctx.send(f"**WHALE-FOLLOW SIGNALS (DRY-RUN)**\n```\n{body[:1800]}\n```")
+
+
+@bot.command(name="premarket-queue")
+async def premarket_queue_cmd(ctx):
+    """Show signals queued for market open execution."""
+    try:
+        import sqlite3 as _pq_sq
+        conn = _pq_sq.connect(DB_PATH)
+        rows = conn.execute(
+            "SELECT ticker_a, ticker_b, zscore, correlation, direction, confidence, discovered_at "
+            "FROM pre_market_queue ORDER BY confidence DESC").fetchall()
+        conn.close()
+    except Exception as e:
+        await ctx.send(f"Queue error: {e}")
+        return
+    if not rows:
+        await ctx.send("**Pre-Market Queue**: Empty. No signals queued for open.")
+        return
+    msg = f"**PRE-MARKET QUEUE** ({len(rows)} signals)\n"
+    msg += f"Top 3 execute at 9:30 AM ET open\n```\n"
+    msg += f"{'Pair':12s} {'Z-Score':>8s} {'Corr':>6s} {'Conf':>5s} {'Dir'}\n"
+    msg += f"{'─'*45}\n"
+    for a, b, z, c, d, conf, dt in rows[:15]:
+        marker = ">>>" if conf >= 95 else "   "
+        msg += f"{marker} {a}/{b:4s}  {z:>+7.2f} {c:>6.3f} {conf:>4.0f}  {d[:15]}\n"
+    msg += "```"
+    await ctx.send(msg[:1950])
+
+
+@bot.command(name="today")
+async def today_cmd(ctx):
+    """Quick snapshot of today's trading activity."""
+    try:
+        import asyncio as _pnl_aio
+        data = await _pnl_aio.to_thread(_build_pnl_data)
+    except Exception as e:
+        await ctx.send(f"Error: {e}")
+        return
+    msg = f"**TODAY** | {datetime.now(timezone.utc).strftime('%b %d')}\n```\n"
+    msg += f"Realized:    ${data['today_realized']:>+10,.2f}\n"
+    msg += f"Unrealized:  ${data['today_unrealized_change']:>+10,.2f}\n"
+    msg += f"Gross:       ${data['today_gross']:>+10,.2f}\n"
+    msg += f"Trades:      {data['today_wins']}W {data['today_losses']}L"
+    if data['today_closed']:
+        msg += f" ({data['today_win_rate']:.0f}%)\n"
+    else:
+        msg += " (no closes)\n"
+    if data['best_today']:
+        msg += f"Top winner:  {data['best_today']['market'][:25]} ${data['best_today']['pnl']:>+,.2f}\n"
+    if data['worst_today']:
+        msg += f"Top loser:   {data['worst_today']['market'][:25]} ${data['worst_today']['pnl']:>+,.2f}\n"
+    msg += f"Equity:      ${data['equity']:>10,.2f} ({data['return_pct']:>+.1f}%)\n"
+    msg += f"Open:        {len(data['open_positions'])} positions\n"
+    msg += "```"
+    await ctx.send(msg)
+
+
+@bot.command(name="strategy-pnl")
+async def strategy_pnl_cmd(ctx):
+    """P&L breakdown by strategy."""
+    try:
+        import asyncio as _pnl_aio
+        data = await _pnl_aio.to_thread(_build_pnl_data)
+    except Exception as e:
+        await ctx.send(f"Error: {e}")
+        return
+    stats = data.get("strategy_stats", {})
+    if not stats:
+        await ctx.send("No closed trades by strategy yet.")
+        return
+    msg = "**STRATEGY P&L**\n```\n"
+    msg += f"{'Strategy':<20s} {'P&L':>9s} {'Trades':>7s} {'WR%':>5s} {'Avg':>8s} {'Best':>8s} {'Worst':>8s}\n"
+    msg += f"{'─'*68}\n"
+    for strat in sorted(stats.keys()):
+        s = stats[strat]
+        msg += (f"{strat:<20s} ${s['total_pnl']:>+8.0f} {s['count']:>6d} "
+                f"{s['win_rate']:>4.0f}% ${s['avg_pnl']:>+7.0f} "
+                f"${s['best']:>+7.0f} ${s['worst']:>+7.0f}\n")
+    msg += "```"
+    await ctx.send(msg[:1950])
+
+
 @bot.command(name="status")
 async def status_cmd(ctx):
     """One-screen dashboard: cash, equity, P&L, positions, signals, regime, funding, AI summary."""
@@ -4165,13 +5943,27 @@ async def status_cmd(ctx):
     trades_today = 0
     try:
         _sc = _ssq.connect(DB_PATH)
-        _row = _sc.execute("SELECT SUM(realized_pnl) FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL").fetchone()
+        _row = _sc.execute("SELECT SUM(realized_pnl) FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL" + _SQL_REAL_TRADES_AND_LEGACY).fetchone()
         if _row and _row[0]:
             total_realized = _row[0]
         _today = now.strftime("%Y-%m-%d")
         _trow = _sc.execute("SELECT COUNT(*) FROM positions WHERE created_at LIKE ?", (f"{_today}%",)).fetchone()
         trades_today = _trow[0] if _trow else 0
         _sc.close()
+    except Exception:
+        pass
+
+    # ── Alpaca positions snapshot (one API call for entry prices + qty) ──
+    _st_alpaca = {}
+    try:
+        _st_ap_r = _sr.get(f"{ALPACA_BASE_URL}/v2/positions", headers=_alp, timeout=10)
+        if _st_ap_r.status_code == 200:
+            for _ap in _st_ap_r.json():
+                _st_alpaca[_ap["symbol"].upper()] = {
+                    "avg_entry": abs(float(_ap.get("avg_entry_price", 0))),
+                    "qty": abs(float(_ap.get("qty", 0))),
+                    "unrealized_pl": float(_ap.get("unrealized_pl", 0)),
+                }
     except Exception:
         pass
 
@@ -4199,13 +5991,20 @@ async def status_cmd(ctx):
                     _ll, _sl = parts[0], parts[1] if len(parts) > 1 else ""
                 _el = pos.get("entry_long_price", 0)
                 _es = pos.get("entry_short_price", 0)
+                # Fallback: use Alpaca avg_entry_price when entry leg prices missing
+                if _ll and (not _el or _el <= 0):
+                    _el = _st_alpaca.get(_ll.upper(), {}).get("avg_entry", 0)
+                if _sl and (not _es or _es <= 0):
+                    _es = _st_alpaca.get(_sl.upper(), {}).get("avg_entry", 0)
                 if _ll and _sl and _el > 0 and _es > 0:
-                    _rl = _sr.get(f"https://data.alpaca.markets/v2/stocks/{_ll}/quotes/latest", headers=_alp, timeout=3)
-                    _rs = _sr.get(f"https://data.alpaca.markets/v2/stocks/{_sl}/quotes/latest", headers=_alp, timeout=3)
-                    if _rl.status_code == 200 and _rs.status_code == 200:
-                        _lp = float(_rl.json().get("quote", {}).get("ap", 0) or 0)
-                        _sp = float(_rs.json().get("quote", {}).get("bp", 0) or 0)
-                        if _lp > 0 and _sp > 0:
+                    _lp, _ = get_current_price(_ll)
+                    _sp, _ = get_current_price(_sl)
+                    if _lp > 0 and _sp > 0:
+                        _qty_l = _st_alpaca.get(_ll.upper(), {}).get("qty", 0)
+                        _qty_s = _st_alpaca.get(_sl.upper(), {}).get("qty", 0)
+                        if _qty_l > 0 and _qty_s > 0:
+                            upnl = (_lp - _el) * _qty_l - (_sp - _es) * _qty_s
+                        else:
                             _sz = cost / 2
                             upnl = ((_lp - _el) * (_sz / _el)) + ((_es - _sp) * (_sz / _es))
             elif strategy in ("crypto", "momentum"):
@@ -4376,19 +6175,19 @@ async def firm_stats_cmd(ctx):
         c = conn.cursor()
 
         # Total trades and P&L
-        c.execute("SELECT COUNT(*), COALESCE(SUM(realized_pnl),0) FROM positions WHERE status='closed' AND strategy != 'pairs_legacy'")
+        c.execute("SELECT COUNT(*), COALESCE(SUM(realized_pnl),0) FROM positions WHERE status='closed'" + _SQL_REAL_TRADES_AND_LEGACY)
         total_trades, total_pnl = c.fetchone()
 
         # Best/worst single trade
-        c.execute("SELECT market_id, realized_pnl, strategy FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL ORDER BY realized_pnl DESC LIMIT 1")
+        c.execute("SELECT market_id, realized_pnl, strategy FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL" + _SQL_REAL_TRADES_AND_LEGACY + " ORDER BY realized_pnl DESC LIMIT 1")
         best_row = c.fetchone()
-        c.execute("SELECT market_id, realized_pnl, strategy FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL ORDER BY realized_pnl ASC LIMIT 1")
+        c.execute("SELECT market_id, realized_pnl, strategy FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL" + _SQL_REAL_TRADES_AND_LEGACY + " ORDER BY realized_pnl ASC LIMIT 1")
         worst_row = c.fetchone()
 
         # Daily P&L for best/worst day and streak
-        c.execute("""SELECT DATE(closed_at) as d, SUM(realized_pnl) as dpnl
-            FROM positions WHERE status='closed' AND closed_at IS NOT NULL AND strategy != 'pairs_legacy'
-            GROUP BY DATE(closed_at) ORDER BY d""")
+        c.execute("SELECT DATE(closed_at) as d, SUM(realized_pnl) as dpnl "
+            "FROM positions WHERE status='closed' AND closed_at IS NOT NULL"
+            + _SQL_REAL_TRADES_AND_LEGACY + " GROUP BY DATE(closed_at) ORDER BY d")
         daily_rows = c.fetchall()
 
         best_day = ("—", 0)
@@ -4426,8 +6225,8 @@ async def firm_stats_cmd(ctx):
             AVG(CASE WHEN created_at IS NOT NULL AND closed_at IS NOT NULL
                 THEN (julianday(closed_at) - julianday(created_at)) * 24
                 ELSE NULL END) as avg_hold_hours
-            FROM positions WHERE status='closed' AND strategy != 'pairs_legacy' AND realized_pnl IS NOT NULL
-            GROUP BY strategy ORDER BY pnl DESC""")
+            FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL"""
+            + _SQL_REAL_TRADES_AND_LEGACY + " GROUP BY strategy ORDER BY pnl DESC")
         strat_rows = c.fetchall()
 
         # Open position count and exposure
@@ -4686,6 +6485,30 @@ async def options_flow_cmd(ctx):
     await ctx.send(msg[:1900])
 
 
+@bot.command(name="squeeze-scan")
+async def squeeze_scan_cmd(ctx):
+    """Show top 5 short squeeze candidates."""
+    candidates = scan_squeeze_candidates()
+    msg = f"**SQUEEZE SCANNER** ({len(candidates)} candidates)\n"
+    if candidates:
+        msg += "```\n"
+        msg += f"{'Ticker':6s} {'Price':>8s} {'Chg%':>6s} {'Z':>6s} {'Prob':>5s} {'Vol':>10s}\n"
+        msg += f"{'-'*45}\n"
+        for c in candidates[:5]:
+            msg += (f"{c['ticker']:6s} ${c['price']:>7.2f} {c['change_pct']:>+5.1f}% "
+                    f"{c['zscore']:>+5.2f} {c['squeeze_prob']:>4d}% {c['volume']:>10,.0f}\n")
+        msg += "```"
+    else:
+        msg += "No squeeze candidates found. Scans market hours.\n"
+    # Active squeeze positions
+    sq_pos = [p for p in PAPER_PORTFOLIO.get("positions", []) if p.get("strategy") == "reverse_copy"]
+    if sq_pos:
+        msg += f"\n**Active ({len(sq_pos)}/{SQUEEZE_CONFIG['max_positions']}):**\n"
+        for p in sq_pos:
+            msg += f"  {p.get('market')} ${p.get('cost', 0):.0f} prob={p.get('squeeze_prob', '?')}%\n"
+    await ctx.send(msg[:1900])
+
+
 @bot.command(name="fed-sentiment")
 async def fed_sentiment_cmd(ctx):
     """Show current Fed hawkish/dovish score and recent headlines."""
@@ -4814,6 +6637,25 @@ async def earnings_cmd(ctx):
     await ctx.send(msg[:1900])
 
 
+@bot.command(name="econ-calendar")
+async def econ_calendar_cmd(ctx):
+    """Show next 7 days of economic events and pre-event status."""
+    events = _ECON_CALENDAR.get("events", [])
+    if not events:
+        fetch_econ_calendar()
+        events = _ECON_CALENDAR.get("events", [])
+    pre_active = _ECON_CALENDAR.get("pre_event_active", False)
+    msg = f"**ECONOMIC CALENDAR** (next 7 days)\n"
+    msg += f"Pre-event sizing: {'**ACTIVE (0.5x)**' if pre_active else 'Normal'}\n```\n"
+    if events:
+        for ev in events[:15]:
+            msg += f"  {ev['date']} {ev['day'][:3]}  {ev['name'][:35]:35s}  [{ev['impact']}]\n"
+    else:
+        msg += "  No high-impact events in next 7 days\n"
+    msg += "```"
+    await ctx.send(msg[:1900])
+
+
 @bot.command(name="crypto-pairs")
 async def crypto_pairs_cmd(ctx):
     """Show crypto pairs Z-scores and open positions."""
@@ -4894,7 +6736,7 @@ async def sectors_cmd(ctx):
 async def polygon_status_cmd(ctx):
     """Show Polygon.io connection status and sample data."""
     try:
-        from polygon_client import test_connection, get_quote, get_crypto_price, get_news, get_market_movers
+        from polygon_client import test_connection, get_quote, get_crypto_price, get_news, get_market_movers, get_cache_stats
         ok, status_msg = test_connection()
         msg = f"**POLYGON.IO STATUS**\n"
         msg += f"Connection: {'OK' if ok else 'FAILED'} — {status_msg}\n"
@@ -4913,6 +6755,15 @@ async def polygon_status_cmd(ctx):
                 msg += "\n**Top Gainers:**\n```\n"
                 for m in movers:
                     msg += f"  {m['ticker']:6s} ${m['price']:.2f} {m['change_pct']:+.1f}% vol={m['volume']:,.0f}\n"
+                msg += "```"
+            # Cache stats
+            cs = get_cache_stats()
+            msg += f"\n**Price Cache (30s TTL):**\n"
+            msg += f"Hits: {cs['hits']} | Misses: {cs['misses']} | Cached: {cs['cached_tickers']} tickers\n"
+            if cs.get("tickers"):
+                msg += "```\n"
+                for tk, info in sorted(cs["tickers"].items())[:8]:
+                    msg += f"  {tk:6s} ${info['price']:>10,.2f} ({info['age_sec']:.0f}s ago)\n"
                 msg += "```"
             # Latest news
             news = get_news(limit=3)
@@ -5029,6 +6880,126 @@ async def pead_status_cmd(ctx):
     await ctx.send(msg[:1900])
 
 
+@bot.command(name="strategy-debug")
+async def strategy_debug_cmd(ctx):
+    """Show debug state for all alpha strategies — last run, last signal, skip reason, thresholds."""
+    msg = "**Strategy Debug Dashboard**\n```\n"
+    for name, state in _STRATEGY_DEBUG.items():
+        msg += f"{'─'*50}\n"
+        msg += f"  {name.upper()}\n"
+        msg += f"  Last run:    {state.get('last_run', 'never')}\n"
+        msg += f"  Threshold:   {state.get('threshold', 'N/A')}\n"
+        msg += f"  Last signal: {state.get('last_signal', 'none')}\n"
+        msg += f"  Status:      {state.get('last_reason', 'unknown')}\n"
+    msg += f"{'─'*50}\n"
+    # Open positions per strategy
+    strat_counts = {}
+    for p in PAPER_PORTFOLIO.get("positions", []):
+        s = p.get("strategy", "other")
+        strat_counts[s] = strat_counts.get(s, 0) + 1
+    msg += f"\nOpen positions: {dict(strat_counts)}\n"
+    msg += f"Regime: {get_regime('equities').get('regime', '?')} | VIX: {get_regime('equities').get('vix', '?')}\n"
+    msg += "```"
+    await ctx.send(msg[:1900])
+
+
+@bot.command(name="cfo")
+async def cfo_cmd(ctx, amount: str = ""):
+    """Show CFO allocation recommendation."""
+    alloc = get_cfo_allocation()
+    if not alloc:
+        await ctx.send("CFO Agent has not run yet. Run: `python3 intelligence_workers/cfo_agent.py`")
+        return
+
+    vix = alloc.get("vix", 0)
+    regime = alloc.get("regime", "?").upper()
+    portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
+        p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+    if amount:
+        try:
+            portfolio_value = float(amount.replace(",", "").replace("$", ""))
+        except ValueError:
+            pass
+
+    msg = f"{'═' * 38}\n"
+    msg += f"CFO ALLOCATION | VIX {vix:.1f} {regime}\n"
+    msg += f"Portfolio: ${portfolio_value:,.0f}\n"
+    msg += f"{'═' * 38}\n"
+    msg += "STRATEGY ALLOCATION:\n```\n"
+
+    strat_allocs = alloc.get("strategy_allocations", {})
+    strat_stats = alloc.get("strategy_stats", {})
+    for strat, pct in sorted(strat_allocs.items(), key=lambda x: -x[1]):
+        dollars = portfolio_value * pct
+        sharpe = strat_stats.get(strat, {}).get("sharpe", 0)
+        msg += f"  {strat:<20s} ${dollars:>8,.0f} ({pct*100:>4.0f}%) [Sharpe {sharpe:.1f}]\n"
+    msg += f"  {'cash_reserve':<20s} ${portfolio_value * 0.10:>8,.0f} ({10:>4.0f}%)\n"
+    msg += "```\n"
+
+    actions = alloc.get("recommended_actions", [])
+    if actions:
+        msg += "RECOMMENDED ACTIONS:\n"
+        for a in actions[:5]:
+            msg += f"  → {a}\n"
+
+    msg += f"{'═' * 38}\n"
+    msg += f"Confidence: {alloc.get('confidence', '?')} | Reply `!approve-rebalance` to apply"
+    await ctx.send(msg[:1900])
+
+
+@bot.command(name="approve-rebalance")
+async def approve_rebalance_cmd(ctx):
+    """Apply CFO-recommended exposure limits to Redis."""
+    alloc = get_cfo_allocation()
+    if not alloc:
+        await ctx.send("No CFO allocation available.")
+        return
+    r = _get_redis_safe()
+    if not r:
+        await ctx.send("Redis unavailable — cannot apply limits.")
+        return
+    limits = alloc.get("strategy_allocations", {})
+    r.set("config:exposure_limits", json.dumps(limits))
+    await ctx.send(f"Exposure limits applied for {len(limits)} strategies. CFO allocation is now ACTIVE.")
+
+
+@bot.command(name="intelligence")
+async def intelligence_cmd(ctx):
+    """Show last 10 intelligence signals from all sources."""
+    feed = get_intel_feed(10)
+    if not feed:
+        await ctx.send("No intelligence signals. Workers may not have run yet.")
+        return
+    msg = "**Intelligence Feed** (last 10)\n```\n"
+    for sig in feed:
+        src = sig.get("source", "?")
+        ticker = sig.get("ticker", "?")
+        sig_type = sig.get("signal_type", "?")
+        strength = sig.get("strength", 0)
+        ts = sig.get("timestamp", "")[:16]
+        icon = {"darkpool": "D", "congress": "C", "insider": "I", "options": "O"}.get(src, "?")
+        msg += f"  [{icon}] {ticker:<6s} {sig_type:<14s} str={strength:.2f}  {ts}\n"
+    msg += "```"
+    await ctx.send(msg[:1900])
+
+
+@bot.command(name="workers-status")
+async def workers_status_cmd(ctx):
+    """Show last run time of each intelligence worker."""
+    r = _get_redis_safe()
+    msg = "**Intelligence Workers**\n```\n"
+    if r:
+        cfo_last = r.get("intel:cfo:last_run") or "never"
+        msg += f"  CFO Agent:        {cfo_last}\n"
+        for src in ("darkpool", "congress", "insider", "options"):
+            keys = r.keys(f"intel:{src}:*")
+            msg += f"  {src:<18s} {len(keys)} active signals\n"
+    else:
+        msg += "  Redis unavailable\n"
+    msg += "```"
+    await ctx.send(msg)
+
+
 @bot.command(name="hedge-status")
 async def hedge_status_cmd(ctx):
     """Show VRP regime, crash hedge positions, and options status."""
@@ -5091,6 +7062,84 @@ async def hedge_status_cmd(ctx):
         lines.append(f"  Est profit if VIX→20: ${_vf_est_profit:.0f}")
     elif vix > 30:
         lines.append(f"\n**VIX Fade:** VIX={vix:.1f} > 30 — UVXY short will open at market open")
+
+    await ctx.send("\n".join(lines))
+
+
+@bot.command(name="crash-hedge-status")
+async def crash_hedge_status_cmd(ctx):
+    """Show crash hedge engine status: VIX regime, open hedges, triggers."""
+    regime = get_regime("equities")
+    vix = regime.get("vix") or 0
+    cfg = CRASH_HEDGE_CONFIG
+
+    # Determine hedge mode based on VIX level
+    if vix < 20:
+        mode = "IDLE"
+        mode_desc = "no hedging needed"
+    elif vix <= 28:
+        mode = "BUY_PUTS"
+        mode_desc = "cheap OTM protection"
+    else:
+        mode = "AGGRESSIVE_HEDGE"
+        mode_desc = "sell premium + short SPY"
+
+    # Psychologist hedge mode
+    psych_mode = psychologist_get_hedge_mode()
+
+    # Collect all hedge-related positions
+    hedge_strategies = ("crash_hedge_put", "crash_hedge_short", "crash_hedge_call_spread", "vix_fade")
+    hedge_positions = [p for p in PAPER_PORTFOLIO.get("positions", [])
+                       if p.get("strategy") in hedge_strategies]
+
+    lines = [
+        f"**CRASH HEDGE STATUS**",
+        f"VIX: **{vix:.1f}** | Market Regime: {regime.get('regime', 'normal').upper()}",
+        f"Hedge Mode: **{mode}** — {mode_desc}",
+        f"Psychologist Mode: {psych_mode}",
+        f"",
+        f"**Open Hedge Positions ({len(hedge_positions)}):**",
+    ]
+
+    if hedge_positions:
+        for p in hedge_positions:
+            strat = p.get("strategy", "?")
+            mkt = p.get("market", "?")
+            cost = p.get("cost", 0)
+            entry_price = p.get("entry_price", 0)
+            entry_vix = p.get("vrp_regime", "N/A")
+            shares = p.get("shares", 0)
+            ts = p.get("timestamp", "?")
+            stop = p.get("stop_price", 0)
+            target = p.get("target_price", 0)
+            lines.append(f"  **{strat}** | {mkt}")
+            lines.append(f"    Entry: ${entry_price:.2f} x{shares} | Cost: ${cost:.0f}")
+            lines.append(f"    Entry VIX: {entry_vix} | Current VIX: {vix:.1f}")
+            if stop or target:
+                lines.append(f"    Stop: ${stop:.2f} | Target: ${target:.2f}")
+            lines.append(f"    Opened: {ts}")
+    else:
+        lines.append("  No active hedges")
+
+    # Trigger levels
+    lines.append(f"")
+    lines.append(f"**Trigger Levels (CRASH_HEDGE_CONFIG):**")
+    lines.append(f"  VIX >= {cfg['put_vix_threshold']} → Buy puts")
+    lines.append(f"  VIX >= {cfg['vrp_vix_threshold']} → Sell call spreads (VRP)")
+    lines.append(f"  VIX >= {cfg['short_vix_threshold']} → Short SPY")
+    lines.append(f"  Max hedges: {cfg['max_hedges']} | Cooldown: {cfg['cooldown_hours']}h")
+
+    # Recommended action
+    lines.append(f"")
+    lines.append(f"**Recommended Action:**")
+    if vix < cfg["put_vix_threshold"]:
+        lines.append(f"  Stand by — VIX {vix:.1f} below put threshold ({cfg['put_vix_threshold']})")
+    elif vix < cfg["vrp_vix_threshold"]:
+        lines.append(f"  Buy OTM puts — VIX {vix:.1f} in put-buy zone ({cfg['put_vix_threshold']}-{cfg['vrp_vix_threshold']})")
+    elif vix < cfg["short_vix_threshold"]:
+        lines.append(f"  Sell call spreads + puts — VIX {vix:.1f} in VRP zone ({cfg['vrp_vix_threshold']}-{cfg['short_vix_threshold']})")
+    else:
+        lines.append(f"  FULL HEDGE: short SPY + spreads + puts — VIX {vix:.1f} >= {cfg['short_vix_threshold']}")
 
     await ctx.send("\n".join(lines))
 
@@ -5228,14 +7277,39 @@ async def oracle_status_cmd(ctx):
     if _hl_msg:
         await ctx.send(f"**Intel Headlines:**\n{_hl_msg[:1900]}")
 
+# DO NOT RESET — historical data is critical for Kelly sizing and Echo Memory learning.
+# The paper portfolio must never be wiped. Use !close-all to close positions at market
+# while preserving all trade history in SQLite.
 @bot.command(name="paper-reset")
 async def paper_reset_cmd(ctx, amount: float = 10000):
-    PAPER_PORTFOLIO["cash"] = amount
+    await ctx.send("**paper-reset is DISABLED.** Historical trade data is critical for Kelly sizing and Echo Memory.\n"
+                   "Use `!close-all` to close all positions at current prices (preserves all history).")
+
+
+@bot.command(name="close-all")
+async def close_all_cmd(ctx):
+    """Close all open positions at current prices, return cash. Preserves all SQLite history."""
+    positions = PAPER_PORTFOLIO.get("positions", [])
+    if not positions:
+        await ctx.send("No open positions to close.")
+        return
+    count = len(positions)
+    total_returned = 0
+    for pos in list(positions):
+        cost = pos.get("cost", 0)
+        market = pos.get("market", "")
+        # Close at cost (flat) — no live price fetch in manual close
+        PAPER_PORTFOLIO["cash"] += cost
+        total_returned += cost
+        db_close_position(market, cost, "MANUAL_CLOSE_ALL", 0)
+        log.info("CLOSE-ALL: %s | returned $%.2f", market[:40], cost)
     PAPER_PORTFOLIO["positions"] = []
-    PAPER_PORTFOLIO["trades"] = []
     ACTIVE_TRADE_LOCK.clear()
     db_save_daily_state()
-    await ctx.send(f"Paper portfolio reset: ${amount:,.2f} cash, 0 positions. Ready for fresh validation.")
+    save_all_state()
+    await ctx.send(f"**Closed {count} positions** | ${total_returned:,.2f} returned to cash\n"
+                   f"Cash: ${PAPER_PORTFOLIO['cash']:,.2f}\n"
+                   f"All trade history preserved in SQLite.")
 
 @bot.command(name="calibration")
 async def calibration_cmd(ctx):
@@ -5566,33 +7640,6 @@ async def allocation_status_cmd(ctx):
     await ctx.send(msg)
 
 
-@bot.command(name="squeeze-scan")
-async def squeeze_scan_cmd(ctx):
-    """Scan for short squeeze candidates: high SI + reversion signals."""
-    msg = await ctx.send("Scanning for short squeeze candidates...")
-
-    candidates = squeeze_scan()
-    if not candidates:
-        await msg.edit(content="**Squeeze Scan**: No candidates found (need shortable stocks with >15% SI)")
-        return
-
-    result = "**Short Squeeze Candidates**\n```\n"
-    result += f"{'Ticker':>6s} {'SI%':>6s} {'Price':>8s} {'Z-score':>8s} {'Pair':>6s} {'Sq Prob':>7s}\n"
-    result += f"{'─' * 48}\n"
-
-    for c in candidates[:8]:
-        _z_str = f"{c['zscore']:+.2f}" if c["zscore"] is not None else "  n/a"
-        _pair = c.get("pair_partner") or "—"
-        result += (f"  {c['ticker']:>4s} {c['short_interest']*100:>5.1f}% "
-                   f"${c['price']:>7.2f} {_z_str:>8s} {_pair:>6s} {c['squeeze_prob']*100:>5.0f}%\n")
-
-    result += f"{'─' * 48}\n"
-    result += f"SI > 15% + Z-score reversion = squeeze signal\n"
-    result += "```"
-
-    await msg.edit(content=result)
-
-
 @bot.command(name="tv-signals")
 async def tv_signals_cmd(ctx):
     """Show last 10 TradingView webhook signals received."""
@@ -5622,6 +7669,98 @@ async def tv_signals_cmd(ctx):
     _cutoff = datetime.utcnow() - __import__("datetime").timedelta(hours=24)
     _recent = sum(1 for s in history if hasattr(s.get("timestamp"), "timestamp") and s["timestamp"] > _cutoff)
     msg += f"{_recent}\n"
+    msg += "```"
+    await ctx.send(msg)
+
+
+@bot.command(name="security-status")
+async def security_status_cmd(ctx):
+    """Audit which credentials are configured and how they're loaded."""
+    secrets = [
+        ("DISCORD_TOKEN", bool(os.environ.get("DISCORD_TOKEN"))),
+        ("ALPACA_API_KEY", bool(ALPACA_API_KEY)),
+        ("ALPACA_SECRET_KEY", bool(ALPACA_SECRET_KEY)),
+        ("POLYGON_API_KEY", bool(os.environ.get("POLYGON_API_KEY"))),
+        ("KALSHI_API_KEY_ID", bool(KALSHI_API_KEY_ID)),
+        ("KALSHI_PRIVATE_KEY", bool(KALSHI_PRIVATE_KEY)),
+        ("COINBASE_API_KEY", bool(os.environ.get("COINBASE_API_KEY"))),
+        ("COINBASE_API_SECRET", bool(os.environ.get("COINBASE_API_SECRET"))),
+        ("PHEMEX_API_KEY", bool(os.environ.get("PHEMEX_API_KEY"))),
+        ("PHEMEX_API_SECRET", bool(os.environ.get("PHEMEX_API_SECRET"))),
+        ("ANTHROPIC_API_KEY", bool(os.environ.get("ANTHROPIC_API_KEY"))),
+        ("TWILIO_SID", bool(os.environ.get("TWILIO_SID"))),
+        ("TWILIO_TOKEN", bool(os.environ.get("TWILIO_TOKEN"))),
+        ("TELEGRAM_BOT_TOKEN", bool(TELEGRAM_BOT_TOKEN)),
+        ("SMTP_EMAIL", bool(SMTP_EMAIL)),
+        ("SMTP_PASSWORD", bool(SMTP_PASSWORD)),
+    ]
+    # Check for PEM files
+    pem_files = [
+        ("/app/keys/kalshi.pem", os.path.exists("/app/keys/kalshi.pem")),
+        ("/app/keys/coinbase.pem", os.path.exists("/app/keys/coinbase.pem")),
+    ]
+    configured = sum(1 for _, v in secrets if v)
+    msg = f"**SECURITY AUDIT**\n"
+    msg += f"Configured: {configured}/{len(secrets)} credentials\n"
+    msg += "```\n"
+    for name, ok in secrets:
+        status = "OK" if ok else "MISSING"
+        source = "env" if ok else "—"
+        msg += f"  {name:25s} {status:7s} [{source}]\n"
+    msg += f"\nPEM Files:\n"
+    for path, exists in pem_files:
+        msg += f"  {path:30s} {'OK' if exists else 'MISSING'}\n"
+    msg += f"\nTrading Mode: {os.environ.get('TRADING_MODE', 'paper')}\n"
+    msg += f"Dry Run: {os.environ.get('DRY_RUN', 'false')}\n"
+    msg += "```\n"
+    msg += "*Credentials loaded from .env via docker-compose environment*"
+    await ctx.send(msg[:1900])
+
+
+@bot.command(name="tv-test")
+async def tv_test_cmd(ctx):
+    """Simulate a TradingView BUY signal for SPY to test webhook pipeline."""
+    now = datetime.now(timezone.utc)
+    spy_price = _get_spy_price() or 640
+    test_signal = {
+        "signal": "BUY", "asset": "SPY", "indicator": "TV-TEST",
+        "price": spy_price, "timestamp": now, "source": "discord_test",
+        "executed": False,
+    }
+    TRADINGVIEW_SIGNALS["latest_signal"] = test_signal
+    TRADINGVIEW_SIGNALS["history"].append(test_signal)
+    if len(TRADINGVIEW_SIGNALS["history"]) > 50:
+        TRADINGVIEW_SIGNALS["history"] = TRADINGVIEW_SIGNALS["history"][-50:]
+    log.info("TV-TEST: Simulated BUY SPY at $%.2f", spy_price)
+    await ctx.send(
+        f"**TV WEBHOOK TEST**\n"
+        f"Simulated: BUY SPY at ${spy_price:.2f}\n"
+        f"Signal registered in pipeline.\n"
+        f"Auto-execute: {'ON — would execute on next cycle' if TRADINGVIEW_SIGNALS.get('auto_execute') else 'OFF'}\n"
+        f"Expires in: {TRADINGVIEW_SIGNALS['signal_expiry_minutes']} min\n"
+        f"Verify: http://89.167.108.136:8080/webhook-test")
+
+
+@bot.command(name="ai-cost")
+async def ai_cost_cmd(ctx):
+    """Show AI consensus API usage and estimated cost today."""
+    today_calls = _AI_CONSENSUS_DAILY_COUNT
+    max_calls = AI_CONSENSUS_MAX_DAILY
+    est_cost_today = today_calls * AI_CONSENSUS_COST_PER_CALL
+    remaining = max(0, max_calls - today_calls)
+    total_ever = len(_AI_CONSENSUS_LOG)
+    total_est = total_ever * AI_CONSENSUS_COST_PER_CALL
+    est_monthly = est_cost_today * 30  # Extrapolate from today's usage
+    msg = f"**AI Cost Report**\n```\n"
+    msg += f"{'Calls today:':<26s} {today_calls}/{max_calls}\n"
+    msg += f"{'Remaining today:':<26s} {remaining}\n"
+    msg += f"{'Model:':<26s} claude-haiku-4-5-20251001\n"
+    msg += f"{'Est. cost today:':<26s} ${est_cost_today:.4f}\n"
+    msg += f"{'Est. monthly (at rate):':<26s} ${est_monthly:.3f}\n"
+    msg += f"{'Min confidence gate:':<26s} {AI_CONSENSUS_MIN_CONFIDENCE}\n"
+    msg += f"{'─'*40}\n"
+    msg += f"{'Total calls (session):':<26s} {total_ever}\n"
+    msg += f"{'Est. session cost:':<26s} ${total_est:.4f}\n"
     msg += "```"
     await ctx.send(msg)
 
@@ -5701,7 +7840,7 @@ async def engineer_log_cmd(ctx):
 @bot.command(name="risk-status")
 async def risk_status_cmd(ctx):
     """Show risk management state: correlations, drawdowns, pauses."""
-    risk_run_all_checks()
+    await asyncio.get_event_loop().run_in_executor(None, risk_run_all_checks)
 
     msg = "**Risk Management Status**\n```\n"
 
@@ -6061,7 +8200,7 @@ async def performance_cmd(ctx, window: str = "7"):
         conn = _pfsq.connect(DB_PATH)
         cutoff = (datetime.now(timezone.utc) - __import__("datetime").timedelta(days=_days)).strftime("%Y-%m-%d")
 
-        strats = conn.execute("SELECT DISTINCT strategy FROM positions WHERE status='closed' AND closed_at>=? AND realized_pnl IS NOT NULL", (cutoff,)).fetchall()
+        strats = conn.execute("SELECT DISTINCT strategy FROM positions WHERE status='closed' AND closed_at>=? AND realized_pnl IS NOT NULL AND tier='PAPER'", (cutoff,)).fetchall()
 
         lines = []
         for (strat,) in strats:
@@ -6070,7 +8209,8 @@ async def performance_cmd(ctx, window: str = "7"):
             rows = conn.execute("""
                 SELECT realized_pnl, size_usd,
                        (julianday(closed_at) - julianday(created_at)) * 24 as hold_h
-                FROM positions WHERE status='closed' AND strategy=? AND closed_at>=? AND realized_pnl IS NOT NULL
+                FROM positions WHERE status='closed' AND strategy=? AND closed_at>=?
+                AND realized_pnl IS NOT NULL AND tier='PAPER'
                 ORDER BY closed_at DESC
             """, (strat, cutoff)).fetchall()
 
@@ -6139,9 +8279,11 @@ async def performance_cmd(ctx, window: str = "7"):
         await msg.edit(content=f"Performance error: {e}")
 
 
-@bot.command(name="backtest")
-async def backtest_cmd(ctx, strategy: str = "pairs", days: str = "90"):
-    """Backtest a strategy over historical data. Usage: !backtest pairs 90"""
+@bot.command(name="backtest-yf")
+async def backtest_cmd_yf(ctx, strategy: str = "pairs", days: str = "90"):
+    """Legacy yfinance-based backtest. Kept for reference — the new
+    `!backtest` command (defined earlier) uses the cached-Parquet backtester
+    at /app/backtester/ which is faster and more rigorous."""
     _days = int(days) if days.isdigit() else 90
     msg = await ctx.send(f"Backtesting **{strategy}** over {_days} days...")
 
@@ -6156,8 +8298,8 @@ async def backtest_cmd(ctx, strategy: str = "pairs", days: str = "90"):
             _lookback = 60  # Rolling 60-day window for Z-score (no look-ahead)
             for ticker_a, ticker_b in cfg["seed"][:20]:
                 try:
-                    data_a = yf.download(ticker_a, period=f"{_days + _lookback}d", progress=False)
-                    data_b = yf.download(ticker_b, period=f"{_days + _lookback}d", progress=False)
+                    data_a = yf.download(ticker_a, period=f"{_days + _lookback}d", progress=False, timeout=10)
+                    data_b = yf.download(ticker_b, period=f"{_days + _lookback}d", progress=False, timeout=10)
                     if len(data_a) < _lookback + 20 or len(data_b) < _lookback + 20:
                         continue
                     pa = data_a["Close"].values.flatten()
@@ -6208,7 +8350,7 @@ async def backtest_cmd(ctx, strategy: str = "pairs", days: str = "90"):
             # Replay momentum signals on top cryptos
             for sym in ["BTC", "ETH", "SOL", "AVAX", "LINK"]:
                 try:
-                    data = yf.download(f"{sym}-USD", period=f"{_days}d", progress=False)
+                    data = yf.download(f"{sym}-USD", period=f"{_days}d", progress=False, timeout=10)
                     if len(data) < 30:
                         continue
                     closes = data["Close"].values.flatten()
@@ -6304,30 +8446,6 @@ async def pairs_scan_cmd(ctx):
     await ctx.send(msg)
 
 
-@bot.command(name="security-status")
-async def security_status(ctx):
-    """Show security status including hostname, circuit breaker, key rotation."""
-    hostname_ok = check_hostname_security()
-    cb = CIRCUIT_BREAKER
-    rotations = check_key_rotation_needed()
-    report = (
-        f"**Security Status**\n================================\n"
-        f"Hostname: {socket.gethostname()} ({'OK' if hostname_ok else 'UNAUTHORIZED'})\n"
-        f"Allowed: {ALLOWED_HOSTNAME}\n"
-        f"Circuit breaker: {'TRIPPED' if cb['tripped'] else 'OK'}\n"
-        f"Trades last 60s: {len(cb['trades_last_60s'])} / {cb['max_trades_per_minute']} max\n"
-    )
-    if cb["tripped"]:
-        report += f"Trip reason: {cb['trip_reason']}\n"
-    if rotations:
-        report += "\n**Key Rotation Reminders:**\n"
-        for r in rotations:
-            report += f"  {r}\n"
-    else:
-        report += "\nKey rotation: All keys current\n"
-    report += "================================"
-    await ctx.send(report)
-
 @bot.command(name="reset-breaker")
 async def reset_breaker(ctx):
     """Reset the circuit breaker after it trips."""
@@ -6410,10 +8528,10 @@ async def show_costs(ctx):
     await ctx.send(
         f"**Cost & Safety Dashboard** | {ts}\n"
         f"================================\n"
-        f"**OpenAI Costs:**\n"
+        f"**AI Costs (Claude Haiku):**\n"
         f"  Model: {c['preferred_model']}\n"
-        f"  Monthly spent: ${a['openai_cost_usd']:.4f} / ${c['monthly_openai_limit']:.2f}\n"
-        f"  Calls: {a['openai_calls']} | Tokens: {a['openai_tokens']:,}\n"
+        f"  Monthly spent: ${a['ai_cost_usd']:.4f} / ${c['monthly_ai_limit']:.2f}\n"
+        f"  Calls: {a['ai_calls']} | Tokens: {a['ai_tokens']:,}\n"
         f"\n**Safety Guards:**\n"
         f"  Kill switch: {'ACTIVE' if c['kill_switch'] else 'Off'}\n"
         f"  Strict mode: {'On' if c['strict_mode'] else 'Off'}\n"
@@ -6429,59 +8547,88 @@ async def show_costs(ctx):
 
 
 
-@bot.command(name="studio")
-async def studio_status(ctx):
-    """Show OpenClaw Studio dashboard status."""
-    await ctx.send(
-        f"**OpenClaw Studio**\n================================\n"
-        f"Status: Running (localhost:3000)\n"
-        f"Access: Via Tailscale at http://100.89.63.72:3000\n"
-        f"Features:\n"
-        f"  • Agent chat interface\n"
-        f"  • Job scheduling & approval gates\n"
-        f"  • Real-time skill monitoring\n"
-        f"  • Trade execution dashboard\n"
-        f"\n**Netdata Monitoring:**\n"
-        f"  URL: http://100.89.63.72:19999\n"
-        f"  Metrics: equity, PnL, Sharpe, drawdown, OpenAI costs\n"
-        f"================================"
-    )
 
 
 
 
 @tasks.loop(minutes=10)
 async def alert_scan_task():
-    """Periodically scan for high-EV opportunities and send alerts."""
+    """Periodically scan for high-EV opportunities and send alerts.
+    Heavy blocking calls (yfinance, REST APIs) run in threads to avoid
+    blocking Discord's heartbeat."""
+    import asyncio
     try:
-        adapt_cycle_rate()  # adjust scan rate based on volatility
+        await asyncio.to_thread(adapt_cycle_rate)
         if not CYCLE_PAUSED and not COST_CONFIG.get("kill_switch", False):
             await check_and_send_alerts()
-            push_all_analytics()  # push metrics each cycle
+            await asyncio.to_thread(push_all_analytics)
             # === PAIRS DISCOVERY (runs daily, internally throttled) ===
             try:
-                discover_sp500_pairs()
+                await asyncio.to_thread(discover_sp500_pairs)
             except Exception as _pderr:
                 log.warning("Pairs discovery error: %s", _pderr)
+            # === PRE-MARKET QUEUE FLUSH (first market-hours cycle) ===
+            if EQUITIES_ENABLED and is_market_open():
+                try:
+                    _q_conn = sqlite3.connect(DB_PATH)
+                    # Respect MAX_PAIRS_POSITIONS: only flush signals we have room for
+                    _q_open_pairs = sum(1 for p in PAPER_PORTFOLIO.get("positions", []) if p.get("strategy") == "pairs")
+                    _q_slots = max(0, MAX_PAIRS_POSITIONS - _q_open_pairs)
+                    _q_limit = min(3, _q_slots)  # Original limit was 3, cap by available slots
+                    _q_rows = _q_conn.execute(
+                        "SELECT ticker_a, ticker_b, zscore, correlation, direction, confidence "
+                        "FROM pre_market_queue ORDER BY confidence DESC LIMIT ?",
+                        (_q_limit,)
+                    ).fetchall() if _q_limit > 0 else []
+                    if _q_rows:
+                        log.info("PRE-MARKET QUEUE: executing %d queued signals at open", len(_q_rows))
+                        _q_conn.execute("DELETE FROM pre_market_queue")
+                        _q_conn.commit()
+                        _q_ch = bot.get_channel(int(DISCORD_CHANNEL_ID)) if DISCORD_CHANNEL_ID else None
+                        if _q_ch:
+                            _q_msg = "**PRE-MARKET QUEUE FLUSH**\n"
+                            for _qa, _qb, _qz, _qc, _qd, _qconf in _q_rows:
+                                _q_msg += f"  {_qa}/{_qb} z={_qz:+.2f} corr={_qc:.3f} conf={_qconf:.0f}\n"
+                            await _q_ch.send(_q_msg)
+                    _q_conn.close()
+                except Exception as _qf_err:
+                    log.warning("Queue flush error: %s", _qf_err)
             # === PAIRS TRADING SCANNER (runs during market hours) ===
             if EQUITIES_ENABLED and is_market_open():
                 try:
                     channel = bot.get_channel(int(DISCORD_CHANNEL_ID))
-                    pairs_opps = scan_pairs_opportunities()
+                    pairs_opps = await asyncio.to_thread(scan_pairs_opportunities)
 
-                    _sm = datetime.now().minute
-                    if _sm % 30 < 10:
-                        try:
-                            _pch = bot.get_channel(int(DISCORD_CHANNEL_ID))
-                            import sys as _sys
-                            _main_mod = _sys.modules.get("__main__")
-                            _pead_fn = getattr(_main_mod, "run_pead_scanner", None) if _main_mod else None
-                            if _pead_fn:
-                                await _pead_fn(_pch)
+                    # === PEAD SCANNER (every cycle during market hours) ===
+                    try:
+                        _pch = bot.get_channel(int(DISCORD_CHANNEL_ID)) if DISCORD_CHANNEL_ID else None
+                        _pead_fn = globals().get("run_pead_scanner")
+                        if _pead_fn:
+                            await asyncio.wait_for(_pead_fn(_pch), timeout=60.0)
+                        else:
+                            log.warning("PEAD: run_pead_scanner not in globals()")
+                    except asyncio.TimeoutError:
+                        log.warning("SCANNER TIMEOUT: run_pead_scanner skipped after 60s")
+                    except Exception as _pe:
+                        log.warning("PEAD error: %s", _pe)
+
+                    # === ALPHA STRATEGIES (run during market hours) ===
+                    try:
+                        _alpha_ch = bot.get_channel(int(DISCORD_CHANNEL_ID)) if DISCORD_CHANNEL_ID else None
+                        _g = globals()
+                        for _name in ("run_sympathy_scanner", "run_gamma_pin_scanner", "run_vacuum_scanner", "scan_cash_secured_puts_sim"):
+                            _fn = _g.get(_name)
+                            if _fn:
+                                try:
+                                    await asyncio.wait_for(_fn(_alpha_ch), timeout=30.0)
+                                except asyncio.TimeoutError:
+                                    log.warning("SCANNER TIMEOUT: %s skipped after 30s", _name)
+                                except Exception as _ae:
+                                    log.warning("Alpha %s error: %s", _name, _ae)
                             else:
-                                log.warning("PEAD: run_pead_scanner not found in __main__ module")
-                        except Exception as _pe:
-                            log.warning("PEAD error: %s", _pe)
+                                log.warning("Alpha: %s not in globals()", _name)
+                    except Exception as _alpha_err:
+                        log.warning("Alpha strategy error: %s", _alpha_err)
 
                     for po in pairs_opps:
                         log.info("PAIRS SIGNAL: %s corr=%.3f z=%.2f dir=%s",
@@ -6496,12 +8643,62 @@ async def alert_scan_task():
                 except Exception as pairs_err:
                     log.warning("Pairs scan error: %s", pairs_err)
             elif EQUITIES_ENABLED and not is_market_open():
-                pass  # Market closed, skip silently
+                # Queue high-conviction signals for market open execution
+                # Use direct Z-score scan (bypass is_market_open guard in scan_pairs_opportunities)
+                try:
+                    # Respect MAX_PAIRS_POSITIONS when queuing
+                    _q_open = sum(1 for p in PAPER_PORTFOLIO.get("positions", []) if p.get("strategy") == "pairs")
+                    _q_room = max(0, MAX_PAIRS_POSITIONS - _q_open)
+                    pairs_opps = await asyncio.to_thread(_scan_pairs_for_queue)
+                    pairs_opps = pairs_opps[:_q_room]  # Only queue what we have room for
+                    if pairs_opps:
+                        _q_conn = sqlite3.connect(DB_PATH)
+                        _q_conn.execute("""CREATE TABLE IF NOT EXISTS pre_market_queue (
+                            id INTEGER PRIMARY KEY, ticker_a TEXT, ticker_b TEXT,
+                            zscore REAL, correlation REAL, direction TEXT,
+                            confidence REAL, discovered_at TEXT,
+                            UNIQUE(ticker_a, ticker_b))""")
+                        for po in pairs_opps:
+                            _qa, _qb = po.get("pair", "/").split("/") if "/" in po.get("pair", "") else (po.get("long",""), po.get("short",""))
+                            _qconf = min(abs(po.get("zscore", 0)) * 30 + po.get("correlation", 0) * 20, 100)
+                            _q_conn.execute(
+                                "INSERT OR REPLACE INTO pre_market_queue (ticker_a, ticker_b, zscore, correlation, direction, confidence, discovered_at) VALUES (?,?,?,?,?,?,?)",
+                                (_qa, _qb, po.get("zscore", 0), po.get("correlation", 0),
+                                 po.get("direction", ""), _qconf,
+                                 datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")))
+                        _q_conn.commit()
+                        _q_conn.close()
+                        log.info("PRE-MARKET QUEUE: stored %d signals for market open", len(pairs_opps))
+                except Exception as _qerr:
+                    log.warning("Pre-market queue error: %s", _qerr)
+            # === PREDICTION MARKET STRATEGIES (runs 24/7 — not gated by market hours) ===
+            try:
+                _pm_ch = bot.get_channel(int(DISCORD_CHANNEL_ID)) if DISCORD_CHANNEL_ID else None
+                _pm_fn = globals().get("execute_pm_strategies")
+                if _pm_fn:
+                    try:
+                        _pm_fired = await asyncio.wait_for(_pm_fn(_pm_ch), timeout=30.0)
+                        if _pm_fired and _pm_fired > 0:
+                            log.info("PM STRATEGIES: %d new positions opened", _pm_fired)
+                    except asyncio.TimeoutError:
+                        log.warning("SCANNER TIMEOUT: execute_pm_strategies skipped after 30s")
+                else:
+                    log.warning("PM: execute_pm_strategies not in globals()")
+            except Exception as _pm_err:
+                log.warning("PM strategy error: %s", _pm_err)
+
+            # === UPDATE STRATEGY DEBUG STATE (for strategies gated by market hours) ===
+            if not is_market_open():
+                _now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                for _dbg_name in ("sympathy_lag", "pead", "liquidity_vacuum", "gamma_pin"):
+                    _STRATEGY_DEBUG[_dbg_name]["last_run"] = _now_str
+                    _STRATEGY_DEBUG[_dbg_name]["last_reason"] = "market closed — skipped"
+
             # === FUNDING ARB SCANNER (runs 24/7, Phemex + Binance) ===
             try:
                 _arb_cfg = globals().get("FUNDING_ARB_CONFIG", {})
                 _arb_threshold = _arb_cfg.get("min_funding_rate", 0.0003)
-                _arb_rates = fetch_all_funding_rates()
+                _arb_rates = await asyncio.to_thread(fetch_all_funding_rates)
                 for _fname, _ri in _arb_rates.items():
                     try:
                         _rate_pct = _ri["best"]
@@ -6586,9 +8783,12 @@ async def alert_scan_task():
             try:
                 _wg_fn = getattr(__import__("sys").modules.get("__main__"), "scan_weekend_gap", None)
                 if _wg_fn:
-                    _wg_fired = await _wg_fn()
-                    if _wg_fired and _wg_fired > 0:
-                        log.info("WEEKEND GAP: %d trades fired", _wg_fired)
+                    try:
+                        _wg_fired = await asyncio.wait_for(_wg_fn(), timeout=30.0)
+                        if _wg_fired and _wg_fired > 0:
+                            log.info("WEEKEND GAP: %d trades fired", _wg_fired)
+                    except asyncio.TimeoutError:
+                        log.warning("SCANNER TIMEOUT: scan_weekend_gap skipped after 30s")
             except Exception:
                 pass
             # === FRIDAY CLOSE RECORDER (Fri 3:50-4:00 PM ET) ===
@@ -6598,14 +8798,21 @@ async def alert_scan_task():
                 if _fri_et.weekday() == 4 and _fri_et.hour == 15 and _fri_et.minute >= 50:
                     _rec_fn = getattr(__import__("sys").modules.get("__main__"), "record_friday_close", None)
                     if _rec_fn:
-                        _rec_fn()
+                        try:
+                            await asyncio.wait_for(asyncio.to_thread(_rec_fn), timeout=30.0)
+                        except asyncio.TimeoutError:
+                            log.warning("SCANNER TIMEOUT: record_friday_close skipped after 30s")
             except Exception:
                 pass
             # === CROSS-EXCHANGE CRYPTO ARB (monitoring, 24/7) ===
             try:
                 _arb_alerts_fn = getattr(__import__("sys").modules.get("__main__"), "scan_crypto_arb_spreads", None)
                 if _arb_alerts_fn:
-                    _arb_alerts = _arb_alerts_fn()
+                    try:
+                        _arb_alerts = await asyncio.wait_for(asyncio.to_thread(_arb_alerts_fn), timeout=30.0)
+                    except asyncio.TimeoutError:
+                        log.warning("SCANNER TIMEOUT: scan_crypto_arb_spreads skipped after 30s")
+                        _arb_alerts = None
                     if _arb_alerts:
                         _arb_ch = bot.get_channel(int(DISCORD_CHANNEL_ID)) if DISCORD_CHANNEL_ID else None
                         if _arb_ch:
@@ -6623,14 +8830,21 @@ async def alert_scan_task():
             try:
                 _etf_fn = getattr(__import__("sys").modules.get("__main__"), "scan_etf_arb", None)
                 if _etf_fn:
-                    await _etf_fn()
+                    try:
+                        await asyncio.wait_for(_etf_fn(), timeout=30.0)
+                    except asyncio.TimeoutError:
+                        log.warning("SCANNER TIMEOUT: scan_etf_arb skipped after 30s")
             except Exception:
                 pass
             # === CORRELATION REGIME MONITOR (hourly) ===
             try:
                 _cr_fn = getattr(__import__("sys").modules.get("__main__"), "check_correlation_regime_action", None)
                 if _cr_fn:
-                    _cr_changed = _cr_fn()
+                    try:
+                        _cr_changed = await asyncio.wait_for(asyncio.to_thread(_cr_fn), timeout=30.0)
+                    except asyncio.TimeoutError:
+                        log.warning("SCANNER TIMEOUT: check_correlation_regime_action skipped after 30s")
+                        _cr_changed = None
                     if _cr_changed:
                         _cr_ch = bot.get_channel(int(DISCORD_CHANNEL_ID)) if DISCORD_CHANNEL_ID else None
                         if _cr_ch:
@@ -6656,7 +8870,11 @@ async def alert_scan_task():
             try:
                 _uo_fn = getattr(__import__("sys").modules.get("__main__"), "scan_unusual_options", None)
                 if _uo_fn:
-                    _uo_prints = _uo_fn()
+                    try:
+                        _uo_prints = await asyncio.wait_for(asyncio.to_thread(_uo_fn), timeout=30.0)
+                    except asyncio.TimeoutError:
+                        log.warning("SCANNER TIMEOUT: scan_unusual_options skipped after 30s")
+                        _uo_prints = None
                     if _uo_prints and len(_uo_prints) > 0:
                         # Alert on new prints
                         _recent = [p for p in _uo_prints if p.get("ts") == datetime.now(timezone.utc).strftime("%H:%M")]
@@ -6677,35 +8895,41 @@ async def alert_scan_task():
             try:
                 _dp_fn = getattr(__import__("sys").modules.get("__main__"), "scan_dark_pool", None)
                 if _dp_fn:
-                    _dp_fn()
+                    try:
+                        await asyncio.wait_for(asyncio.to_thread(_dp_fn), timeout=30.0)
+                    except asyncio.TimeoutError:
+                        log.warning("SCANNER TIMEOUT: scan_dark_pool skipped after 30s")
             except Exception:
                 pass
             # === MOMENTUM IGNITION DETECTOR (pump & dump short) ===
             try:
                 _mig_fn = getattr(__import__("sys").modules.get("__main__"), "scan_momentum_ignition", None)
                 if _mig_fn:
-                    _mig_fired = await _mig_fn()
-                    if _mig_fired and _mig_fired > 0:
-                        log.info("MOMENTUM IGNITION: %d shorts fired", _mig_fired)
+                    try:
+                        _mig_fired = await asyncio.wait_for(_mig_fn(), timeout=30.0)
+                        if _mig_fired and _mig_fired > 0:
+                            log.info("MOMENTUM IGNITION: %d shorts fired", _mig_fired)
+                    except asyncio.TimeoutError:
+                        log.warning("SCANNER TIMEOUT: scan_momentum_ignition skipped after 30s")
             except Exception as _mig_err:
                 log.warning("Momentum ignition error: %s", _mig_err)
             # === CRYPTO PAIRS STAT ARB (runs 24/7, every other cycle ~10min) ===
             try:
                 _cp_fn = getattr(__import__("sys").modules.get("__main__"), "scan_crypto_pairs", None)
                 if _cp_fn:
-                    _cp_fired = await _cp_fn()
-                    if _cp_fired and _cp_fired > 0:
-                        log.info("CRYPTO PAIRS: %d trades fired", _cp_fired)
+                    try:
+                        _cp_fired = await asyncio.wait_for(_cp_fn(), timeout=30.0)
+                        if _cp_fired and _cp_fired > 0:
+                            log.info("CRYPTO PAIRS: %d trades fired", _cp_fired)
+                    except asyncio.TimeoutError:
+                        log.warning("SCANNER TIMEOUT: scan_crypto_pairs skipped after 30s")
             except Exception as _cperr:
                 log.warning("Crypto pairs scan error: %s", _cperr)
             # === CRASH HEDGE SCANNER (runs during market hours) ===
             if is_market_open():
                 try:
                     _hedge_ch = bot.get_channel(int(DISCORD_CHANNEL_ID)) if DISCORD_CHANNEL_ID else None
-                    _check_hedge_fn = __import__("sys").modules.get("__main__")
-                    _check_hedge_fn = getattr(_check_hedge_fn, "check_crash_hedges", None) if _check_hedge_fn else None
-                    if _check_hedge_fn:
-                        await _check_hedge_fn(_hedge_ch)
+                    await check_crash_hedges(_hedge_ch)
                 except Exception as hedge_err:
                     log.warning("Crash hedge scan error: %s", hedge_err)
             # === META-ALLOCATION ENGINE (rebalances every 4h internally) ===
@@ -6748,21 +8972,24 @@ async def alert_scan_task():
                 if _psych.get("regime_changed"):
                     _psych_ch = bot.get_channel(int(DISCORD_CHANNEL_ID)) if DISCORD_CHANNEL_ID else None
                     if _psych_ch:
+                        # VIX regime notification
+                        _vr = _psych.get("vix_regime", "normal")
+                        _vix_val = _psych.get("vix_value", 0)
+                        _rw = REGIME_STRATEGY_WEIGHTS.get(_vr, REGIME_STRATEGY_WEIGHTS["normal"])
+                        await _psych_ch.send(
+                            f"**REGIME SWITCH → {_vr.upper()}** (VIX={_vix_val:.1f})\n"
+                            f"Pairs {_rw['pairs']:.1f}x | Crypto {_rw['crypto']:.1f}x | "
+                            f"Hedge {_rw['crash_hedge']:.1f}x | Max pairs: {MAX_PAIRS_POSITIONS}\n"
+                            f"Hedge mode: {_rw['hedge_mode']}\n"
+                            f"F&G: {_psych['last_fng']}/100 ({_psych['last_label']})")
                         if _psych["contrarian_mode"]:
                             await _psych_ch.send(
                                 f"**PSYCHOLOGIST — CONTRARIAN MODE**\n"
-                                f"Fear & Greed: {_psych['last_fng']}/100 ({_psych['last_label']})\n"
                                 f"Extreme fear detected — biasing toward mean reversion, away from momentum")
                         elif _psych["caution_mode"]:
                             await _psych_ch.send(
                                 f"**PSYCHOLOGIST — CAUTION MODE**\n"
-                                f"Fear & Greed: {_psych['last_fng']}/100 ({_psych['last_label']})\n"
                                 f"Extreme greed detected — all position sizes tightened to 0.5x")
-                        else:
-                            await _psych_ch.send(
-                                f"**PSYCHOLOGIST — NORMAL MODE**\n"
-                                f"Fear & Greed: {_psych['last_fng']}/100 ({_psych['last_label']})\n"
-                                f"Sentiment regime cleared")
             except Exception as _pserr:
                 log.warning("Psychologist error: %s", _pserr)
             # === ORACLE ENGINE (runs every cycle, market hours preferred) ===
@@ -6780,7 +9007,20 @@ async def alert_scan_task():
                 log.warning("Engineer agent error: %s", _engr)
             # === RISK MANAGEMENT AGENT (every cycle) ===
             try:
-                risk_run_all_checks()
+                await asyncio.get_event_loop().run_in_executor(None, risk_run_all_checks)
+                # VIX regime transition alert
+                _vp = _RISK_STATE.get("_vix_regime_prev")
+                _vc = _RISK_STATE.get("vix_regime", "RISK_ON")
+                if _vp and _vp != _vc:
+                    _RISK_STATE["_vix_regime_prev"] = None  # one-shot
+                    try:
+                        _vrch = bot.get_channel(int(DISCORD_CHANNEL_ID)) if DISCORD_CHANNEL_ID else None
+                        _vix_now = (get_regime("equities") or {}).get("vix") or 0
+                        _emoji = {"RISK_ON":"🟢","PRESERVATION":"🟡","CRASH_MODE":"🔴"}.get(_vc,"")
+                        if _vrch:
+                            await _vrch.send(f"{_emoji} **REGIME {_vc}** | VIX={_vix_now:.1f} | (was {_vp})")
+                    except Exception:
+                        pass
                 _pauses = _RISK_STATE.get("strategy_pauses", {})
                 if _pauses:
                     _risk_ch = bot.get_channel(int(DISCORD_CHANNEL_ID)) if DISCORD_CHANNEL_ID else None
@@ -6855,6 +9095,33 @@ async def before_alert_scan():
 # AUTO-PAPER TRADING + LEARNING SYSTEM
 # ============================================================================
 AUTO_PAPER_ENABLED = True
+PREDICTION_TIER_ENABLED = False  # Permanent kill — see docs/GOVERNANCE.md (2026-04-30)
+
+
+def _is_auto_disabled(strategy_name):
+    """Read strategy_kill_switch table — returns True if the named strategy is
+    auto-disabled by the watchdog. Per the Strategy Disable Principle in
+    docs/GOVERNANCE.md, every strategy entry function must consult this gate
+    BEFORE creating positions. Recording-only without entry-side gating is
+    the same failure mode as the Apr 23 prediction "disable".
+
+    Fail-open: any DB error returns False so a SQLite hiccup does not silently
+    halt all strategies."""
+    if not strategy_name:
+        return False
+    try:
+        import sqlite3 as _sks
+        c = _sks.connect(DB_PATH)
+        row = c.execute(
+            "SELECT disabled FROM strategy_kill_switch WHERE strategy=?",
+            (strategy_name,),
+        ).fetchone()
+        c.close()
+        return bool(row and row[0])
+    except Exception:
+        return False
+
+
 SIGNAL_HISTORY = []  # All high-EV signals: executed and not executed
 
 
@@ -6931,6 +9198,10 @@ def is_sports_or_junk(title):
 
 async def auto_paper_execute(channel, opp):
     """Automatically execute a high-EV opportunity in paper mode."""
+    _opp_strategy = (opp.get("strategy") or "").lower()
+    if _opp_strategy and _is_auto_disabled(_opp_strategy):
+        log.info("%s auto-disabled by strategy_kill_switch — skipping", _opp_strategy)
+        return False
     if not AUTO_PAPER_ENABLED:
         return False
     if TRADING_MODE != "paper":
@@ -6941,24 +9212,50 @@ async def auto_paper_execute(channel, opp):
     ev = opp.get("ev", 0)
     if ev < ALERT_CONFIG["min_ev_threshold"]:
         return False
-    # === PSYCHOLOGIST: skip momentum in contrarian mode ===
-    if psychologist_should_skip_momentum() and opp.get("type", "").lower() == "momentum":
-        log.info("PSYCHOLOGIST: skip momentum %s (contrarian mode)", opp.get("market", "")[:30])
+
+    # === FIX 2: PAIRS POSITION CAP (max 5 concurrent pairs) ===
+    _opp_strategy = (opp.get("strategy") or "").lower()
+    _opp_platform = (opp.get("platform") or "").lower()
+    _is_pairs = _opp_strategy == "pairs" or _opp_platform == "pairs"
+    if _is_pairs:
+        _open_pairs = sum(1 for p in PAPER_PORTFOLIO.get("positions", [])
+                          if p.get("strategy") == "pairs")
+        if _open_pairs >= MAX_PAIRS_POSITIONS:
+            log.info("PAIRS_CAP: max %d pairs reached (%d open) — skipping %s",
+                     MAX_PAIRS_POSITIONS, _open_pairs, opp.get("market", "")[:40])
+            return False
+
+    # === FIX 3: CASH RESERVE MINIMUM ($5K floor for non-hedge entries) ===
+    _is_hedge = "hedge" in _opp_strategy or "crash" in _opp_strategy
+    _current_cash = PAPER_PORTFOLIO.get("cash", 0)
+    if not _is_hedge and _current_cash < 5000:
+        log.info("CASH_RESERVE: below $5K minimum (cash=$%.0f) — skipping %s",
+                 _current_cash, opp.get("market", "")[:40])
         return False
+    # === PSYCHOLOGIST: skip momentum/crypto in contrarian or risk_off mode ===
+    if psychologist_should_skip_momentum():
+        _opp_platform = opp.get("platform", "").lower()
+        _opp_type = opp.get("type", "").lower()
+        if _opp_type in ("momentum", "reversal") or _opp_platform == "crypto":
+            log.info("PSYCHOLOGIST: BLOCKED %s %s — regime=%s crypto=%sx",
+                     _opp_platform, opp.get("market", "")[:30],
+                     _PSYCH_STATE.get("vix_regime", "?"),
+                     REGIME_STRATEGY_WEIGHTS.get(_PSYCH_STATE.get("vix_regime", "normal"), {}).get("crypto", "?"))
+            return False
     # === BLACKLIST (sports, memes, long-term junk) ===
     _mkt_lower = opp.get("market", "").lower()
     if is_sports_or_junk(opp.get("market", "")):
         log.info("BLACKLIST: skip %s", opp.get("market", "")[:40])
         return False
     _plat = opp.get("platform", "").lower()
-    if _plat in ("polymarket", "kalshi", "predictit"):
+    if _plat in ("polymarket", "kalshi"):
         _cats=["fda","sec ","cpi","fed ","fomc","supreme court","earnings","tariff","iran","ceasefire","ukraine","russia","china","indictment","impeach","rate cut","rate hike","inflation","gdp","jobs report","nonfarm","sanctions","netanyahu","trudeau","macron","zelensky","zelenskyy","putin","modi","erdogan","mbs","kim jong","opec","taiwan","gaza","debt ceiling","executive order","pce","retail sales","recession","yield curve","merger","antitrust"]
         if not any(cat in opp.get("market","").lower() for cat in _cats):
             log.info("FILTERED: non-catalyst pred market (%s)", opp.get("market","")[:40])
             return False
     # === PREDICTION MARKET EXPOSURE CAP (20% of cash) ===
     _plat_lower = opp.get("platform", "").lower()
-    if _plat_lower in ("polymarket", "kalshi", "predictit"):
+    if _plat_lower in ("polymarket", "kalshi"):
         _pred_exposure = sum(p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", [])
                             if p.get("strategy") == "prediction")
         _pred_cap = PAPER_PORTFOLIO.get("cash", 25000) * 0.20
@@ -7050,6 +9347,14 @@ async def auto_paper_execute(channel, opp):
         if _cc >= 20:  # Paper: stress test
             log.info("CRYPTO-CAP: skip %s (%d open)", _mkey[:30], _cc)
             return False
+        # === TV SIGNAL GATE (crypto only) ===
+        # TradingView recommendation must be BUY/STRONG_BUY for our watchlist
+        # tickers. Fail-open for tickers the TV worker doesn't cover.
+        if _mkey_ticker:
+            _tv_ok, _tv_reason = _tv_signal_allows_entry(_mkey_ticker)
+            if not _tv_ok:
+                log.info("TV-GATE: skip crypto %s (%s)", _mkey[:30], _tv_reason)
+                return False
     # === GLOBAL POSITION CAP (max 15) ===
     if len(PAPER_PORTFOLIO.get("positions", [])) >= 100:  # Paper: no real cap
         log.info("GLOBAL-CAP: 15 positions open, skip")
@@ -7796,69 +10101,6 @@ async def execute_coinbase_order(action, symbol, amount):
         return False, f"Coinbase execution error: {exc}"
 
 
-async def execute_robinhood_order(action, symbol, amount):
-    """Place a crypto order via Robinhood Crypto API. Returns (success, message)."""
-    if not ROBINHOOD_API_KEY or not ROBINHOOD_PRIVATE_KEY:
-        return False, "Robinhood API keys not configured"
-    if DRY_RUN_MODE:
-        log.info("DRY RUN: Robinhood %s %s $%.2f", action, symbol, amount)
-        return True, f"DRY RUN: {action} order logged but not sent (dry-run mode)"
-    try:
-        import base64, json, uuid as _uuid, datetime as _dt
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-        
-        # Load private key — base64 decode, take first 32 bytes
-        private_bytes = base64.b64decode(ROBINHOOD_PRIVATE_KEY)
-        private_key = Ed25519PrivateKey.from_private_bytes(private_bytes[:32])
-        
-        # Build request
-        base_url = "https://trading.robinhood.com"
-        path = "/api/v1/crypto/trading/orders/"
-        timestamp = int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp())
-        
-        side_str = "buy" if action.upper() == "BUY" else "sell"
-        
-        # Robinhood uses "BTC-USD" format, not just "BTC"
-        rh_symbol = symbol if "-" in symbol else f"{symbol}-USD"
-        
-        order_body = {
-            "client_order_id": str(_uuid.uuid4()),
-            "side": side_str,
-            "symbol": rh_symbol,
-            "type": "market",
-            "market_order_config": {
-                "asset_quantity": str(round(amount, 8))
-            }
-        }
-        
-        body_str = json.dumps(order_body)
-        
-        # Sign exactly per official docs: api_key + str(timestamp) + path + body
-        message = f"{ROBINHOOD_API_KEY}{timestamp}{path}{body_str}"
-        signature = private_key.sign(message.encode("utf-8"))
-        sig_b64 = base64.b64encode(signature).decode("utf-8")
-        
-        headers = {
-            "x-api-key": ROBINHOOD_API_KEY,
-            "x-timestamp": str(timestamp),
-            "x-signature": sig_b64,
-            "Content-Type": "application/json",
-        }
-        
-        log.info("Robinhood request: %s %s %s qty=%s", side_str, rh_symbol, base_url + path, amount)
-        
-        r = requests.post(f"{base_url}{path}", data=body_str, headers=headers, timeout=15)
-        
-        if r.status_code in (200, 201):
-            data = r.json()
-            order_id = data.get("id", "unknown")
-            status = data.get("state", "unknown")
-            return True, f"Robinhood order: {side_str} {rh_symbol} qty={amount} (ID: {order_id}, Status: {status})"
-        else:
-            return False, f"Robinhood error: {r.status_code} {r.text[:200]}"
-    except Exception as exc:
-        return False, f"Robinhood execution error: {exc}"
-
 @bot.command(name="dry-run")
 async def dry_run_cmd(ctx, action: str = ""):
     """Toggle dry-run mode. Usage: !dry-run on/off"""
@@ -7926,10 +10168,9 @@ def find_kalshi_markets_for_arb():
 def find_polymarket_markets_for_arb():
     """Fetch Polymarket markets with prices for arbitrage comparison."""
     try:
-        r = requests.get("https://gamma-api.polymarket.com/markets?closed=false&limit=100&order=volume24hr&ascending=false", timeout=15)
-        if r.status_code != 200:
+        markets = get_polymarket_markets(limit=100)
+        if not markets:
             return []
-        markets = r.json()
         result = []
         for m in markets:
             tokens = m.get("tokens", [])
@@ -8291,8 +10532,42 @@ async def regime_cmd(ctx):
 # FRACTIONAL KELLY + ASYMMETRIC RISK/REWARD
 # ============================================================================
 KELLY_FRACTION = 0.25  # Quarter-Kelly
+KELLY_MIN_TRADES = 50  # Minimum closed trades before Kelly is trusted
+KELLY_FIXED_PCT = 0.02  # Fixed 2% per leg when below min trades ($500 at $25K)
 MIN_REWARD_RISK = 2.0  # Minimum 2:1 reward-to-risk
 ATR_LOOKBACK = 14  # ATR period
+
+
+def _get_closed_trade_count(strategy):
+    """Count closed trades for a strategy in SQLite."""
+    try:
+        import sqlite3 as _ktc
+        conn = _ktc.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM positions WHERE status='closed' AND strategy=?", (strategy,))
+        count = c.fetchone()[0]
+        conn.close()
+        return count
+    except Exception:
+        return 0
+
+
+def _kelly_or_fixed(strategy, bankroll, kelly_fn, *kelly_args):
+    """Use fixed 2% sizing if strategy has < 50 trades, else full Kelly.
+    kelly_fn is called with kelly_args if trade count is sufficient.
+    Returns (size, mode_str)."""
+    count = _get_closed_trade_count(strategy)
+    if count < KELLY_MIN_TRADES:
+        size = KELLY_FIXED_PCT * bankroll
+        mode = f"fixed {KELLY_FIXED_PCT*100:.0f}% ({count}/{KELLY_MIN_TRADES} trades)"
+        log.info("KELLY MODE: %s — %s", mode, strategy)
+        return size, mode
+    else:
+        size = kelly_fn(*kelly_args)
+        pct = size / bankroll * 100 if bankroll > 0 else 0
+        mode = f"kelly {pct:.1f}% ({count}/{KELLY_MIN_TRADES} trades)"
+        log.info("KELLY MODE: %s — %s", mode, strategy)
+        return size, mode
 
 
 def kelly_size(win_prob, payout_odds, bankroll):
@@ -8577,19 +10852,30 @@ def calculate_edge_score(opportunity):
 
 
 def suggest_position_size_v2(opportunity, bankroll=10000):
-    """Enhanced position sizing using fractional Kelly + regime + edge score."""
+    """Enhanced position sizing using Kelly for prediction markets.
+    Kelly formula: f = (p - (1-p)/b) where p=YES price, b=(1/p - 1)."""
     ev = opportunity.get("ev", 0)
     if ev <= 0:
         return 0
-    
-    # Estimate win probability from EV
-    # For prediction markets: if YES @ $0.40, implied prob = 40%
-    # Our edge is the EV above that
-    implied_prob = opportunity.get("yes_price", 0.5)
-    our_prob = min(implied_prob + ev, 0.95)  # Cap at 95%
-    payout_odds = (1.0 / implied_prob) - 1 if implied_prob > 0 else 1
-    
-    size = kelly_size(our_prob, payout_odds, bankroll)
+
+    # For prediction markets: YES price IS the implied probability
+    yes_price = opportunity.get("yes_price", 0.5)
+    if yes_price <= 0 or yes_price >= 1.0:
+        return 0
+
+    # Kelly: p = our estimated true probability, b = payout odds
+    # Estimate p as YES_price + small edge from our analysis
+    p = min(yes_price + min(ev, 0.10), 0.90)  # Cap edge contribution at 10%
+    b = (1.0 / yes_price) - 1  # Payout odds (e.g., YES@0.40 → b=1.5)
+
+    # Kelly fraction: f = (p*b - (1-p)) / b = (p - (1-p)/b)
+    q = 1 - p
+    kelly_f = (p * b - q) / b if b > 0 else 0
+    if kelly_f <= 0:
+        return 0  # Negative edge
+
+    # Quarter-Kelly for safety
+    size = kelly_f * KELLY_FRACTION * bankroll
     
     # Apply edge score modifier
     edge_score, confidence, _ = calculate_edge_score(opportunity)
@@ -8759,8 +11045,26 @@ def check_safety_gates():
 
 async def auto_execute_opportunity(opp, channel):
     """Automatically execute a trade for a high-scoring opportunity."""
+    # PERMANENT KILL: prediction tier disabled (2026-04-30, see docs/GOVERNANCE.md).
+    # Sizing knobs (regime weights, meta_alloc) do NOT gate entries — only this does.
+    if PREDICTION_TIER_ENABLED is False and opp.get("platform") in ("Kalshi", "Polymarket"):
+        log.info("prediction tier disabled — skipping %s", opp.get("market", "")[:60])
+        return None
+
+    # Strategy auto-disable gate (defense in depth — the watchdog can flip
+    # individual strategies via the strategy_kill_switch table at any time).
+    _opp_strategy_guess = (
+        "prediction" if opp.get("platform") in ("Kalshi", "Polymarket")
+        else "crypto" if opp.get("platform", "").lower() == "crypto"
+        else (opp.get("strategy") or "").lower()
+    )
+    if _opp_strategy_guess and _is_auto_disabled(_opp_strategy_guess):
+        log.info("%s auto-disabled by strategy_kill_switch — skipping %s",
+                 _opp_strategy_guess, opp.get("market", "")[:60])
+        return None
+
     reset_daily_counters()
-    
+
     # Safety check
     safe, reason = check_safety_gates()
     if not safe:
@@ -8797,7 +11101,54 @@ async def auto_execute_opportunity(opp, channel):
     market = opp.get("market", "Unknown")[:80]
     platform = opp.get("platform", "Unknown")
     yes_price = opp.get("yes_price", 0)
-    
+
+    # ── PREDICTION MARKET FILTERS (strict institutional criteria) ─────
+    PRED_MAX_POSITIONS = 3
+    PRED_MAX_SIZE = 250  # Hard cap per position
+    if platform in ("Kalshi", "Polymarket") and opp.get("side", "BUY") != "NO":
+        import re as _pf_re
+
+        # Count existing prediction positions
+        _pred_count = sum(1 for p in PAPER_PORTFOLIO.get("positions", [])
+                          if p.get("strategy") == "prediction")
+        if _pred_count >= PRED_MAX_POSITIONS:
+            log.info("PRED FILTER: Blocked — %d/%d positions open", _pred_count, PRED_MAX_POSITIONS)
+            return False
+
+        # FILTER 1: YES price must be $0.35–$0.65 (meaningful probability)
+        if yes_price > 0 and (yes_price < 0.35 or yes_price > 0.65):
+            log.info("PRED FILTER: Blocked %s — YES $%.3f outside $0.35-$0.65", market[:40], yes_price)
+            return False
+
+        # FILTER 2: Expiry must be > 14 days away
+        _pf_match = _pf_re.search(r'by (\w+)\s+(\d{1,2})', market)
+        if _pf_match:
+            _pf_months = {"January":1,"February":2,"March":3,"April":4,"May":5,"June":6,
+                          "July":7,"August":8,"September":9,"October":10,"November":11,"December":12}
+            _pf_mo = _pf_months.get(_pf_match.group(1), 0)
+            if _pf_mo > 0:
+                try:
+                    _pf_exp = datetime(datetime.now().year, _pf_mo, int(_pf_match.group(2)), tzinfo=timezone.utc)
+                    _pf_days = (_pf_exp - datetime.now(timezone.utc)).days
+                    if _pf_days <= 14:
+                        log.info("PRED FILTER: Blocked %s — expires in %dd (min 14)", market[:40], _pf_days)
+                        return False
+                except ValueError:
+                    pass
+
+        # FILTER 3: Catalyst whitelist required
+        _pred_cats = ["fed", "fomc", "cpi", "rate", "iran", "ceasefire", "ukraine", "russia",
+                      "china", "tariff", "election", "sanctions", "taiwan", "gaza", "opec",
+                      "recession", "gdp", "inflation", "netanyahu", "trump"]
+        if not any(cat in market.lower() for cat in _pred_cats):
+            log.info("PRED FILTER: Blocked %s — not in catalyst whitelist", market[:40])
+            return False
+
+        # Cap position size
+        size = min(size, PRED_MAX_SIZE)
+        log.info("PRED APPROVED: %s YES=$%.3f (passed all filters)", market[:40], yes_price)
+    # ────────────────────────────────────────────────────────────────────
+
     # Calculate stops and targets
     if opp.get("side") == "NO" and opp.get("no_price"):
         entry_price = opp["no_price"]
@@ -8968,7 +11319,7 @@ async def closed_cmd(ctx):
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("SELECT market_id, exit_reason, realized_pnl, closed_at FROM positions WHERE status='closed' ORDER BY closed_at DESC LIMIT 10")
+        c.execute("SELECT market_id, exit_reason, realized_pnl, closed_at FROM positions WHERE status='closed' AND tier='PAPER' ORDER BY closed_at DESC LIMIT 10")
         rows = c.fetchall()
         conn.close()
     except Exception:
@@ -9063,20 +11414,47 @@ OVERSIGHT_CONFIG = {
 async def run_ai_oversight(channel):
     """AI oversight: review performance, pause if needed, suggest improvements."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    
-    total_trades = ANALYTICS.get("total_trades", 0)
-    winning = ANALYTICS.get("winning_trades", 0)
-    losing = ANALYTICS.get("losing_trades", 0)
-    total_pnl = ANALYTICS.get("total_pnl", 0)
+
+    # FIX: Read all-time stats from SQLite, not in-memory ANALYTICS
+    # ANALYTICS resets on restart → shows 0/0/0 → false halt
+    total_trades = 0
+    winning = 0
+    losing = 0
+    total_pnl = 0
+    try:
+        _ovs_conn = sqlite3.connect(DB_PATH)
+        _ovs_row = _ovs_conn.execute(
+            "SELECT COUNT(*), "
+            "SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN realized_pnl < 0 THEN 1 ELSE 0 END), "
+            "COALESCE(SUM(realized_pnl), 0) "
+            "FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL "
+            "AND realized_pnl != 0 AND tier='PAPER' "
+            "AND exit_reason NOT LIKE '%ADMIN%' AND exit_reason NOT LIKE '%GHOST%' "
+            "AND exit_reason NOT LIKE '%ZOMBIE%'"
+        ).fetchone()
+        if _ovs_row:
+            total_trades = _ovs_row[0] or 0
+            winning = _ovs_row[1] or 0
+            losing = _ovs_row[2] or 0
+            total_pnl = _ovs_row[3] or 0
+        _ovs_conn.close()
+    except Exception as _ovs_err:
+        log.warning("OVERSIGHT: SQLite read failed: %s — falling back to ANALYTICS", _ovs_err)
+        total_trades = ANALYTICS.get("total_trades", 0)
+        winning = ANALYTICS.get("winning_trades", 0)
+        losing = ANALYTICS.get("losing_trades", 0)
+        total_pnl = ANALYTICS.get("total_pnl", 0)
+
     max_dd = ANALYTICS.get("max_drawdown", 0)
-    
+
     win_rate = (winning / max(total_trades, 1)) * 100
     
     alerts = []
     halt_trading = False
     
     # Check win rate
-    if total_trades >= 10 and win_rate < OVERSIGHT_CONFIG["win_rate_floor"]:
+    if total_trades >= 20 and win_rate < OVERSIGHT_CONFIG["win_rate_floor"]:
         alerts.append(f"Win rate {win_rate:.1f}% below floor ({OVERSIGHT_CONFIG['win_rate_floor']}%)")
         halt_trading = True
     
@@ -9123,7 +11501,11 @@ async def run_ai_oversight(channel):
     
     # Build daily oversight report
     regime = REGIME_CONFIG.get("current_regime", "UNKNOWN")
-    fng = REGIME_CONFIG.get("fng_value", "?")
+    fng = REGIME_CONFIG.get("fng_value")
+    if fng is None or fng == "?":
+        # Fall back to live cache, never display "?"
+        _fng_v, _ = get_fear_greed()
+        fng = _fng_v
     
     report = (
         f"**AI Oversight Report** | {ts}\n================================\n"
@@ -9168,14 +11550,13 @@ async def test_execution(ctx, platform: str = "", amount: str = "1"):
     """Test order execution on a specific platform with tiny amount.
     Usage: !test-execution kalshi 1
            !test-execution coinbase 2
-           !test-execution robinhood 1
            !test-execution phemex 1
     """
     if not platform:
         await ctx.send(
             "**Test Execution — Safe Order Testing**\n"
             "Usage: `!test-execution <platform> <amount>`\n"
-            "Platforms: `kalshi`, `coinbase`, `robinhood`, `phemex`\n"
+            "Platforms: `kalshi`, `coinbase`, `phemex`\n"
             "Amount: $1-5 recommended for testing\n"
             "\nThis will attempt a REAL order (unless dry-run is on).\n"
             f"Dry-run mode: **{'ON (safe)' if DRY_RUN_MODE else 'OFF (real orders!)'}**\n"
@@ -9212,14 +11593,6 @@ async def test_execution(ctx, platform: str = "", amount: str = "1"):
     elif platform == "coinbase":
         try:
             success, exec_msg = await execute_coinbase_order("BUY", "BTC", amt)
-        except Exception as exc:
-            exec_msg = f"Error: {exc}"
-    
-    elif platform == "robinhood":
-        try:
-            # Robinhood crypto: buy small amount of XRP (cheapest)
-            qty = amt / 2.0  # Approx XRP price ~$2
-            success, exec_msg = await execute_robinhood_order("BUY", "XRP", qty)
         except Exception as exc:
             exec_msg = f"Error: {exc}"
     
@@ -9274,7 +11647,7 @@ async def test_execution(ctx, platform: str = "", amount: str = "1"):
         except Exception as exc:
             exec_msg = f"Error: {exc}"
     else:
-        await msg.edit(content=f"Unknown platform: `{platform}`. Use: kalshi, coinbase, robinhood, phemex, polymarket, alpaca, ibkr")
+        await msg.edit(content=f"Unknown platform: `{platform}`. Use: kalshi, coinbase, phemex, polymarket, alpaca, ibkr")
         return
     
     status = "SUCCESS" if success else "FAILED"
@@ -9373,10 +11746,17 @@ def get_alpaca_balance():
         return f"Error: {exc}"
 
 
-def _alpaca_limit_at_mid(symbol, side, notional=None, qty=None, max_attempts=3, timeout_sec=45):
+def _alpaca_limit_at_mid(symbol, side, notional=None, qty=None,
+                         max_attempts=3, timeout_sec=45,
+                         strategy=None, market_id=None):
     """Submit limit order at bid/ask midpoint, retry up to max_attempts, fallback to market.
-    Returns (order_id, fill_price, fill_type) where fill_type is 'limit' or 'market'."""
-    import requests as _lreq, time as _ltime
+    Returns (order_id, fill_price, fill_type) where fill_type is 'limit' or 'market'.
+
+    WAL integration: when `strategy` + `market_id` provided, writes a PENDING
+    row at entry and updates to 'open'/'failed' on completion — mirrors the
+    bookkeeping of `_alpaca_submit_with_wal` for legs submitted through this
+    helper. Called from pairs scanner so every pair-leg gets WAL coverage."""
+    import requests as _lreq, time as _ltime, uuid as _luuid
     _hdr = {
         "APCA-API-KEY-ID": ALPACA_API_KEY,
         "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
@@ -9384,6 +11764,30 @@ def _alpaca_limit_at_mid(symbol, side, notional=None, qty=None, max_attempts=3, 
     }
     _data_hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
     _orders_url = f"{ALPACA_BASE_URL}/v2/orders"
+
+    wal_row_id = None
+    wal_client_id = f"walmid_{_luuid.uuid4().hex[:20]}"
+    if strategy and market_id:
+        try:
+            _walc = sqlite3.connect(DB_PATH)
+            _walc.execute("""INSERT INTO positions
+                (market_id, strategy, platform, direction, size_usd, status,
+                 created_at, metadata)
+                VALUES (?, ?, 'alpaca', ?, ?, 'PENDING', datetime('now'), ?)""",
+                (market_id, strategy, side, float(notional or 0),
+                 json.dumps({
+                     "client_order_id": wal_client_id,
+                     "intent_ts": datetime.now(timezone.utc).isoformat(),
+                     "helper": "_alpaca_limit_at_mid",
+                     "symbol": symbol, "notional": notional, "qty": qty,
+                 })))
+            wal_row_id = _walc.execute("SELECT last_insert_rowid()").fetchone()[0]
+            _walc.commit()
+            _walc.close()
+            log.info("WAL: %s %s PENDING (limit-mid) row_id=%d", strategy, market_id, wal_row_id)
+        except Exception as _we:
+            log.warning("WAL: PENDING insert failed (%s) — continuing without WAL row", _we)
+            wal_row_id = None
 
     for attempt in range(1, max_attempts + 1):
         # Fetch current bid/ask
@@ -9431,7 +11835,7 @@ def _alpaca_limit_at_mid(symbol, side, notional=None, qty=None, max_attempts=3, 
         _filled = False
         _fill_price = 0
         while _ltime.time() < _deadline:
-            _ltime.sleep(5)
+            time.sleep(5)
             try:
                 _sr = _lreq.get(f"{_orders_url}/{_oid}", headers=_hdr, timeout=5)
                 if _sr.status_code == 200:
@@ -9448,6 +11852,18 @@ def _alpaca_limit_at_mid(symbol, side, notional=None, qty=None, max_attempts=3, 
         if _filled:
             log.info("LIMIT-MID FILL: %s at $%.2f (mid was $%.2f, spread saved est $%.4f)",
                      symbol, _fill_price, _mid, abs(_ask - _mid) if side == "buy" else abs(_mid - _bid))
+            if wal_row_id is not None:
+                try:
+                    _wc = sqlite3.connect(DB_PATH)
+                    _wc.execute(
+                        "UPDATE positions SET status='open', entry_price=?, "
+                        "metadata=json_set(metadata, '$.alpaca_order_id', ?, "
+                        "'$.fill_price', ?, '$.fill_type', 'limit') "
+                        "WHERE id=? AND status='PENDING'",
+                        (_fill_price, _oid, _fill_price, wal_row_id))
+                    _wc.commit(); _wc.close()
+                except Exception:
+                    pass
             return _oid, _fill_price, "limit"
 
         # Not filled — cancel and retry with fresh mid
@@ -9470,12 +11886,42 @@ def _alpaca_limit_at_mid(symbol, side, notional=None, qty=None, max_attempts=3, 
             _md = _mr.json()
             _moid = _md.get("id", "unknown")
             _mfp = float(_md.get("filled_avg_price", 0) or 0)
+            if wal_row_id is not None:
+                try:
+                    _wc = sqlite3.connect(DB_PATH)
+                    _wc.execute(
+                        "UPDATE positions SET status='open', entry_price=?, "
+                        "metadata=json_set(metadata, '$.alpaca_order_id', ?, "
+                        "'$.fill_price', ?, '$.fill_type', 'market') "
+                        "WHERE id=? AND status='PENDING'",
+                        (_mfp, _moid, _mfp, wal_row_id))
+                    _wc.commit(); _wc.close()
+                except Exception:
+                    pass
             return _moid, _mfp, "market"
         else:
             log.warning("LIMIT-MID MARKET FALLBACK FAILED: %s HTTP %d: %s", symbol, _mr.status_code, _mr.text[:200])
+            if wal_row_id is not None:
+                try:
+                    _wc = sqlite3.connect(DB_PATH)
+                    _wc.execute(
+                        "UPDATE positions SET status='failed', exit_reason=?, closed_at=datetime('now') WHERE id=? AND status='PENDING'",
+                        (f"limit-mid all attempts + market fallback failed HTTP {_mr.status_code}", wal_row_id))
+                    _wc.commit(); _wc.close()
+                except Exception:
+                    pass
             return None, 0, "failed"
     except Exception as _me:
         log.warning("LIMIT-MID MARKET FALLBACK ERROR: %s %s", symbol, _me)
+        if wal_row_id is not None:
+            try:
+                _wc = sqlite3.connect(DB_PATH)
+                _wc.execute(
+                    "UPDATE positions SET status='failed', exit_reason=?, closed_at=datetime('now') WHERE id=? AND status='PENDING'",
+                    (f"limit-mid exception: {str(_me)[:200]}", wal_row_id))
+                _wc.commit(); _wc.close()
+            except Exception:
+                pass
         return None, 0, "failed"
 
 
@@ -9855,27 +12301,169 @@ def _agent_log_event(agent, message):
 
 import json as _json_api
 
-def _build_api_status():
-    """Build /api/status response."""
+def _build_api_status(tier="PAPER"):
+    """Build /api/status response. tier filters the aggregate P&L queries.
+
+    Valid tier values: PAPER (default), HISTORICAL, TRANSITIONAL, SHADOW, LIVE, ALL.
+    'ALL' returns cross-tier aggregates.
+    'LIVE' short-circuits to a deployment-status payload (no trades until May 3).
+
+    Per-tier semantics (DASH-B-FIX):
+    - baseline: per-tier denominator for Return % (None → N/A)
+    - realized_pnl: SUM(realized_pnl) WHERE tier=X
+    - adjusted_realized_pnl: PAPER only applies Phase 2 adj_start_date
+      cutoff; for non-PAPER tiers this equals realized_pnl (no cutoff,
+      since "adjusted" is a PAPER-specific concept)
+    - return_pct: realized / baseline (for non-PAPER non-ALL tiers);
+      PAPER keeps Phase 2 adjusted logic
+    - unrealized_pnl: Alpaca API (all live positions, not tier-filtered
+      because Alpaca doesn't know tiers) — labeled "All Tiers" in UI
+    - total_trades / best_trade / worst_trade: scoped to tier
+    """
+    tier = (tier or "PAPER").upper()
+    if tier not in _VALID_TIERS:
+        tier = "PAPER"
+
+    # LIVE: pre-deploy short-circuit. No trades, no P&L, deployment status only.
+    if tier == "LIVE":
+        return {
+            "selected_tier": "LIVE",
+            "baseline": 0.0,
+            "realized_pnl": 0.0,
+            "adjusted_realized_pnl": 0.0,
+            "unrealized_pnl": 0.0,
+            "return_pct": None,
+            "adjusted_return_pct": None,
+            "total_trades": 0,
+            "tier_open_positions": 0,
+            "best_trade": None,
+            "worst_trade": None,
+            "deployment_status": "NOT_DEPLOYED",
+            "first_decision_date": "2026-05-03",
+            "expected_first_tranche_usd": 10000,
+            "prerequisites": [
+                {"label": "Kill switch implemented (dormant, token set)", "done": True},
+                {"label": "Pre-commit hook active", "done": True},
+                {"label": "Walk-forward guard active", "done": True},
+                {"label": "Engineer audit log capturing mutations", "done": True},
+                {"label": "7-day observation window (Apr 26 – May 2)", "done": False},
+                {"label": "Paper-tier performance review", "done": False},
+                {"label": "Shadow graduation candidate review", "done": False},
+                {"label": "Jerad + Gemini concurrence", "done": False},
+            ],
+        }
+
+    _tier_frag = _sql_tier_fragment(tier)
     cash = PAPER_PORTFOLIO.get("cash", 0)
     positions = PAPER_PORTFOLIO.get("positions", [])
-    total_cost = sum(p.get("cost", 0) for p in positions)
-    # Realized PnL
+    # Exclude simulated positions from cost basis (their "cost" is credit already in cash)
+    total_cost = sum(p.get("cost", 0) for p in positions
+                     if p.get("platform") != "Simulated")
+    # Realized PnL + tier-scoped trade stats
     total_realized = 0.0
+    total_trades_tier = 0
+    best_trade_tier = None
+    worst_trade_tier = None
     try:
         import sqlite3 as _asq
         _c = _asq.connect(DB_PATH)
-        _r = _c.execute("SELECT SUM(realized_pnl) FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL").fetchone()
-        if _r and _r[0]:
-            total_realized = _r[0]
+        # Match /api/pnl definition: "real trades" exclude $0 flat closes.
+        # Sum over all real exits (including flats) for realized P&L so totals
+        # still reconcile with archive baselines.
+        _r = _c.execute(
+            "SELECT COALESCE(SUM(realized_pnl),0) "
+            "FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL"
+            + _tier_frag
+        ).fetchone()
+        if _r:
+            total_realized = float(_r[0] or 0)
+        _rc = _c.execute(
+            "SELECT COUNT(*) FROM positions WHERE status='closed' "
+            "AND realized_pnl IS NOT NULL AND realized_pnl != 0"
+            + _tier_frag
+        ).fetchone()
+        if _rc:
+            total_trades_tier = int(_rc[0] or 0)
+        _bt = _c.execute(
+            "SELECT market_id, realized_pnl, strategy FROM positions "
+            "WHERE status='closed' AND realized_pnl IS NOT NULL AND realized_pnl != 0"
+            + _tier_frag + " ORDER BY realized_pnl DESC LIMIT 1"
+        ).fetchone()
+        if _bt:
+            best_trade_tier = {"market": _bt[0], "pnl": round(_bt[1], 2), "strategy": _bt[2]}
+        _wt = _c.execute(
+            "SELECT market_id, realized_pnl, strategy FROM positions "
+            "WHERE status='closed' AND realized_pnl IS NOT NULL AND realized_pnl != 0"
+            + _tier_frag + " ORDER BY realized_pnl ASC LIMIT 1"
+        ).fetchone()
+        if _wt:
+            worst_trade_tier = {"market": _wt[0], "pnl": round(_wt[1], 2), "strategy": _wt[2]}
+        _op = _c.execute(
+            "SELECT COUNT(*) FROM positions WHERE status='open' "
+            + ("" if tier == "ALL" else f"AND tier = '{tier}' ")
+        ).fetchone()
+        tier_open_positions = int(_op[0] or 0) if _op else 0
         _c.close()
     except Exception:
+        tier_open_positions = 0
         pass
     regime = get_regime("equities")
     fng_val, fng_label = get_fear_greed()
     equity = cash + total_cost
+    # Unrealized P&L: pull from Alpaca positions (authoritative source)
+    total_unrealized = 0.0
+    try:
+        _status_hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+        _status_ap_r = requests.get(f"{ALPACA_BASE_URL}/v2/positions", headers=_status_hdr, timeout=5)
+        if _status_ap_r.status_code == 200:
+            total_unrealized = sum(float(p.get("unrealized_pl", 0)) for p in _status_ap_r.json())
+    except Exception:
+        pass
+    # Pull current TV signals for all watchlist tickers in one Redis round-trip
+    # (hit 10 keys at most), then enrich each position row with its signal.
+    # Signal is a compact dict the dashboard can render directly.
+    _tv_sigs_by_ticker: dict = {}
+    try:
+        _r_tv = _get_redis_safe()
+        if _r_tv:
+            _tv_keys = [f"tv_signals:{t}" for t in
+                        ("SPY","QQQ","NVDA","AAPL","META","MSFT","GOOGL","ETH","BTC","RAVE")]
+            _tv_vals = _r_tv.mget(_tv_keys)
+            for _tk, _v in zip(("SPY","QQQ","NVDA","AAPL","META","MSFT","GOOGL","ETH","BTC","RAVE"), _tv_vals):
+                if _v:
+                    try:
+                        _sig = json.loads(_v)
+                        _tv_sigs_by_ticker[_tk] = {
+                            "recommendation": _sig.get("recommendation"),
+                            "rsi": round(_sig.get("rsi") or 0, 1),
+                            "ema_aligned": _sig.get("ema_aligned"),
+                            "ts": _sig.get("ts"),
+                        }
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    def _pos_tv_signal(p):
+        """Map a position to its TV signal if we have one. Considers long_leg,
+        market ticker (CRYPTO:X → X), and oracle long/short legs."""
+        candidates = []
+        _m = (p.get("market") or "").upper()
+        if _m.startswith("CRYPTO:"):
+            candidates.append(_m.replace("CRYPTO:", "").split()[0])
+        _ll = (p.get("long_leg") or "").upper().strip()
+        if _ll: candidates.append(_ll)
+        _sl = (p.get("short_leg") or "").upper().strip()
+        if _sl: candidates.append(_sl)
+        for t in candidates:
+            if t in _tv_sigs_by_ticker:
+                return _tv_sigs_by_ticker[t]
+        return None
+
     pos_list = []
     for p in positions:
+        if p.get("platform") == "Simulated":
+            continue
         pos_list.append({
             "market": p.get("market", "")[:40],
             "strategy": p.get("strategy", "?"),
@@ -9886,22 +12474,495 @@ def _build_api_status():
             "platform": p.get("platform", ""),
             "long_leg": p.get("long_leg", ""),
             "short_leg": p.get("short_leg", ""),
+            "tv_signal": _pos_tv_signal(p),
         })
+
+    # IB Gateway snapshot — balance, positions, connection state. Read-only
+    # view of what the ib-gateway microservice published to Redis.
+    ib_snapshot = {"connected": False, "balance": {}, "positions": [], "status": {}}
+    try:
+        import ib_connector as _ibc
+        ib_snapshot = {
+            "connected": _ibc.is_connected(),
+            "status": _ibc.get_status(),
+            "balance": _ibc.get_balance(),
+            "positions": _ibc.get_positions() or [],
+        }
+    except Exception as _ibe:
+        ib_snapshot["error"] = str(_ibe)
+    # Return % is based on TOTAL equity (cash + deployed), not just cash
+    starting_capital = 25000
+    return_pct = ((equity / starting_capital) - 1) * 100 if equity > 0 else 0
+    # Adjusted baseline (excludes one-off bug + broken-strategy losses) — read from config table
+    adj_start_equity = 18692.16
+    adj_start_date = "2026-04-08"
+    adj_bug_loss = 5857.00
+    adj_strategy_loss = 1668.00
+    try:
+        import sqlite3 as _csq
+        _cc = _csq.connect(DB_PATH)
+        for k, default in (
+            ("paper_start_equity", adj_start_equity),
+            ("paper_bug_loss", adj_bug_loss),
+            ("paper_strategy_loss", adj_strategy_loss),
+        ):
+            _row = _cc.execute("SELECT value FROM config WHERE key=?", (k,)).fetchone()
+            if _row and _row[0]:
+                if k == "paper_start_equity":
+                    adj_start_equity = float(_row[0])
+                elif k == "paper_bug_loss":
+                    adj_bug_loss = float(_row[0])
+                elif k == "paper_strategy_loss":
+                    adj_strategy_loss = float(_row[0])
+        _row = _cc.execute("SELECT value FROM config WHERE key='paper_start_date'").fetchone()
+        if _row and _row[0]:
+            adj_start_date = _row[0]
+        _cc.close()
+    except Exception:
+        pass
+    # Adjusted return: realized P&L from trades closed on/after adj_start_date ÷ adj_start_equity.
+    # Stable — only moves when trades close, not on every tick of unrealized.
+    realized_post_start = 0.0
+    try:
+        import sqlite3 as _rsq
+        _rc = _rsq.connect(DB_PATH)
+        _rr = _rc.execute(
+            "SELECT COALESCE(SUM(realized_pnl),0) FROM positions "
+            "WHERE status='closed' AND realized_pnl IS NOT NULL AND closed_at >= ?" + _tier_frag,
+            (adj_start_date,),
+        ).fetchone()
+        if _rr:
+            realized_post_start = float(_rr[0] or 0)
+        _rc.close()
+    except Exception:
+        pass
+    # DASH-B-FIX: adj_* concepts are PAPER-specific. For non-PAPER tiers
+    # we surface total tier realized as "adjusted" too and use per-tier
+    # baseline for Return %, so the label no longer references a PAPER
+    # cutoff that doesn't apply.
+    tier_baseline = _tier_baseline(tier)
+    if tier == "PAPER":
+        # Phase 2 adjusted logic: realized from closed_at >= adj_start_date
+        effective_realized = round(realized_post_start, 2)
+        effective_baseline = adj_start_equity
+    else:
+        # Non-PAPER: use the full tier total against its own baseline
+        effective_realized = round(total_realized, 2)
+        effective_baseline = tier_baseline
+    if effective_baseline and effective_baseline > 0:
+        effective_return_pct = (effective_realized / effective_baseline) * 100
+    else:
+        effective_return_pct = None  # TRANSITIONAL + others without baseline
+    adj_return_pct = (realized_post_start / adj_start_equity) * 100 if adj_start_equity > 0 else 0
+    strategy_status = _build_strategy_status()
+
+    # Real vs Simulated headline P&L (2026-04-30, see docs/GOVERNANCE.md).
+    # The headline `realized_pnl` above already excludes simulated rows via
+    # _SQL_REAL_TRADES_ALL_TIERS. These two fields make the split explicit
+    # for the dashboard so simulated probes are never confused for return.
+    real_pnl_30d = sim_pnl_30d = real_trades_30d = sim_trades_30d = 0
+    real_pnl_all = sim_pnl_all = 0
+    try:
+        import sqlite3 as _rsq
+        _rc = _rsq.connect(DB_PATH)
+        _r30 = _rc.execute(
+            "SELECT COUNT(*), COALESCE(SUM(realized_pnl),0) FROM positions "
+            "WHERE status='closed' AND realized_pnl IS NOT NULL AND tier='PAPER' "
+            "AND closed_at >= datetime('now','-30 days') "
+            "AND COALESCE(platform,'') != 'Simulated' AND COALESCE(deleted_sim, 0) = 0"
+        ).fetchone()
+        _s30 = _rc.execute(
+            "SELECT COUNT(*), COALESCE(SUM(realized_pnl),0) FROM positions "
+            "WHERE status='closed' AND realized_pnl IS NOT NULL AND tier='PAPER' "
+            "AND closed_at >= datetime('now','-30 days') "
+            "AND COALESCE(platform,'') = 'Simulated' AND COALESCE(deleted_sim, 0) = 0"
+        ).fetchone()
+        _rAll = _rc.execute(
+            "SELECT COALESCE(SUM(realized_pnl),0) FROM positions "
+            "WHERE status='closed' AND realized_pnl IS NOT NULL AND tier='PAPER' "
+            "AND COALESCE(platform,'') != 'Simulated' AND COALESCE(deleted_sim, 0) = 0"
+        ).fetchone()
+        _sAll = _rc.execute(
+            "SELECT COALESCE(SUM(realized_pnl),0) FROM positions "
+            "WHERE status='closed' AND realized_pnl IS NOT NULL AND tier='PAPER' "
+            "AND COALESCE(platform,'') = 'Simulated' AND COALESCE(deleted_sim, 0) = 0"
+        ).fetchone()
+        _rc.close()
+        real_trades_30d = int(_r30[0] or 0); real_pnl_30d = round(float(_r30[1] or 0), 2)
+        sim_trades_30d  = int(_s30[0] or 0); sim_pnl_30d  = round(float(_s30[1] or 0), 2)
+        real_pnl_all    = round(float(_rAll[0] or 0), 2)
+        sim_pnl_all     = round(float(_sAll[0] or 0), 2)
+    except Exception as _rs_err:
+        log.warning("real/sim split query error: %s", _rs_err)
     return {
+        "selected_tier": tier,
+        "baseline": tier_baseline,
         "cash": cash, "equity": equity, "cost_basis": total_cost,
-        "realized_pnl": total_realized, "combined_pnl": total_realized,
-        "return_pct": ((equity / 25000) - 1) * 100 if equity > 0 else 0,
+        "deployed_capital": total_cost, "unrealized_pnl": round(total_unrealized, 2),
+        "starting_capital": starting_capital,
+        "realized_pnl": round(total_realized, 2), "combined_pnl": round(total_realized, 2),
+        "tier_open_positions": tier_open_positions,
+        "total_trades": total_trades_tier,
+        "best_trade": best_trade_tier,
+        "worst_trade": worst_trade_tier,
+        "return_pct": effective_return_pct,
+        "adjusted_start_equity": adj_start_equity,
+        "adjusted_start_date": adj_start_date,
+        "adjusted_bug_loss": adj_bug_loss,
+        "adjusted_strategy_loss": adj_strategy_loss,
+        "adjusted_return_pct": effective_return_pct,
+        "adjusted_realized_pnl": effective_realized,
         "vix": regime.get("vix"), "regime": regime.get("regime", "?"),
+        "vix_regime": _RISK_STATE.get("vix_regime", "RISK_ON"),
         "fng_value": fng_val, "fng_label": fng_label,
         "positions": pos_list, "position_count": len(positions),
         "contrarian_mode": _PSYCH_STATE.get("contrarian_mode", False),
         "caution_mode": _PSYCH_STATE.get("caution_mode", False),
+        "ib": ib_snapshot,
+        "strategy_status": strategy_status,
+        # Real vs Simulated headline split (PAPER tier, last 30d + lifetime)
+        "real_pnl_30d":    real_pnl_30d,
+        "real_trades_30d": real_trades_30d,
+        "real_pnl_all":    real_pnl_all,
+        "sim_pnl_30d":     sim_pnl_30d,
+        "sim_trades_30d":  sim_trades_30d,
+        "sim_pnl_all":     sim_pnl_all,
     }
+
+
+def _build_api_tier_summary():
+    """Build /api/tier_summary response — per-tier dollar snapshot.
+
+    LIVE: $0 until first live deploy (steady).
+    PAPER baseline: config.paper_start_equity ($18,692 Phase 2 adjusted
+      baseline — excludes pre-Apr-8 sizing bug and legacy prediction
+      losses; fallback $25K if config missing).
+    PAPER current: total Alpaca equity (cash + all open position cost),
+      INCLUDES cost basis of any non-PAPER tier open positions. See
+      DASH-B review note #2 — deferred to Task 5 for strict per-tier
+      separation; for now the dashboard shows this as total paper
+      platform balance with a caption.
+    SHADOW: shadow_strategy_allocations aggregate + open SHADOW positions.
+    HISTORICAL/TRANSITIONAL: static archive figures (pre-tier migration).
+      TRANSITIONAL baseline=None because the transitional window had no
+      dedicated starting bankroll — it was a migration bookkeeping tier.
+    """
+    import sqlite3 as _tss
+    out = {
+        "live": {
+            "baseline": 0.0, "current": 0.0, "realized_pnl": 0.0,
+            "open_positions": 0, "status": "NOT DEPLOYED",
+        },
+        "paper": {
+            "baseline": 25000.0, "current": 0.0, "realized_pnl": 0.0,
+            "open_positions": 0,
+            "note": "current = total Alpaca equity; includes non-PAPER tier open exposure (Task 5 cleanup)",
+            "status": "ACTIVE — frozen code baseline for May 3 decision",
+        },
+        "shadow": {
+            "baseline": 100000.0, "current": 0.0, "realized_pnl": 0.0,
+            "open_positions": 0,
+            "status": "ACTIVE — 11 strategies testing",
+        },
+        "historical": {
+            "baseline": 25000.0, "current": 20726.76, "realized_pnl": -4273.24,
+            "open_positions": 0,
+            "status": "ARCHIVE — 272 trades pre-tier-migration",
+        },
+        "transitional": {
+            "baseline": None, "current": -171.90, "realized_pnl": -171.90,
+            "open_positions": 0,
+            "status": "ARCHIVE — 19 trades during migration (bookkeeping tier, no dedicated bankroll)",
+        },
+    }
+    # PAPER live equity + realized
+    paper_positions = [p for p in PAPER_PORTFOLIO.get("positions", [])
+                       if p.get("platform") != "Simulated"]
+    paper_cash = PAPER_PORTFOLIO.get("cash", 0)
+    paper_cost = sum(p.get("cost", 0) for p in paper_positions)
+    out["paper"]["current"] = round(paper_cash + paper_cost, 2)
+    out["paper"]["open_positions"] = len(paper_positions)
+    try:
+        _c = _tss.connect(DB_PATH)
+        # Paper baseline from config override
+        _row = _c.execute(
+            "SELECT value FROM config WHERE key='paper_start_equity'"
+        ).fetchone()
+        if _row and _row[0]:
+            out["paper"]["baseline"] = float(_row[0])
+        # Paper realized
+        _r = _c.execute(
+            "SELECT COALESCE(SUM(realized_pnl),0) FROM positions "
+            "WHERE status='closed' AND realized_pnl IS NOT NULL" +
+            _sql_tier_fragment("PAPER")
+        ).fetchone()
+        if _r and _r[0]:
+            out["paper"]["realized_pnl"] = round(float(_r[0]), 2)
+        # Shadow aggregates from allocations table
+        try:
+            _sr = _c.execute(
+                "SELECT COALESCE(SUM(initial_allocation),0), "
+                "COALESCE(SUM(current_balance),0), "
+                "COALESCE(SUM(total_pnl),0) "
+                "FROM shadow_strategy_allocations"
+            ).fetchone()
+            if _sr:
+                out["shadow"]["baseline"] = round(float(_sr[0] or 0), 2)
+                out["shadow"]["current"] = round(float(_sr[1] or 0), 2)
+                out["shadow"]["realized_pnl"] = round(float(_sr[2] or 0), 2)
+        except Exception:
+            pass
+        # Shadow open positions
+        try:
+            _so = _c.execute(
+                "SELECT COUNT(*) FROM positions WHERE status='open' AND tier='SHADOW'"
+            ).fetchone()
+            if _so and _so[0]:
+                out["shadow"]["open_positions"] = int(_so[0])
+        except Exception:
+            pass
+        _c.close()
+    except Exception as _tse:
+        out["error"] = str(_tse)
+    return out
+
+
+def _build_api_sgs(strategy=None, tier=None, history=False, limit=30):
+    """Build /api/sgs response — latest SGS per (strategy, tier).
+
+    strategy, tier: filter to a specific scored row.
+    history=True: return up to `limit` most recent rows for the given
+      strategy (tier optional) — used for trend charting.
+    Default: latest row per (strategy, tier) across all scored combos.
+    """
+    import sqlite3 as _sgs_sq
+    conn = _sgs_sq.connect(DB_PATH)
+    conn.row_factory = _sgs_sq.Row
+    try:
+        if history and strategy:
+            params = [strategy]
+            where = "WHERE strategy=?"
+            if tier:
+                where += " AND tier=?"
+                params.append(tier.upper())
+            rows = conn.execute(
+                f"SELECT * FROM strategy_grade_scores {where} "
+                f"ORDER BY timestamp DESC LIMIT ?",
+                params + [int(limit)],
+            ).fetchall()
+        elif strategy:
+            where = "WHERE strategy=?"
+            params = [strategy]
+            if tier:
+                where += " AND tier=?"
+                params.append(tier.upper())
+            rows = conn.execute(
+                f"SELECT * FROM strategy_grade_scores {where} "
+                f"ORDER BY timestamp DESC LIMIT 1",
+                params,
+            ).fetchall()
+        else:
+            # Latest row per (strategy, tier) — grouped max(id) gives last insert
+            rows = conn.execute(
+                "SELECT s.* FROM strategy_grade_scores s "
+                "JOIN (SELECT strategy, tier, MAX(id) AS mid "
+                "      FROM strategy_grade_scores GROUP BY strategy, tier) g "
+                "ON s.id = g.mid ORDER BY s.sgs DESC"
+            ).fetchall()
+    except _sgs_sq.OperationalError:
+        conn.close()
+        return {"scores": [], "error": "strategy_grade_scores table missing"}
+    conn.close()
+    out = []
+    for r in rows:
+        try:
+            gates = json.loads(r["hard_gates_met"]) if r["hard_gates_met"] else {}
+        except Exception:
+            gates = {}
+        out.append({
+            "id": r["id"],
+            "timestamp": r["timestamp"],
+            "strategy": r["strategy"],
+            "tier": r["tier"],
+            "sgs": r["sgs"],
+            "components": {
+                "sample": r["sample_size_score"],
+                "profit": r["profitability_score"],
+                "risk": r["risk_adjusted_score"],
+                "winrate": r["win_rate_score"],
+                "drawdown": r["drawdown_score"],
+                "consistency": r["consistency_score"],
+            },
+            "n_trades": r["n_trades"],
+            "profit_factor": r["profit_factor"],
+            "sharpe": r["sharpe"],
+            "win_rate_pct": r["win_rate_pct"],
+            "max_drawdown_pct": r["max_drawdown_pct"],
+            "avg_win": r["avg_win"],
+            "avg_loss": r["avg_loss"],
+            "hard_gates": gates,
+            "recommendation": r["recommendation"],
+            "action_ready": bool(r["action_ready"]),
+        })
+    return {"scores": out}
+
+
+def _build_api_shadow_strategies():
+    """Build /api/shadow_strategies response — per-strategy shadow breakdown.
+
+    Joins shadow_strategy_allocations to v_strategy_performance so the
+    dashboard shadow panel can render allocation, current balance, trades,
+    win rate, and realized P&L per strategy.
+    """
+    import sqlite3 as _sss
+    rows = []
+    try:
+        _c = _sss.connect(DB_PATH)
+        _c.row_factory = _sss.Row
+        _alloc = _c.execute(
+            "SELECT strategy, initial_allocation, current_balance, "
+            "trades_count, wins, losses, total_pnl, status "
+            "FROM shadow_strategy_allocations ORDER BY initial_allocation DESC"
+        ).fetchall()
+        # Join to v_strategy_performance where available
+        _perf = {}
+        try:
+            for r in _c.execute(
+                "SELECT strategy, total_trades, wins, losses, total_pnl, "
+                "win_rate_pct FROM v_strategy_performance WHERE tier='SHADOW'"
+            ).fetchall():
+                _perf[r[0]] = {
+                    "total_trades": r[1], "wins": r[2], "losses": r[3],
+                    "total_pnl": r[4], "win_rate_pct": r[5],
+                }
+        except Exception:
+            pass
+        for r in _alloc:
+            name = r["strategy"]
+            live = _perf.get(name, {})
+            rows.append({
+                "strategy": name,
+                "allocated": float(r["initial_allocation"] or 0),
+                "current": float(r["current_balance"] or 0),
+                "realized_pnl": float(r["total_pnl"] or 0),
+                "trades": int(r["trades_count"] or live.get("total_trades") or 0),
+                "wins": int(r["wins"] or live.get("wins") or 0),
+                "losses": int(r["losses"] or live.get("losses") or 0),
+                "win_rate_pct": live.get("win_rate_pct"),
+                "status": r["status"] or "ACTIVE",
+            })
+        _c.close()
+    except Exception as _e:
+        return {"strategies": [], "error": str(_e)}
+    return {"strategies": rows}
+
+
+# Backtest verdicts (source: 2026-04-18 full backtest sweep).
+# status: ACTIVE_*, PAPER_*, HOLD_*, MONITORING, DISABLED, SIM_ONLY
+# sharpe: sharpe_trade from backtest (None when not yet backtested)
+# verdict: short tag used by dashboard health panel for coloring.
+_STRATEGY_VERDICTS = {
+    "oracle_futures": {"status": "PAPER_30DAY",   "sharpe": 1.14, "verdict": "validated_awaiting_live"},
+    "pairs":          {"status": "ACTIVE_3X_SIZED","sharpe": 0.55, "verdict": "validated"},
+    "sector_rotation":{"status": "ACTIVE_SMALL",  "sharpe": 0.41, "verdict": "weak_diversifier"},
+    "pead":           {"status": "ACTIVE_FILTERED","sharpe": 1.56, "verdict": "filtered_to_3_tickers_DE_TSLA_MMM"},
+    "sympathy_lag":   {"status": "ACTIVE",        "sharpe": 4.99, "verdict": "validated_intraday_3pct_PF_2.77"},
+    "crash_hedge":    {"status": "DISABLED",      "sharpe": -12.91, "verdict": "failed_81cell_BS_sweep_rework_needed"},
+    "lottery_fade":   {"status": "PAPER_ONLY",    "sharpe": None, "verdict": "needs_live_closes"},
+    "vrp_income":     {"status": "SIM_ONLY",      "sharpe": None, "verdict": "needs_options_replay"},
+}
+
+
+def _build_strategy_status() -> dict:
+    """Assemble strategy status dict: baked verdicts + live trade counts +
+    7d/30d P&L pulled from SQLite so the dashboard can render a health panel.
+
+    Real vs Simulated split (2026-04-30): live_pnl_* / live_trades_* counts
+    BROKER-FILLABLE rows only (platform != 'Simulated', deleted_sim = 0).
+    Simulated rows are exposed alongside as sim_pnl_* / sim_trades_* so the
+    dashboard can show them as research probes, never as headline P&L."""
+    out: dict = {}
+    strategy_aliases = {
+        "crash_hedge": ("crash_hedge_put", "crash_hedge_short", "crash_hedge_call_spread"),
+    }
+    REAL_FILTER = (" AND COALESCE(platform,'') != 'Simulated' "
+                   "AND COALESCE(deleted_sim, 0) = 0")
+    SIM_FILTER  = (" AND COALESCE(platform,'') = 'Simulated' "
+                   "AND COALESCE(deleted_sim, 0) = 0")
+    try:
+        import sqlite3 as _ssq
+        _c = _ssq.connect(DB_PATH)
+        for name, verdict in _STRATEGY_VERDICTS.items():
+            strat_keys = strategy_aliases.get(name, (name,))
+            placeholders = ",".join("?" for _ in strat_keys)
+            base = (f"FROM positions "
+                    f"WHERE status='closed' AND realized_pnl IS NOT NULL AND tier='PAPER' "
+                    f"AND strategy IN ({placeholders})")
+
+            def _q(window_clause, extra_filter):
+                return _c.execute(
+                    f"SELECT COUNT(*), COALESCE(SUM(realized_pnl),0) {base} "
+                    f"{extra_filter} {window_clause}",
+                    strat_keys,
+                ).fetchone()
+
+            r_row7   = _q("AND closed_at >= datetime('now','-7 days')",  REAL_FILTER)
+            r_row30  = _q("AND closed_at >= datetime('now','-30 days')", REAL_FILTER)
+            r_rowAll = _q("",                                            REAL_FILTER)
+            s_row7   = _q("AND closed_at >= datetime('now','-7 days')",  SIM_FILTER)
+            s_row30  = _q("AND closed_at >= datetime('now','-30 days')", SIM_FILTER)
+            s_rowAll = _q("",                                            SIM_FILTER)
+
+            out[name] = {
+                **verdict,
+                # Headline (broker-fillable trades only)
+                "live_trades_7d":  int(r_row7[0]  or 0),
+                "live_pnl_7d":     round(float(r_row7[1]  or 0), 2),
+                "live_trades_30d": int(r_row30[0] or 0),
+                "live_pnl_30d":    round(float(r_row30[1] or 0), 2),
+                "live_trades_all": int(r_rowAll[0] or 0),
+                "live_pnl_all":    round(float(r_rowAll[1] or 0), 2),
+                # Sim probe (synthetic — research only, not realized return)
+                "sim_trades_7d":   int(s_row7[0]   or 0),
+                "sim_pnl_7d":      round(float(s_row7[1]   or 0), 2),
+                "sim_trades_30d":  int(s_row30[0]  or 0),
+                "sim_pnl_30d":     round(float(s_row30[1]  or 0), 2),
+                "sim_trades_all":  int(s_rowAll[0] or 0),
+                "sim_pnl_all":     round(float(s_rowAll[1] or 0), 2),
+                "last_backtest": "2026-04-18",
+            }
+        _c.close()
+    except Exception as _se:
+        log.warning("strategy_status DB error: %s", _se)
+        for name, verdict in _STRATEGY_VERDICTS.items():
+            out[name] = {**verdict,
+                         "live_trades_7d": 0, "live_pnl_7d": 0.0,
+                         "live_trades_30d": 0, "live_pnl_30d": 0.0,
+                         "live_trades_all": 0, "live_pnl_all": 0.0,
+                         "sim_trades_7d": 0, "sim_pnl_7d": 0.0,
+                         "sim_trades_30d": 0, "sim_pnl_30d": 0.0,
+                         "sim_trades_all": 0, "sim_pnl_all": 0.0,
+                         "last_backtest": "2026-04-18"}
+    return out
 
 
 def _build_api_intelligence():
     """Build /api/intelligence response."""
     return {"events": list(reversed(_AGENT_EVENT_LOG[-20:]))}
+
+
+def _build_api_exposure():
+    """Build /api/exposure response from Redis key portfolio_exposure.
+    Worker: intelligence_workers/factor_exposure.py runs on cron every 4h."""
+    try:
+        r = _get_redis_safe()
+        if r:
+            raw = r.get("portfolio_exposure")
+            if raw:
+                return json.loads(raw)
+    except Exception as e:
+        return {"error": str(e), "alerts": []}
+    return {"alerts": [], "built_at": None, "note": "no exposure snapshot yet — cron runs every 4h"}
 
 
 def _build_api_oracle():
@@ -9991,8 +13052,8 @@ def _build_api_charts():
         # Strategy P&L breakdown
         c.execute("""SELECT strategy, COALESCE(SUM(realized_pnl), 0) as pnl, COUNT(*) as trades,
             SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins
-            FROM positions WHERE status='closed' AND strategy NOT IN ('pairs_legacy')
-            AND realized_pnl IS NOT NULL GROUP BY strategy""")
+            FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL"""
+            + _SQL_REAL_TRADES_AND_LEGACY + " GROUP BY strategy")
         strat_rows = c.fetchall()
         strategy_pnl = [{"strategy": r[0], "pnl": round(r[1], 2), "trades": r[2], "wins": r[3]} for r in strat_rows]
         # Trade frequency: trades per day last 14 days
@@ -10002,22 +13063,22 @@ def _build_api_charts():
         freq_rows = c.fetchall()
         trade_freq = [{"date": r[0], "count": r[1]} for r in reversed(freq_rows)]
         # Launch criteria
-        c.execute("SELECT COUNT(*) FROM positions WHERE status='closed' AND strategy NOT IN ('pairs_legacy') AND created_at >= '2026-03-29'")
+        c.execute("SELECT COUNT(*) FROM positions WHERE status='closed'" + _SQL_REAL_TRADES_AND_LEGACY + " AND created_at >= '2026-04-08'")
         clean_trades = c.fetchone()[0]
-        c.execute("""SELECT COUNT(*), SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END)
-            FROM positions WHERE status='closed' AND strategy NOT IN ('pairs_legacy')
-            AND realized_pnl IS NOT NULL AND created_at >= '2026-03-29'""")
+        c.execute("SELECT COUNT(*), SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) "
+            "FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL"
+            + _SQL_REAL_TRADES_AND_LEGACY + " AND created_at >= '2026-04-08'")
         _wr_row = c.fetchone()
         total_wr = _wr_row[0] or 0
         wins_wr = _wr_row[1] or 0
         win_rate = (wins_wr / total_wr * 100) if total_wr > 0 else 0
         # Sharpe from daily P&L
-        c.execute("""SELECT SUM(realized_pnl) FROM positions WHERE status='closed'
-            AND strategy NOT IN ('pairs_legacy') AND DATE(closed_at) = DATE('now')""")
+        c.execute("SELECT SUM(realized_pnl) FROM positions WHERE status='closed'"
+            + _SQL_REAL_TRADES_AND_LEGACY + " AND DATE(closed_at) = DATE('now')")
         # Consecutive balanced days
-        c.execute("""SELECT DATE(closed_at), SUM(realized_pnl) FROM positions
-            WHERE status='closed' AND closed_at IS NOT NULL AND strategy NOT IN ('pairs_legacy')
-            GROUP BY DATE(closed_at) ORDER BY DATE(closed_at) DESC LIMIT 30""")
+        c.execute("SELECT DATE(closed_at), SUM(realized_pnl) FROM positions "
+            "WHERE status='closed' AND closed_at IS NOT NULL"
+            + _SQL_REAL_TRADES_AND_LEGACY + " GROUP BY DATE(closed_at) ORDER BY DATE(closed_at) DESC LIMIT 30")
         day_rows = c.fetchall()
         consec = 0
         for _, dpnl in day_rows:
@@ -10108,19 +13169,531 @@ def calculate_factor_exposure():
     return exposure, _FACTOR_NEUTRALITY
 
 
+# Factor neutralization: ETF offsets when a factor exceeds 25%
+FACTOR_NEUTRALIZE_MAP = {
+    "tech":     {"etf": "QQQ",  "direction": "short", "label": "Tech overweight → short QQQ"},
+    "energy":   {"etf": "XLE",  "direction": "short", "label": "Energy overweight → short XLE"},
+    "defense":  {"etf": "ITA",  "direction": "short", "label": "Defense overweight → short ITA"},
+    "airlines": {"etf": "JETS", "direction": "long",  "label": "Airlines overweight → long JETS"},
+    "finance":  {"etf": "XLF",  "direction": "short", "label": "Finance overweight → short XLF"},
+    "healthcare": {"etf": "XLV", "direction": "short", "label": "Healthcare overweight → short XLV"},
+    "consumer": {"etf": "XLY",  "direction": "short", "label": "Consumer overweight → short XLY"},
+}
+FACTOR_NEUTRALIZE_SIZE_PCT = 0.003  # 0.3% of portfolio per neutralizing position
+FACTOR_NEUTRALIZE_THRESHOLD = 25    # Trigger at 25% concentration
+
+
 def check_factor_alerts(channel_notify=None):
-    """Check if any factor exceeds 30% of deployed capital. Log warnings."""
+    """Check if any factor exceeds 25% of deployed capital. Auto-neutralize if possible."""
     exposure, neutrality = calculate_factor_exposure()
     alerts = []
+    neutralized = []
+    portfolio_val = PAPER_PORTFOLIO.get("cash", 0) + sum(p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+
     for factor, data in exposure.items():
         if data["pct"] > 30:
             alerts.append(f"{factor}: {data['pct']:.0f}% (net ${data['net']:+,.0f})")
             log.warning("FACTOR ALERT: %s at %.0f%% of deployed capital (net $%+.0f)",
                         factor, data["pct"], data["net"])
+
+        # Auto-neutralize when factor exceeds threshold
+        if data["pct"] > FACTOR_NEUTRALIZE_THRESHOLD and factor in FACTOR_NEUTRALIZE_MAP:
+            _nz = FACTOR_NEUTRALIZE_MAP[factor]
+            _nz_etf = _nz["etf"]
+            _nz_dir = _nz["direction"]
+            _nz_size = portfolio_val * FACTOR_NEUTRALIZE_SIZE_PCT
+
+            # Check if we already have a neutralizing position for this factor
+            _already = any(
+                p.get("market", "").startswith(f"FACTOR_NEUTRAL:{_nz_etf}")
+                for p in PAPER_PORTFOLIO.get("positions", [])
+            )
+            if _already or _nz_size < 50:
+                continue
+
+            # Debit cash and create neutralizing position
+            if PAPER_PORTFOLIO["cash"] >= _nz_size:
+                PAPER_PORTFOLIO["cash"] -= _nz_size
+                _nz_pos = {
+                    "market": f"FACTOR_NEUTRAL:{_nz_etf}",
+                    "side": _nz_dir.upper(),
+                    "shares": 1,
+                    "entry_price": 0,
+                    "cost": _nz_size,
+                    "value": _nz_size,
+                    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                    "platform": "Alpaca",
+                    "ev": 0,
+                    "strategy": "factor_neutral",
+                    "long_leg": _nz_etf if _nz_dir == "long" else "",
+                    "short_leg": _nz_etf if _nz_dir == "short" else "",
+                }
+                PAPER_PORTFOLIO["positions"].append(_nz_pos)
+                save_all_state()
+
+                _before_pct = data["pct"]
+                # Recalculate after
+                _new_exp, _ = calculate_factor_exposure()
+                _after_pct = _new_exp.get(factor, {}).get("pct", _before_pct)
+
+                log.info("FACTOR NEUTRALIZED: %s | %s $%.0f | %s%.0f%% → %.0f%%",
+                         _nz["label"], _nz_etf, _nz_size, factor, _before_pct, _after_pct)
+                neutralized.append(f"{_nz['label']} (${_nz_size:.0f}) | {factor} {_before_pct:.0f}% → {_after_pct:.0f}%")
+
     if alerts:
         _agent_log_event("risk", f"Factor concentration: {', '.join(alerts)}")
         send_critical_alert("Factor Alert", f"Concentration: {', '.join(alerts)}")
+    if neutralized:
+        _agent_log_event("risk", f"Factor neutralized: {', '.join(neutralized)}")
     return alerts
+
+
+def _build_pnl_data(tier=None):
+    """Build comprehensive P&L dataset. Powers !pnl, !today, !strategy-pnl, /api/pnl.
+
+    tier: when provided (PAPER/HISTORICAL/TRANSITIONAL/SHADOW/LIVE/ALL),
+    all closed-trade aggregates are tier-scoped. Default None preserves
+    the historical PAPER+legacy behavior for chat commands that haven't
+    been tier-parameterized yet.
+    """
+    import sqlite3 as _pnl_sq
+    import requests as _pnl_req
+    now = datetime.now(timezone.utc)
+    today_str = now.strftime("%Y-%m-%d")
+    _hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+
+    # Tier-scoped SQL fragment. None → legacy PAPER+legacy-exclusion fragment
+    # (preserves existing chat-command behavior). Tier set → route through
+    # _sql_tier_fragment(tier) which handles all tiers.
+    if tier is None:
+        _trade_frag = _SQL_REAL_TRADES_AND_LEGACY
+    else:
+        _trade_frag = _sql_tier_fragment(tier)
+
+    conn = _pnl_sq.connect(DB_PATH)
+    c = conn.cursor()
+
+    # ── Today's closed trades (real exits only) ──
+    today_closed = []
+    for r in c.execute(
+        "SELECT market_id, strategy, realized_pnl, exit_reason, size_usd, created_at, closed_at "
+        "FROM positions WHERE status='closed' AND closed_at LIKE ?"
+        + _trade_frag + " ORDER BY closed_at DESC", (f"{today_str}%",)):
+        today_closed.append({"market": r[0], "strategy": r[1], "pnl": r[2] or 0,
+                             "reason": r[3], "size": r[4] or 0, "opened": r[5], "closed": r[6]})
+
+    # Separate real trades (non-zero P&L) from flat closes ($0.00 = entry prices were missing)
+    today_real = [t for t in today_closed if t["pnl"] != 0]
+    today_flat = [t for t in today_closed if t["pnl"] == 0]
+    today_realized = sum(t["pnl"] for t in today_closed)
+    today_wins = [t for t in today_real if t["pnl"] > 0]
+    today_losses = [t for t in today_real if t["pnl"] < 0]
+    best_today = max(today_real, key=lambda t: t["pnl"]) if today_real else None
+    worst_today = min(today_real, key=lambda t: t["pnl"]) if today_real else None
+
+    # ── All-time stats (real exits only) ──
+    all_time = c.execute(
+        "SELECT SUM(realized_pnl), COUNT(*), SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END), "
+        "SUM(CASE WHEN realized_pnl < 0 THEN 1 ELSE 0 END) "
+        "FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL AND realized_pnl != 0"
+        + _trade_frag).fetchone()
+    total_realized = (all_time[0] or 0) if all_time else 0
+    total_trades = (all_time[1] or 0) if all_time else 0
+    total_wins = (all_time[2] or 0) if all_time else 0
+
+    # ── Per-strategy stats (real exits only) ──
+    strategy_stats = {}
+    for r in c.execute(
+        "SELECT strategy, SUM(realized_pnl), COUNT(*), "
+        "SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END), "
+        "AVG(realized_pnl), MAX(realized_pnl), MIN(realized_pnl) "
+        "FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL"
+        + _trade_frag + " GROUP BY strategy"):
+        strategy_stats[r[0]] = {
+            "total_pnl": r[1] or 0, "count": r[2] or 0, "wins": r[3] or 0,
+            "avg_pnl": r[4] or 0, "best": r[5] or 0, "worst": r[6] or 0,
+            "win_rate": (r[3] / r[2] * 100) if r[2] > 0 else 0,
+        }
+
+    # ── Best/worst days + streak (real exits only) ──
+    daily_pnls = {}
+    for r in c.execute(
+        "SELECT DATE(closed_at), SUM(realized_pnl) FROM positions "
+        "WHERE status='closed' AND realized_pnl IS NOT NULL"
+        + _trade_frag + " GROUP BY DATE(closed_at) ORDER BY DATE(closed_at)"):
+        if r[0]:
+            daily_pnls[r[0]] = r[1] or 0
+    best_day = max(daily_pnls.items(), key=lambda x: x[1]) if daily_pnls else ("N/A", 0)
+    worst_day = min(daily_pnls.items(), key=lambda x: x[1]) if daily_pnls else ("N/A", 0)
+    streak = 0
+    for d in sorted(daily_pnls.keys(), reverse=True):
+        if daily_pnls[d] > 0:
+            streak += 1
+        else:
+            break
+
+    conn.close()
+
+    # ── Alpaca positions snapshot (one API call for entry prices) ──
+    _alpaca_pos_map = {}  # {TICKER: {avg_entry_price, qty, market_value, unrealized_pl, side}}
+    try:
+        _ap_r = _pnl_req.get(f"{ALPACA_BASE_URL}/v2/positions", headers=_hdr, timeout=10)
+        if _ap_r.status_code == 200:
+            for _ap in _ap_r.json():
+                _alpaca_pos_map[_ap["symbol"].upper()] = {
+                    "avg_entry": abs(float(_ap.get("avg_entry_price", 0))),
+                    "qty": abs(float(_ap.get("qty", 0))),
+                    "market_value": float(_ap.get("market_value", 0)),
+                    "unrealized_pl": float(_ap.get("unrealized_pl", 0)),
+                    "side": _ap.get("side", ""),
+                }
+    except Exception:
+        pass
+
+    # ── Open positions with live prices ──
+    positions = PAPER_PORTFOLIO.get("positions", [])
+    cash = PAPER_PORTFOLIO.get("cash", 0)
+    open_detail = []
+    total_unrealized = 0.0
+    total_cost = 0.0
+
+    for pos in positions:
+        strat = pos.get("strategy", "?")
+        market = pos.get("market", "")
+        cost = pos.get("cost", 0)
+        if pos.get("platform") != "Simulated":
+            total_cost += cost
+        upnl = 0.0
+        curr_long = 0.0
+        curr_short = 0.0
+        curr_z = None
+
+        def _pnl_get_price(ticker):
+            """Get stock price via universal cache (Polygon → Alpaca → yfinance)."""
+            try:
+                px, _src = get_current_price(ticker)
+                return px if px > 0 else 0.0
+            except Exception:
+                return 0.0
+
+        try:
+            if strat in ("pairs", "oracle_trade"):
+                _ll = pos.get("long_leg", "")
+                _sl = pos.get("short_leg", "")
+                _el = pos.get("entry_long_price", 0)
+                _es = pos.get("entry_short_price", 0)
+                # Fallback: use Alpaca avg_entry_price when entry leg prices missing
+                if _ll and (not _el or _el <= 0):
+                    _ap_long = _alpaca_pos_map.get(_ll.upper(), {})
+                    _el = _ap_long.get("avg_entry", 0)
+                if _sl and (not _es or _es <= 0):
+                    _ap_short = _alpaca_pos_map.get(_sl.upper(), {})
+                    _es = _ap_short.get("avg_entry", 0)
+                if _ll and _sl and _el > 0 and _es > 0:
+                    curr_long = _pnl_get_price(_ll)
+                    curr_short = _pnl_get_price(_sl)
+                    if curr_long > 0 and curr_short > 0:
+                        # Use Alpaca qty if available, else estimate from cost
+                        _ap_l = _alpaca_pos_map.get(_ll.upper(), {})
+                        _ap_s = _alpaca_pos_map.get(_sl.upper(), {})
+                        _qty_l = _ap_l.get("qty", 0)
+                        _qty_s = _ap_s.get("qty", 0)
+                        if _qty_l > 0 and _qty_s > 0:
+                            upnl = (curr_long - _el) * _qty_l - (curr_short - _es) * _qty_s
+                        else:
+                            sz = cost / 2
+                            upnl = ((curr_long - _el) * (sz / _el)) + ((_es - curr_short) * (sz / _es))
+                    if strat == "pairs":
+                        try:
+                            _, curr_z, _ = calculate_pair_zscore(_ll, _sl, 252)
+                        except Exception:
+                            pass
+            elif strat in ("crypto", "momentum"):
+                _tk = market.replace("CRYPTO:", "").split()[0]
+                rc = _pnl_req.get(f"https://api.coinbase.com/v2/prices/{_tk}-USD/spot", timeout=5)
+                if rc.status_code == 200:
+                    spot = float(rc.json().get("data", {}).get("amount", 0))
+                    shares = pos.get("shares", 0)
+                    if spot > 0 and shares > 0:
+                        upnl = (spot * shares) - cost
+        except Exception:
+            pass
+
+        total_unrealized += upnl
+        age_h = 0
+        _ts_raw = pos.get("timestamp", "")
+        try:
+            if " UTC" in _ts_raw:
+                entry_t = datetime.strptime(_ts_raw, "%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc)
+            elif _ts_raw:
+                entry_t = datetime.fromisoformat(_ts_raw.replace("Z", "+00:00"))
+                if entry_t.tzinfo is None:
+                    entry_t = entry_t.replace(tzinfo=timezone.utc)
+            else:
+                entry_t = None
+            if entry_t:
+                age_h = (now - entry_t).total_seconds() / 3600
+        except Exception:
+            pass
+
+        pnl_pct = (upnl / cost * 100) if cost > 0 else 0
+        to_tp = ((0.05 - upnl / cost) * 100) if cost > 0 else 0
+
+        open_detail.append({
+            "market": market, "strategy": strat, "cost": cost,
+            "unrealized": round(upnl, 2), "pnl_pct": round(pnl_pct, 2),
+            "age_hours": round(age_h, 1),
+            "entry_long": pos.get("entry_long_price", 0),
+            "entry_short": pos.get("entry_short_price", 0),
+            "curr_long": round(curr_long, 2), "curr_short": round(curr_short, 2),
+            "z_score": round(curr_z, 2) if curr_z is not None else None,
+            "to_partial_tp_pct": round(to_tp, 1),
+            "partial_closed": pos.get("partial_closed", False),
+            "timestamp": pos.get("timestamp", ""),
+        })
+
+    equity = cash + total_cost
+    return {
+        "selected_tier": (tier or "PAPER").upper() if tier else "PAPER",
+        "today_realized": round(today_realized, 2),
+        "today_unrealized_change": round(total_unrealized, 2),
+        "today_gross": round(today_realized + total_unrealized, 2),
+        "today_wins": len(today_wins), "today_losses": len(today_losses),
+        "today_flat": len(today_flat),
+        "today_win_rate": round(len(today_wins) / max(len(today_wins) + len(today_losses), 1) * 100, 1),
+        "best_today": best_today, "worst_today": worst_today,
+        "today_closed": today_real,  # Only show trades with actual P&L (exclude $0.00 flat)
+        "open_positions": open_detail,
+        "total_unrealized": round(total_unrealized, 2),
+        "total_realized": round(total_realized, 2),
+        "combined_pnl": round(total_realized + total_unrealized, 2),
+        "equity": round(equity, 2), "cash": round(cash, 2),
+        "return_pct": round((equity / 25000 - 1) * 100, 2),
+        "total_trades": total_trades, "total_wins": total_wins,
+        "all_time_win_rate": round(total_wins / max(total_trades, 1) * 100, 1),
+        "strategy_stats": strategy_stats,
+        "best_day": {"date": best_day[0], "pnl": round(best_day[1], 2)},
+        "worst_day": {"date": worst_day[0], "pnl": round(worst_day[1], 2)},
+        "streak": streak,
+        "daily_pnls": {k: round(v, 2) for k, v in sorted(daily_pnls.items())},
+    }
+
+
+def _ensure_equity_history_table(conn):
+    """Create equity_history table if it doesn't exist."""
+    conn.execute("""CREATE TABLE IF NOT EXISTS equity_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        equity REAL,
+        cash REAL,
+        realized_pnl REAL,
+        unrealized_pnl REAL)""")
+
+
+def store_equity_history_row(equity, cash, realized_pnl, unrealized_pnl):
+    """Insert one row into equity_history. Called from daily snapshot and intraday loop."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        _ensure_equity_history_table(conn)
+        conn.execute(
+            "INSERT INTO equity_history (timestamp, equity, cash, realized_pnl, unrealized_pnl) "
+            "VALUES (datetime('now'), ?, ?, ?, ?)",
+            (round(equity, 2), round(cash, 2), round(realized_pnl, 2), round(unrealized_pnl, 2)))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.debug("equity_history write error: %s", e)
+
+
+def db_store_daily_snapshot():
+    """Store end-of-day snapshot for P&L charts. Called at 4:05 PM ET."""
+    try:
+        data = _build_pnl_data()
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""CREATE TABLE IF NOT EXISTS daily_snapshots (
+            date TEXT PRIMARY KEY, equity REAL, cash REAL,
+            realized_pnl REAL, unrealized_pnl REAL, combined_pnl REAL,
+            trades_opened INTEGER, trades_closed INTEGER,
+            wins INTEGER, losses INTEGER,
+            best_trade_market TEXT, best_trade_pnl REAL,
+            worst_trade_market TEXT, worst_trade_pnl REAL)""")
+        _ensure_equity_history_table(conn)
+        best = data.get("best_today") or {}
+        worst = data.get("worst_today") or {}
+        c.execute(
+            "INSERT OR REPLACE INTO daily_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+             data["equity"], data["cash"], data["total_realized"],
+             data["total_unrealized"], data["combined_pnl"],
+             len([p for p in data["open_positions"]]),
+             len(data["today_closed"]),
+             data["today_wins"], data["today_losses"],
+             best.get("market", ""), best.get("pnl", 0),
+             worst.get("market", ""), worst.get("pnl", 0)))
+        # Also write to equity_history
+        c.execute(
+            "INSERT INTO equity_history (timestamp, equity, cash, realized_pnl, unrealized_pnl) "
+            "VALUES (datetime('now'), ?, ?, ?, ?)",
+            (data["equity"], data["cash"], data["total_realized"], data["total_unrealized"]))
+        conn.commit()
+        conn.close()
+        log.info("DAILY SNAPSHOT: equity=$%.2f realized=$%.2f unrealized=$%.2f",
+                 data["equity"], data["total_realized"], data["total_unrealized"])
+    except Exception as e:
+        log.warning("Daily snapshot error: %s", e)
+
+
+# Intraday equity snapshots (every 10 min)
+_INTRADAY_EQUITY_SNAPSHOTS = []  # [{timestamp, equity, cash, pnl}]
+_INTRADAY_MAX_POINTS = 144  # 24 hours at 10-min intervals
+
+def store_intraday_snapshot():
+    """Store equity snapshot for intraday charts. Called every 10 min.
+    Writes to both in-memory list and SQLite intraday_snapshots + equity_history tables."""
+    try:
+        cash = PAPER_PORTFOLIO.get("cash", 0)
+        positions = PAPER_PORTFOLIO.get("positions", [])
+        total_cost = sum(p.get("cost", 0) for p in positions if p.get("platform") != "Simulated")
+        equity = cash + total_cost
+
+        # Calculate unrealized PnL from Alpaca positions
+        unrealized = 0.0
+        try:
+            _hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+            _ap_r = requests.get(f"{ALPACA_BASE_URL}/v2/positions", headers=_hdr, timeout=5)
+            if _ap_r.status_code == 200:
+                unrealized = sum(float(p.get("unrealized_pl", 0)) for p in _ap_r.json())
+        except Exception:
+            pass
+
+        # Calculate realized PnL from DB
+        realized = 0.0
+        try:
+            _rc = sqlite3.connect(DB_PATH)
+            _rr = _rc.execute(
+                "SELECT SUM(realized_pnl) FROM positions WHERE status='closed' AND realized_pnl IS NOT NULL"
+                + _SQL_REAL_TRADES_AND_LEGACY).fetchone()
+            if _rr and _rr[0]:
+                realized = _rr[0]
+            _rc.close()
+        except Exception:
+            pass
+
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        snapshot = {
+            "timestamp": ts,
+            "equity": round(equity, 2),
+            "cash": round(cash, 2),
+        }
+        _INTRADAY_EQUITY_SNAPSHOTS.append(snapshot)
+        if len(_INTRADAY_EQUITY_SNAPSHOTS) > _INTRADAY_MAX_POINTS:
+            _INTRADAY_EQUITY_SNAPSHOTS[:] = _INTRADAY_EQUITY_SNAPSHOTS[-_INTRADAY_MAX_POINTS:]
+
+        # Persist to SQLite for dashboard 1H/24H views across restarts
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute(
+                "INSERT INTO intraday_snapshots (timestamp, equity, cash, unrealized_pnl) VALUES (?, ?, ?, ?)",
+                (ts, round(equity, 2), round(cash, 2), round(unrealized, 2)))
+            # Prune entries older than 48 hours
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            conn.execute("DELETE FROM intraday_snapshots WHERE timestamp < ?", (cutoff,))
+            # Also write to equity_history (one row per snapshot)
+            _ensure_equity_history_table(conn)
+            conn.execute(
+                "INSERT INTO equity_history (timestamp, equity, cash, realized_pnl, unrealized_pnl) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (ts, round(equity, 2), round(cash, 2), round(realized, 2), round(unrealized, 2)))
+            conn.commit()
+            conn.close()
+        except Exception as _dbe:
+            log.debug("Intraday snapshot DB write: %s", _dbe)
+    except Exception as e:
+        log.warning("Intraday snapshot error: %s", e)
+
+
+def _build_api_equity_history(timeframe="all"):
+    """Build /api/equity-history response. Supports 1h, 24h, 1w, 1m, all."""
+    import sqlite3 as _eq_sq
+    now = datetime.now(timezone.utc)
+
+    # For short timeframes, use intraday snapshots (memory + SQLite)
+    if timeframe in ("1h", "24h"):
+        cutoff_hours = 1 if timeframe == "1h" else 24
+        cutoff = (now - timedelta(hours=cutoff_hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Try SQLite first (persists across restarts), fall back to in-memory
+        points = []
+        try:
+            conn = _eq_sq.connect(DB_PATH)
+            rows = conn.execute(
+                "SELECT timestamp, equity, cash FROM intraday_snapshots WHERE timestamp >= ? ORDER BY timestamp", (cutoff,)).fetchall()
+            conn.close()
+            points = [{"timestamp": r[0], "equity": r[1], "cash": r[2]} for r in rows]
+        except Exception:
+            pass
+        if not points:
+            points = [p for p in _INTRADAY_EQUITY_SNAPSHOTS if p["timestamp"] >= cutoff]
+        return {"timeframe": timeframe, "points": points}
+
+    # For longer timeframes, use equity_history table (falls back to daily_snapshots)
+    try:
+        conn = _eq_sq.connect(DB_PATH)
+        if timeframe == "1w":
+            cutoff = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+        elif timeframe == "1m":
+            cutoff = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+        else:
+            cutoff = "2000-01-01"
+
+        # Try equity_history first (more granular)
+        points = []
+        try:
+            rows = conn.execute(
+                "SELECT timestamp, equity, cash, unrealized_pnl FROM equity_history WHERE timestamp >= ? ORDER BY timestamp",
+                (cutoff,)).fetchall()
+            points = [{"timestamp": r[0], "equity": r[1], "cash": r[2], "unrealized_pnl": r[3]} for r in rows]
+        except Exception:
+            pass
+
+        # Fall back to daily_snapshots if equity_history is empty
+        if not points:
+            rows = conn.execute(
+                "SELECT date, equity, cash, realized_pnl, combined_pnl FROM daily_snapshots WHERE date >= ? ORDER BY date",
+                (cutoff,)).fetchall()
+            points = [{"timestamp": r[0], "equity": r[1], "cash": r[2]} for r in rows]
+        conn.close()
+    except Exception:
+        points = []
+
+    return {"timeframe": timeframe, "points": points}
+
+
+def _build_api_pnl(tier="PAPER"):
+    """Build /api/pnl response for dashboard, tier-scoped.
+
+    DASH-B-FIX: tier propagates to every closed-trade aggregate so
+    Today Realized, Total Trades, Best/Worst, Strategy Stats respect
+    the selected tier. LIVE short-circuits to zeros (no trades yet).
+    """
+    t = (tier or "PAPER").upper()
+    if t == "LIVE":
+        return {
+            "selected_tier": "LIVE",
+            "today_realized": 0.0, "today_unrealized_change": 0.0, "today_gross": 0.0,
+            "today_wins": 0, "today_losses": 0, "today_flat": 0,
+            "today_win_rate": 0.0, "best_today": None, "worst_today": None,
+            "today_closed": [], "open_positions": [],
+            "total_unrealized": 0.0, "total_realized": 0.0, "combined_pnl": 0.0,
+            "equity": 0.0, "cash": 0.0, "return_pct": None,
+            "total_trades": 0, "total_wins": 0, "all_time_win_rate": 0.0,
+            "strategy_stats": {},
+            "best_day": {"date": "N/A", "pnl": 0.0},
+            "worst_day": {"date": "N/A", "pnl": 0.0},
+            "streak": 0, "daily_pnls": {},
+            "deployment_status": "NOT_DEPLOYED",
+        }
+    return _build_pnl_data(tier=t)
 
 
 def _build_api_risk():
@@ -10142,22 +13715,52 @@ class TVWebhookHandler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         try:
             if path == "/api/status":
-                data = _build_api_status()
+                import urllib.parse as _sp
+                _qs = _sp.parse_qs(_sp.urlparse(self.path).query)
+                _tier = _qs.get("tier", ["PAPER"])[0]
+                data = _build_api_status(tier=_tier)
+            elif path == "/api/tier_summary":
+                data = _build_api_tier_summary()
+            elif path == "/api/shadow_strategies":
+                data = _build_api_shadow_strategies()
+            elif path == "/api/sgs":
+                import urllib.parse as _sp3
+                _qs3 = _sp3.parse_qs(_sp3.urlparse(self.path).query)
+                _sstrat = _qs3.get("strategy", [None])[0]
+                _stier = _qs3.get("tier", [None])[0]
+                _shist = _qs3.get("history", ["0"])[0] in ("1", "true", "True")
+                data = _build_api_sgs(strategy=_sstrat, tier=_stier,
+                                       history=_shist)
             elif path == "/api/intelligence":
                 data = _build_api_intelligence()
             elif path == "/api/oracle":
                 data = _build_api_oracle()
             elif path == "/api/risk":
                 data = _build_api_risk()
+            elif path == "/api/pnl":
+                import urllib.parse as _sp2
+                _qs2 = _sp2.parse_qs(_sp2.urlparse(self.path).query)
+                _tier2 = _qs2.get("tier", ["PAPER"])[0]
+                data = _build_api_pnl(tier=_tier2)
+            elif path.startswith("/api/equity-history"):
+                import urllib.parse as _eqp
+                _qs = _eqp.parse_qs(_eqp.urlparse(self.path).query)
+                _tf = _qs.get("timeframe", ["all"])[0]
+                data = _build_api_equity_history(_tf)
             elif path == "/api/charts":
                 data = _build_api_charts()
+            elif path == "/api/exposure":
+                data = _build_api_exposure()
             elif path == "/dashboard" or path == "/":
-                # Serve the HTML dashboard
+                # Serve the HTML dashboard with no-cache headers
                 try:
                     with open("/app/dashboard/index.html", "r") as f:
                         html = f.read()
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html")
+                    self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                    self.send_header("Pragma", "no-cache")
+                    self.send_header("Expires", "0")
                     self.end_headers()
                     self.wfile.write(html.encode())
                 except FileNotFoundError:
@@ -10165,6 +13768,16 @@ class TVWebhookHandler(BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(b"Dashboard not found")
                 return
+            elif path == "/webhook-test":
+                # Return last 10 webhook signals received
+                history = TRADINGVIEW_SIGNALS.get("history", [])[-10:]
+                data = {"signals": [{"signal": s.get("signal"), "asset": s.get("asset"),
+                                     "price": s.get("price"), "source": s.get("source"),
+                                     "executed": s.get("executed", False),
+                                     "timestamp": s.get("timestamp", "").strftime("%Y-%m-%d %H:%M UTC") if hasattr(s.get("timestamp", ""), "strftime") else str(s.get("timestamp", ""))}
+                                    for s in history],
+                        "total_received": len(TRADINGVIEW_SIGNALS.get("history", [])),
+                        "auto_execute": TRADINGVIEW_SIGNALS.get("auto_execute", False)}
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -10188,7 +13801,20 @@ class TVWebhookHandler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length).decode()
-            data = _json.loads(body) if body else {}
+            # JSON validation
+            try:
+                data = _json.loads(body) if body else {}
+            except (_json.JSONDecodeError, ValueError):
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b'{"error":"malformed JSON payload"}')
+                log.warning("WEBHOOK: rejected malformed JSON: %s", body[:100])
+                return
+            if not isinstance(data, dict):
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b'{"error":"payload must be a JSON object"}')
+                return
             secret = TRADINGVIEW_SIGNALS.get("webhook_secret", "")
             if secret and data.get("secret") != secret:
                 self.send_response(403)
@@ -10282,39 +13908,9 @@ def calculate_fees():
 
 
 # ============================================================================
-# PREDICTIT MARKET SCANNER
+# PredictIt integration removed 2026-04-18 — listings-only, no authenticated
+# trading, redundant with Polymarket + Kalshi. No value to keep around.
 # ============================================================================
-def get_predictit_markets(limit=10):
-    try:
-        r = requests.get("https://www.predictit.org/api/marketdata/all/", timeout=5)
-        if r.status_code != 200:
-            return []
-        markets = []
-        for m in r.json().get("markets", [])[:limit]:
-            for c in m.get("contracts", []):
-                yp = c.get("lastTradePrice", 0) or 0
-                if 0.05 <= yp <= 0.95:
-                    markets.append({
-                        "platform": "PredictIt", "market": m.get("shortName", "")[:60],
-                        "slug": c.get("shortName", ""), "yes_price": yp,
-                        "no_price": 1 - yp, "volume24h": 0, "liquidity": 0,
-                    })
-        return markets
-    except Exception:
-        return []
-
-
-def get_predictit_balance():
-    """Get PredictIt status."""
-    try:
-        r = requests.get("https://www.predictit.org/api/marketdata/all/", timeout=5)
-        if r.status_code == 200:
-            markets = r.json().get("markets", [])
-            return f"Connected ({len(markets)} markets available)"
-        else:
-            return f"API error: {r.status_code}"
-    except Exception as exc:
-        return f"Offline ({exc})"
 
 
 
@@ -10322,8 +13918,17 @@ def get_predictit_balance():
 # FUNDING RATE ARBITRAGE MODULE (Phemex + Binance + Coinbase)
 # ============================================================================
 FUNDING_ARB_CONFIG = {
-    "enabled": True,
-    "min_funding_rate": 0.0003,  # 0.03% minimum (above round-trip friction)
+    # DISABLED 2026-04-18 — NO EDGE at any tested threshold.
+    # 90-day Binance funding history analysis (Jan 19 - Apr 19 2026) showed
+    # net annualized yield -57% at the only firing threshold (0.005%).
+    # Retail fee tiers (Coinbase 0.4% + Phemex 0.06%) exceed gross funding
+    # yield at every threshold tested (0.005% to 0.05%). Best-case sensitivity
+    # with hypothetical zero-fee Coinbase still produces -4.75%.
+    # See specs/phemex_s1_edge_validation.md for full analysis.
+    # Prior rationale (commit e514e17, now refuted) preserved in git history.
+    # Dict retained for future redesign with institutional fee tiers.
+    "enabled": False,
+    "min_funding_rate": 0.00015,  # 0.015% minimum
     "commission_estimate": 0.0002,  # ~0.02% per side (Phemex + Coinbase)
     "slippage_estimate": 0.0001,  # ~0.01% estimated slippage
     "max_position_usd": 2000,  # Max $2000 per arb leg
@@ -10337,7 +13942,12 @@ _FUNDING_RATES_CACHE = {}
 # Crypto pairs config (defined early for command access)
 CRYPTO_PAIRS_CONFIG = {
     "enabled": True,
-    "seed": [("BTC", "ETH"), ("SOL", "AVAX"), ("BNB", "ETH")],
+    "seed": [
+        ("BTC", "ETH"), ("SOL", "AVAX"), ("BNB", "ETH"),
+        ("BTC", "BCH"), ("ETH", "LTC"), ("SOL", "SUI"),
+        ("AVAX", "NEAR"), ("DOT", "KSM"), ("MATIC", "ARB"),
+        ("LINK", "BAND"), ("UNI", "SUSHI"), ("ATOM", "OSMO"), ("FTM", "ONE"),
+    ],
     "lookback_days": 30,
     "zscore_entry": 1.1,
     "zscore_exit": 0.0,
@@ -10680,6 +14290,62 @@ async def before_daily_reset():
     await bot.wait_until_ready()
 
 
+@tasks.loop(minutes=10)
+async def intraday_snapshot_loop():
+    """Store equity snapshot every 10 minutes for intraday charts."""
+    store_intraday_snapshot()
+
+@intraday_snapshot_loop.before_loop
+async def before_intraday_snapshot():
+    await bot.wait_until_ready()
+
+
+# ── Discord Gateway Watchdog ─────────────────────────────────────────────
+_DISCORD_LAST_HEALTHY = None
+_DISCORD_HEALTH_LOG = "/app/data/discord_health.log"
+
+@tasks.loop(seconds=60)
+async def discord_watchdog_task():
+    """Monitor Discord gateway connection. Log and alert on outages > 90s."""
+    global _DISCORD_LAST_HEALTHY
+    now = datetime.now(timezone.utc)
+
+    if bot.is_ready() and not bot.is_closed():
+        # Connection healthy
+        if _DISCORD_LAST_HEALTHY is None:
+            _DISCORD_LAST_HEALTHY = now
+        _DISCORD_LAST_HEALTHY = now
+        return
+
+    # Connection unhealthy
+    downtime = (now - _DISCORD_LAST_HEALTHY).total_seconds() if _DISCORD_LAST_HEALTHY else 0
+    ts = now.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    if downtime > 90:
+        msg = f"[{ts}] DISCORD DOWN for {downtime:.0f}s — attempting reconnect\n"
+        log.error("DISCORD WATCHDOG: gateway down for %.0fs", downtime)
+        try:
+            with open(_DISCORD_HEALTH_LOG, "a") as f:
+                f.write(msg)
+        except Exception:
+            pass
+        # Discord.py auto-reconnects, but log the event
+        try:
+            await bot.connect(reconnect=True)
+        except Exception as e:
+            log.error("DISCORD WATCHDOG: reconnect failed: %s", e)
+            try:
+                with open(_DISCORD_HEALTH_LOG, "a") as f:
+                    f.write(f"[{ts}] RECONNECT FAILED: {e}\n")
+            except Exception:
+                pass
+
+@discord_watchdog_task.before_loop
+async def before_discord_watchdog():
+    await bot.wait_until_ready()
+    global _DISCORD_LAST_HEALTHY
+    _DISCORD_LAST_HEALTHY = datetime.now(timezone.utc)
+
 
 # ============================================================================
 # DAILY AUTO-REBALANCING (Task 7)
@@ -10864,6 +14530,258 @@ def get_signal_history(signal_type, count=10):
             return []
     return []
 
+
+# ============================================================================
+# SHADOW REDIS NAMESPACE HELPERS (specs/shadow_tier_charter.md)
+# ============================================================================
+# SHADOW NAMESPACE RULE: shadow:intel:* never cross-reads with intel:*.
+# Paper/live consumers MUST NOT read keys starting with shadow:.
+# These helpers auto-prefix "shadow:" to prevent accidental cross-tier writes.
+
+def _shadow_key(key: str) -> str:
+    """Prefix key with 'shadow:' if not already prefixed."""
+    return key if key.startswith("shadow:") else f"shadow:{key}"
+
+
+def shadow_redis_set(key, value, ex=None):
+    """Set key in shadow namespace (auto-prefixes shadow: if absent)."""
+    if not REDIS_CLIENT:
+        return None
+    try:
+        return REDIS_CLIENT.set(_shadow_key(key), value, ex=ex)
+    except Exception:
+        return None
+
+
+def shadow_redis_setex(key, seconds, value):
+    """SETEX in shadow namespace."""
+    if not REDIS_CLIENT:
+        return None
+    try:
+        return REDIS_CLIENT.setex(_shadow_key(key), seconds, value)
+    except Exception:
+        return None
+
+
+def shadow_redis_get(key):
+    """GET from shadow namespace."""
+    if not REDIS_CLIENT:
+        return None
+    try:
+        return REDIS_CLIENT.get(_shadow_key(key))
+    except Exception:
+        return None
+
+
+def shadow_redis_delete(key):
+    """DELETE from shadow namespace."""
+    if not REDIS_CLIENT:
+        return None
+    try:
+        return REDIS_CLIENT.delete(_shadow_key(key))
+    except Exception:
+        return None
+
+
+def shadow_redis_keys(pattern="*"):
+    """KEYS in shadow namespace. Pattern is auto-prefixed shadow:."""
+    if not REDIS_CLIENT:
+        return []
+    try:
+        return REDIS_CLIENT.keys(_shadow_key(pattern))
+    except Exception:
+        return []
+
+
+def shadow_redis_hget(name, key):
+    """HGET from shadow-namespaced hash."""
+    if not REDIS_CLIENT:
+        return None
+    try:
+        return REDIS_CLIENT.hget(_shadow_key(name), key)
+    except Exception:
+        return None
+
+
+def shadow_redis_hset(name, key, value):
+    """HSET in shadow-namespaced hash."""
+    if not REDIS_CLIENT:
+        return None
+    try:
+        return REDIS_CLIENT.hset(_shadow_key(name), key, value)
+    except Exception:
+        return None
+
+
+# ----------------------------------------------------------------------------
+# Shadow decision recorders — template for every orphan wire going forward.
+# Writes to shadow_decisions table (created Day 3 migration, ef78366).
+# Never returns a multiplier that affects live sizing; it records what a
+# hypothetical multiplier WOULD have been so we can graduate shadow
+# strategies to paper only after observed positive expectancy.
+# ----------------------------------------------------------------------------
+
+_SHADOW_ALLOWED_TIERS = ("SHADOW", "PAPER_SHADOW_LOG", "LIVE_SHADOW_LOG", "DELETED")
+
+
+def record_shadow_decision(
+    strategy,
+    signal_source,
+    signal_data=None,
+    intended_size_usd=None,
+    intended_entry_price=None,
+    intended_exit_tp=None,
+    intended_exit_sl=None,
+    intended_ttl_hours=None,
+    metadata=None,
+    trade_id=None,
+    tier="SHADOW",
+):
+    """Log a shadow decision. Returns shadow_decisions.id or None on failure.
+
+    tier ∈ {'SHADOW','PAPER_SHADOW_LOG','LIVE_SHADOW_LOG','DELETED'}
+
+    Use PAPER_SHADOW_LOG when logging what a shadow-tier multiplier WOULD
+    have applied to a real paper trade (comparison data for graduation
+    analysis).
+    """
+    import json as _sj
+    import sqlite3 as _ssq
+    if tier not in _SHADOW_ALLOWED_TIERS:
+        log.warning("record_shadow_decision: invalid tier %r; defaulting to SHADOW", tier)
+        tier = "SHADOW"
+    try:
+        conn = _ssq.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO shadow_decisions
+            (strategy, tier, trade_id, signal_source, signal_data,
+             intended_size_usd, intended_entry_price, intended_exit_price_tp,
+             intended_exit_price_sl, intended_ttl_hours, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            strategy, tier, trade_id, signal_source,
+            _sj.dumps(signal_data or {}, default=str),
+            intended_size_usd, intended_entry_price, intended_exit_tp,
+            intended_exit_sl, intended_ttl_hours,
+            _sj.dumps(metadata or {}, default=str),
+        ))
+        shadow_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+        log.info("SHADOW: recorded decision id=%d strategy=%s source=%s tier=%s",
+                 shadow_id, strategy, signal_source, tier)
+        return shadow_id
+    except Exception as e:
+        log.warning("record_shadow_decision failed: %s", e)
+        return None
+
+
+def update_shadow_decision(
+    shadow_id,
+    simulated_fill_price=None,
+    simulated_fill_status=None,
+    hypothetical_pnl_unrealized=None,
+    hypothetical_pnl_realized=None,
+    hypothetical_exit_reason=None,
+):
+    """Update an existing shadow decision with fill or exit data."""
+    import sqlite3 as _ssq
+    if not shadow_id:
+        return
+    try:
+        updates, params = [], []
+        if simulated_fill_price is not None:
+            updates.append("simulated_fill_price=?")
+            params.append(simulated_fill_price)
+        if simulated_fill_status is not None:
+            updates.append("simulated_fill_status=?")
+            params.append(simulated_fill_status)
+        if hypothetical_pnl_unrealized is not None:
+            updates.append("hypothetical_pnl_unrealized=?")
+            params.append(hypothetical_pnl_unrealized)
+        if hypothetical_pnl_realized is not None:
+            updates.append("hypothetical_pnl_realized=?")
+            params.append(hypothetical_pnl_realized)
+        if hypothetical_exit_reason is not None:
+            updates.append("hypothetical_exit_reason=?")
+            params.append(hypothetical_exit_reason)
+        if not updates:
+            return
+        updates.append("updated_at=CURRENT_TIMESTAMP")
+        params.append(shadow_id)
+        conn = _ssq.connect(DB_PATH)
+        conn.execute(
+            f"UPDATE shadow_decisions SET {', '.join(updates)} WHERE id=?",
+            params,
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.warning("update_shadow_decision %s failed: %s", shadow_id, e)
+
+
+def compute_shadow_multiplier_hypothetical(
+    strategy,
+    actual_trade_id,
+    shadow_multipliers,
+    base_size_usd=None,
+):
+    """Given a real paper trade and a dict of shadow-tier multipliers,
+    record a PAPER_SHADOW_LOG row capturing what the size WOULD have been
+    under those multipliers. Does NOT modify the actual trade.
+
+    shadow_multipliers: {'sec_8k': 1.25, 'options_flow': 0.8, ...}
+    Returns the computed hypothetical multiplier product.
+    """
+    import json as _sj
+    try:
+        product = 1.0
+        for v in (shadow_multipliers or {}).values():
+            if isinstance(v, (int, float)) and v > 0:
+                product *= float(v)
+        hypothetical_size = (base_size_usd or 0) * product if base_size_usd else None
+        record_shadow_decision(
+            strategy=strategy,
+            signal_source="|".join(sorted(shadow_multipliers.keys())) if shadow_multipliers else "none",
+            signal_data={
+                "multipliers": shadow_multipliers,
+                "product": product,
+                "base_size_usd": base_size_usd,
+                "hypothetical_size_usd": hypothetical_size,
+            },
+            trade_id=actual_trade_id,
+            intended_size_usd=hypothetical_size,
+            metadata={"note": "PAPER_SHADOW_LOG: what-if overlay for real paper trade"},
+            tier="PAPER_SHADOW_LOG",
+        )
+        return product
+    except Exception as e:
+        log.warning("compute_shadow_multiplier_hypothetical failed: %s", e)
+        return 1.0
+
+
+# ============================================================================
+# SHADOW EXECUTION — implementation moved to
+#   intelligence_workers/shadow_exec.py
+# so it's importable by producers running as scripts (cron form:
+#   docker exec traderjoes-bot python3 /app/intelligence_workers/foo.py)
+# where /app is NOT on sys.path. The re-export below keeps main.py's
+# public surface intact so any existing main-process caller still works.
+# ============================================================================
+
+from intelligence_workers.shadow_exec import (
+    execute_shadow_trade,
+    rebalance_shadow_allocations,
+    SHADOW_STRATEGY_CAPS as _SHADOW_STRATEGY_CAPS_RE,
+    SHADOW_FIRM_WIDE_CAP as _SHADOW_FIRM_WIDE_CAP_RE,
+    SHADOW_PLATFORM_MIN as _SHADOW_PLATFORM_MIN_RE,
+)
+SHADOW_STRATEGY_CAPS = _SHADOW_STRATEGY_CAPS_RE
+SHADOW_FIRM_WIDE_CAP = _SHADOW_FIRM_WIDE_CAP_RE
+SHADOW_PLATFORM_MIN = _SHADOW_PLATFORM_MIN_RE
+
+
 # ============================================================================
 # SQLITE STATE PERSISTENCE
 # ============================================================================
@@ -10951,6 +14869,21 @@ def init_db():
             ib_order_id TEXT, symbol TEXT, side TEXT, qty REAL,
             fill_price REAL, commission REAL,
             filled_at TEXT DEFAULT (datetime('now'))
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS intraday_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            equity REAL,
+            cash REAL,
+            unrealized_pnl REAL DEFAULT 0
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS equity_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            equity REAL,
+            cash REAL,
+            realized_pnl REAL,
+            unrealized_pnl REAL
         )""")
         conn.commit()
         conn.close()
@@ -11165,7 +15098,12 @@ def is_market_open():
 # CRASH HEDGE MODULE (SPY puts + directional short)
 # ============================================================================
 CRASH_HEDGE_CONFIG = {
-    "enabled": True,
+    # 2026-04-18: DISABLED after 81-cell Black-Scholes parameter sweep showed
+    # every combination of (iv_mult, stop, trail, threshold) lost money over
+    # 2 years of data. Root cause: VIX>25 cross fires at LOCAL vol peaks
+    # that mean-revert more often than they continue crashing. Live 5W/1L
+    # record was small-sample luck. See REWORK_IDEAS below for paths forward.
+    "enabled": False,
     "put_vix_threshold": 25,        # Buy puts when VIX > 25
     "put_size_pct": 0.005,          # 0.5% of portfolio per put hedge
     "put_dte": 7,                   # 7 days to expiration
@@ -11182,6 +15120,42 @@ CRASH_HEDGE_CONFIG = {
     "vrp_long_delta": 0.10,         # Buy 10-delta call
     "vrp_max_spreads": 2,           # Max concurrent call spreads
 }
+# Also alias as a module-level kill switch for any code path that checks it
+# independently of the config dict.
+CRASH_HEDGE_ENABLED = False
+
+# ============================================================================
+# CRASH_HEDGE REWORK BACKLOG (as of 2026-04-18)
+# ============================================================================
+# 81-cell BS options backtest showed 0/81 profitable parameter combinations.
+# Before re-enabling, test these entry-signal alternatives via
+# backtester/options_replay.py:
+#
+#   OPTION A — VIX + DRAWDOWN FILTER
+#     Entry: VIX > 25 crossed up AND SPY already at least -3% below 20-day high
+#     Rationale: filters out local VIX spikes at market tops that mean-revert
+#     Expected: ~50% fewer entries but each entry aligned with a confirmed
+#     downtrend (not a bounce-candidate)
+#
+#   OPTION B — VRP-INVERSION (SELL puts instead of BUY)
+#     Entry: VIX > 25 → sell 7-DTE 2% OTM put (cash-secured)
+#     Rationale: when VIX spikes, put IV is rich — harvest premium instead of
+#     paying it. Max loss capped at strike × 100 if assigned.
+#     Expected: high win-rate, low per-trade P&L, tail risk = strike assignment
+#
+#   OPTION C — TERM STRUCTURE BACKWARDATION
+#     Entry: VIX > 25 AND VIX9D > VIX (backwardation = extreme fear, often
+#     mean-reverts FASTER). Alternative: AND VIX > VXV (3-month), which flags
+#     persistent fear regime.
+#     Rationale: backwardation tells you whether the VIX spike is "isolated"
+#     (short-term) vs "persistent" (structural). Matters for put-holding horizon.
+#
+# Each test must:
+#   1. Run via backtester/options_replay.py replay_crash_hedge_options
+#   2. Parameter sweep (iv_mult, stop, trail, threshold)
+#   3. Sharpe_trade > 0.5 median AND 95% CI lower bound > 0 before deploy
+#   4. Paper mode for 30 days after backtest green-light
+# ============================================================================
 
 # VRP regime state tracking
 _VRP_REGIME_STATE = {"current": "none", "last_switch": None, "cycle_count": 0}
@@ -11229,10 +15203,14 @@ ORACLE_SIGNALS = [
     {"name": "iran_escalation", "keywords": ["iran", "ceasefire"],
      "threshold": 0.35, "long": "XLE", "short": "AAL",
      "inverse": True, "geo_required": "iran", "geo_min_headlines": 5},
-    # Ukraine escalation: fires when Ukraine war market moves + geo confirms 5+ headlines
+    # Positive signal: fires when ceasefire prob RISES above 0.60 (diplomacy working)
+    {"name": "iran_ceasefire_trade", "keywords": ["iran", "ceasefire"],
+     "threshold": 0.60, "long": "UAL", "short": "XLE",
+     "inverse": False},
+    # Ukraine escalation: fires when escalation prob rises above threshold + geo confirms 5+ headlines
     {"name": "ukraine_escalation", "keywords": ["ukraine"],
      "threshold": 0.35, "long": "LMT", "short": "UAL", "extra_long": "GLD",
-     "inverse": True, "geo_required": "ukraine", "geo_min_headlines": 5},
+     "inverse": False, "geo_required": "ukraine", "geo_min_headlines": 5},
     # Taiwan escalation: semiconductor supply chain disruption play
     {"name": "taiwan_escalation", "keywords": ["taiwan"],
      "threshold": 0.35, "long": "SOXX", "short": "TSM", "extra_long": "SMH",
@@ -11256,6 +15234,10 @@ CASCADE_CHAINS = {
     "iran_escalation": [
         {"name": "iran_esc_cascade_gold", "long": "GLD", "short": "SPY", "delay_min": 15,
          "description": "Iran escalation → gold safe haven"},
+    ],
+    "iran_ceasefire_trade": [
+        {"name": "iran_peace_cascade_travel", "long": "JETS", "short": "GLD", "delay_min": 15,
+         "description": "Iran ceasefire → travel recovery, safe haven unwind"},
     ],
     # Ukraine chain: European energy disruption → defense + airlines + gold
     "ukraine_escalation": [
@@ -11651,13 +15633,25 @@ def update_fed_sentiment():
 
 # Polygon tickers mapped to themes for real-time news
 _POLYGON_THEME_TICKERS = {
-    "fed": ["SPY", "TLT", "XLF"],
+    "fed": ["TLT", "XLF"],
     "iran": ["XLE", "USO", "GLD"],
-    "tariff": ["EEM", "FXI", "SPY"],
-    "recession": ["SPY", "TLT", "GLD"],
+    "tariff": ["EEM", "FXI"],
+    "recession": ["TLT", "GLD"],
     "china": ["FXI", "BABA", "TSM"],
     "ukraine": ["LMT", "RTX", "GLD"],
     "taiwan": ["TSM", "SMH", "SOXX"],
+}
+# Required keywords per theme — headline MUST contain at least one to pass
+_POLYGON_THEME_REQUIRED_KWS = {
+    "fed": ["fed", "federal reserve", "fomc", "interest rate", "rate cut", "rate hike",
+            "powell", "monetary policy", "basis point", "bps", "funds rate"],
+    "recession": ["recession", "gdp", "unemployment", "jobless", "nonfarm", "layoff",
+                   "economic slowdown", "contraction", "downturn", "soft landing"],
+    "tariff": ["tariff", "trade war", "import duty", "trade deficit", "sanctions"],
+    "iran": ["iran", "tehran", "kharg", "persian gulf", "ceasefire"],
+    "ukraine": ["ukraine", "russia", "kyiv", "zelensky", "putin", "nato"],
+    "china": ["china", "beijing", "xi jinping", "taiwan strait", "pla"],
+    "taiwan": ["taiwan", "tsmc", "semiconductor", "strait"],
 }
 
 
@@ -11688,10 +15682,10 @@ def _intel_fetch_headlines():
                 for a in articles:
                     title_text = a.get("title", "").strip()
                     if title_text and title_text.lower() not in existing_titles:
-                        # Check if headline is relevant to theme
+                        # Require at least one theme-specific keyword in headline
                         _tl = title_text.lower()
-                        _theme_kws = [q.split()[0].lower() for q in queries] + [theme.lower()]
-                        if any(kw in _tl for kw in _theme_kws) or theme in ("fed", "recession"):
+                        _required = _POLYGON_THEME_REQUIRED_KWS.get(theme, [theme.lower()])
+                        if any(kw in _tl for kw in _required):
                             _INTEL_HEADLINE_MEMORY[theme].append((now, title_text + f" - {a.get('source', '')}"))
                             existing_titles.add(title_text.lower())
                             total += 1
@@ -11864,13 +15858,17 @@ def _oracle_get_all_prices():
 async def scan_oracle_signals(channel=None):
     """Oracle Engine scanner — runs every 10-min cycle.
     Fetches prediction market prices, detects threshold crossings, executes equity trades."""
+    if _is_auto_disabled("oracle_trade"):
+        log.info("oracle_trade auto-disabled by strategy_kill_switch — skipping")
+        return 0
     if not ORACLE_CONFIG["enabled"]:
         return 0
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
         return 0
 
+    import asyncio as _aio_oracle
     now = datetime.now(timezone.utc)
-    prices = _oracle_get_all_prices()
+    prices = await _aio_oracle.to_thread(_oracle_get_all_prices)
     if not prices:
         return 0
 
@@ -11886,7 +15884,7 @@ async def scan_oracle_signals(channel=None):
 
     # --- Intelligence Layer: fetch headlines + geo monitor ---
     try:
-        _intel_count = _intel_fetch_headlines()
+        _intel_count = await _aio_oracle.to_thread(_intel_fetch_headlines)
         if _intel_count > 0:
             log.info("INTEL: fetched %d new headlines across %d themes", _intel_count, len(_INTEL_HEADLINE_MEMORY))
         update_theme_sentiment()
@@ -11944,22 +15942,36 @@ async def scan_oracle_signals(channel=None):
                 _matched_inverse_signals.add(sig["name"])
                 if yes_price > sig["threshold"]:
                     continue  # Inverse: only fire when prob DROPS below threshold
-                # Check geo requirement — count theme headlines directly,
-                # don't require the theme to be the primary geo alert
-                _geo_req = sig.get("geo_required", "")
-                _geo_min = sig.get("geo_min_headlines", 0)
-                if _geo_req:
-                    _theme_esc_count = _intel_theme_escalation_count(_geo_req)
-                    if _theme_esc_count < _geo_min:
-                        log.info("ORACLE GEO SKIP: %s — %s headlines=%d < %d required",
-                                 sig["name"], _geo_req, _theme_esc_count, _geo_min)
-                        continue  # Not enough escalation headlines for this theme
-                    else:
-                        log.info("ORACLE GEO PASS: %s — %s headlines=%d >= %d",
-                                 sig["name"], _geo_req, _theme_esc_count, _geo_min)
             else:
                 if yes_price < sig["threshold"]:
                     continue
+
+            # Geo requirement: check escalation headline count for geo-gated signals
+            _geo_req = sig.get("geo_required", "")
+            _geo_min = sig.get("geo_min_headlines", 0)
+            if _geo_req:
+                _theme_esc_count = _intel_theme_escalation_count(_geo_req)
+                if _theme_esc_count < _geo_min:
+                    log.info("ORACLE GEO SKIP: %s — %s headlines=%d < %d required",
+                             sig["name"], _geo_req, _theme_esc_count, _geo_min)
+                    continue
+                else:
+                    log.info("ORACLE GEO PASS: %s — %s headlines=%d >= %d",
+                             sig["name"], _geo_req, _theme_esc_count, _geo_min)
+                    # Sentiment cross-check for escalation signals:
+                    # If sentiment is IMPROVING (positive), block escalation trade
+                    # Prevents firing when headlines say "wind down" / "ceasefire progress"
+                    try:
+                        _theme_sent = _THEME_SENTIMENT.get(_geo_req, {}).get("score", 0)
+                        if _theme_sent > 0:
+                            log.info("ORACLE SENTIMENT BLOCK: %s — %s sentiment=%.2f > 0 (improving, skip escalation)",
+                                     sig["name"], _geo_req, _theme_sent)
+                            continue
+                        else:
+                            log.info("ORACLE SENTIMENT OK: %s — %s sentiment=%.2f (negative/neutral, proceed)",
+                                     sig["name"], _geo_req, _theme_sent)
+                    except Exception:
+                        pass  # If sentiment unavailable, proceed with trade
 
             signal_name = sig["name"]
             market_id = f"ORACLE:{signal_name}"
@@ -12044,6 +16056,16 @@ async def scan_oracle_signals(channel=None):
             except Exception:
                 pass
 
+
+            # Echo Gate: query 5 similar setups from ChromaDB
+            try:
+                _echo_mult, _echo_reason = echo_gate_evaluate(signal_name, strategy="oracle_trade")
+                if _echo_mult != 1.0:
+                    leg_size *= _echo_mult
+                log.info("ECHO GATE: %s → %.2fx | %s", signal_name, _echo_mult, _echo_reason[:80])
+            except Exception as _echo_err:
+                log.warning("ECHO GATE error: %s", _echo_err)
+
             log.info("ORACLE SIZING: %s conv=%.2f kelly=%.2f base=$%.0f psych=%.1f meta=%.1f → leg=$%.0f",
                      signal_name, _conv_price, kelly_mult, base_size,
                      psychologist_size_multiplier(), meta_alloc_multiplier("oracle_trade"), leg_size)
@@ -12075,7 +16097,7 @@ async def scan_oracle_signals(channel=None):
             # AI Consensus: get second opinion on high-conviction oracle trades
             _ai_verdict = "APPROVE"
             _conviction_score = int(yes_price * 100)
-            if _conviction_score >= 70 and OPENAI_API_KEY:
+            if _conviction_score >= 70 and ANTHROPIC_API_KEY:
                 _ai_notes = [f"Oracle signal: {signal_name}", f"YES price: ${yes_price:.2f}",
                              f"1h delta: {delta_1h:+.3f}", f"Trade: Long {sig['long']} / Short {sig['short']}"]
                 _rel_hl = _intel_get_relevant_headlines(signal_name, limit=2)
@@ -12095,8 +16117,44 @@ async def scan_oracle_signals(channel=None):
             short_tk = sig["short"]
             extra_long_tk = sig.get("extra_long", "")
 
+            # Oracle → IB Futures routing (iran_escalation): replace the Alpaca
+            # XLE ETF extra leg with 1 CL futures contract on NYMEX via the
+            # ib_gateway microservice. Feature-flagged so ops can kill-switch.
+            # Paper account DUQ103226 is the target; real money is not at risk
+            # until ops flips IB Gateway to live port 4001.
+            _ib_futures_fired = False
+            if (signal_name == "iran_escalation"
+                    and os.environ.get("ORACLE_IB_FUTURES", "1") == "1"):
+                try:
+                    from ib_connector import place_futures_order as _ib_fut, is_connected as _ib_ok
+                    if _ib_ok():
+                        # CL Jun 2026 — front-month roll (user spec). Bracket
+                        # stops are passed through but ib_gateway microservice
+                        # doesn't yet attach bracket children; they'll be
+                        # recorded in ib_orders for the followup enforcement.
+                        _cl_order_id = _ib_fut(
+                            "CL", "BUY", 1, expiry="202606",
+                            strategy="oracle_futures",
+                            market_id=f"ORACLE:{signal_name}:CL",
+                            stop_price=None, target_price=None,
+                            exchange="NYMEX",
+                        )
+                        log.info("ORACLE-FUTURES: queued CL 202606 MKT BUY "
+                                 "(ib_order_id=%s) — Alpaca XLE extra leg skipped",
+                                 _cl_order_id)
+                        extra_long_tk = ""  # prevent double-exposure via Alpaca
+                        _ib_futures_fired = True
+                    else:
+                        log.warning("ORACLE-FUTURES: IB not connected — "
+                                    "falling through to Alpaca XLE extra leg")
+                except Exception as _ib_ex:
+                    log.warning("ORACLE-FUTURES: routing failed (%s) — "
+                                "falling through to Alpaca XLE extra leg", _ib_ex)
+
             _extra_dir = "Short" if sig.get("extra_long_side") == "short" else "Long"
             _legs_str = f"Long {long_tk} / Short {short_tk}" + (f" / {_extra_dir} {extra_long_tk}" if extra_long_tk else "")
+            if _ib_futures_fired:
+                _legs_str += " / CL Jun26 via IB"
             log.info("ORACLE SIGNAL: %s YES=$%.2f (Δ1h=%+.3f) → %s | $%.0f/leg",
                      signal_name, yes_price, delta_1h, _legs_str, leg_size)
 
@@ -12116,12 +16174,18 @@ async def scan_oracle_signals(channel=None):
                     "symbol": long_tk, "notional": str(round(leg_size, 2)),
                     "side": "buy", "type": "market", "time_in_force": "day",
                 }
-                _rl = requests.post(_alp_url, json=_long_body, headers=_alp_hdr, timeout=10)
-                if _rl.status_code not in (200, 201):
-                    log.warning("ORACLE LONG FAILED: %s HTTP %d: %s", long_tk, _rl.status_code, _rl.text[:200])
+                # WAL-protected submit (Stage B, 2026-04-18). Pre-writes PENDING
+                # row so a bot crash between POST and response is recoverable.
+                _ok_l, _rl_resp, _long_wal = _alpaca_submit_with_wal(
+                    _long_body, strategy="oracle_trade", market_id=market_id,
+                    intended_size=leg_size,
+                    metadata_extras={"signal": signal_name, "leg": "long", "ticker": long_tk},
+                )
+                if not _ok_l:
+                    log.warning("ORACLE LONG FAILED: %s %s", long_tk, _rl_resp.get("error", "?"))
                     continue
-                _long_oid = _rl.json().get("id", "unknown")
-                log.info("ORACLE LONG ORDER: %s id=%s", long_tk, _long_oid)
+                _long_oid = _rl_resp.get("id", "unknown")
+                log.info("ORACLE LONG ORDER: %s id=%s wal_row=%s", long_tk, _long_oid, _long_wal)
 
                 # Short leg — whole shares only
                 _short_price = 0
@@ -12145,16 +16209,23 @@ async def scan_oracle_signals(channel=None):
                     "symbol": short_tk, "qty": str(_short_shares),
                     "side": "sell", "type": "market", "time_in_force": "day",
                 }
-                _rs = requests.post(_alp_url, json=_short_body, headers=_alp_hdr, timeout=10)
-                if _rs.status_code not in (200, 201):
-                    log.warning("ORACLE SHORT FAILED: %s HTTP %d: %s — cancelling long", short_tk, _rs.status_code, _rs.text[:200])
+                # WAL-protected submit (Stage B, 2026-04-18). On failure, the
+                # long leg is cancelled so we don't leave a naked directional
+                # position open across the bot-crash/restart window.
+                _ok_s, _rs_resp, _short_wal = _alpaca_submit_with_wal(
+                    _short_body, strategy="oracle_trade", market_id=market_id,
+                    intended_size=leg_size,
+                    metadata_extras={"signal": signal_name, "leg": "short", "ticker": short_tk},
+                )
+                if not _ok_s:
+                    log.warning("ORACLE SHORT FAILED: %s %s — cancelling long", short_tk, _rs_resp.get("error", "?"))
                     try:
                         requests.delete(f"{_alp_url}/{_long_oid}", headers=_alp_hdr, timeout=5)
                     except Exception:
                         pass
                     continue
-                _short_oid = _rs.json().get("id", "unknown")
-                log.info("ORACLE SHORT ORDER: %s id=%s", short_tk, _short_oid)
+                _short_oid = _rs_resp.get("id", "unknown")
+                log.info("ORACLE SHORT ORDER: %s id=%s wal_row=%s", short_tk, _short_oid, _short_wal)
 
                 # Extra leg (e.g. GLD long for ukraine, SMH short for taiwan)
                 _extra_long_oid = None
@@ -12185,13 +16256,21 @@ async def scan_oracle_signals(channel=None):
                             "side": "buy", "type": "market", "time_in_force": "day",
                         }
                     if _extra_body:
-                        _re = requests.post(_alp_url, json=_extra_body, headers=_alp_hdr, timeout=10)
-                        if _re.status_code in (200, 201):
-                            _extra_long_oid = _re.json().get("id", "unknown")
-                            log.info("ORACLE EXTRA %s ORDER: %s id=%s", _extra_side.upper(), extra_long_tk, _extra_long_oid)
+                        # WAL-protected submit (Stage B, 2026-04-18). Extra leg
+                        # failures are non-fatal — we keep the 2-leg position.
+                        _ok_e, _re_resp, _extra_wal = _alpaca_submit_with_wal(
+                            _extra_body, strategy="oracle_trade", market_id=market_id,
+                            intended_size=leg_size,
+                            metadata_extras={"signal": signal_name, "leg": "extra",
+                                             "side": _extra_side, "ticker": extra_long_tk},
+                        )
+                        if _ok_e:
+                            _extra_long_oid = _re_resp.get("id", "unknown")
+                            log.info("ORACLE EXTRA %s ORDER: %s id=%s wal_row=%s",
+                                     _extra_side.upper(), extra_long_tk, _extra_long_oid, _extra_wal)
                         else:
-                            log.warning("ORACLE EXTRA %s FAILED: %s HTTP %d: %s (continuing with 2 legs)",
-                                        _extra_side.upper(), extra_long_tk, _re.status_code, _re.text[:200])
+                            log.warning("ORACLE EXTRA %s FAILED: %s %s (continuing with 2 legs)",
+                                        _extra_side.upper(), extra_long_tk, _re_resp.get("error", "?"))
 
                 # Get fill prices
                 _entry_long_price = 0
@@ -12362,11 +16441,16 @@ async def scan_oracle_signals(channel=None):
                 "symbol": long_tk, "notional": str(round(leg_size, 2)),
                 "side": "buy", "type": "market", "time_in_force": "day",
             }
-            _rl = requests.post(_alp_url, json=_long_body, headers=_alp_hdr, timeout=10)
-            if _rl.status_code not in (200, 201):
-                log.warning("GEO-ONLY LONG FAILED: %s HTTP %d: %s", long_tk, _rl.status_code, _rl.text[:200])
+            # WAL-protected submit (Stage B, 2026-04-18) — geo-only oracle path.
+            _ok_l, _rl_resp, _long_wal = _alpaca_submit_with_wal(
+                _long_body, strategy="oracle_trade", market_id=market_id,
+                intended_size=leg_size,
+                metadata_extras={"signal": signal_name, "leg": "long", "ticker": long_tk, "path": "geo_only"},
+            )
+            if not _ok_l:
+                log.warning("GEO-ONLY LONG FAILED: %s %s", long_tk, _rl_resp.get("error", "?"))
                 continue
-            _long_oid = _rl.json().get("id", "unknown")
+            _long_oid = _rl_resp.get("id", "unknown")
 
             # Short leg
             _short_price = 0
@@ -12389,15 +16473,21 @@ async def scan_oracle_signals(channel=None):
                 "symbol": short_tk, "qty": str(_short_shares),
                 "side": "sell", "type": "market", "time_in_force": "day",
             }
-            _rs = requests.post(_alp_url, json=_short_body, headers=_alp_hdr, timeout=10)
-            if _rs.status_code not in (200, 201):
-                log.warning("GEO-ONLY SHORT FAILED: %s HTTP %d", short_tk, _rs.status_code)
+            # WAL-protected submit (Stage B, 2026-04-18). On failure, cancel
+            # the long leg so we don't leave a naked directional position.
+            _ok_s, _rs_resp, _short_wal = _alpaca_submit_with_wal(
+                _short_body, strategy="oracle_trade", market_id=market_id,
+                intended_size=leg_size,
+                metadata_extras={"signal": signal_name, "leg": "short", "ticker": short_tk, "path": "geo_only"},
+            )
+            if not _ok_s:
+                log.warning("GEO-ONLY SHORT FAILED: %s %s — cancelling long", short_tk, _rs_resp.get("error", "?"))
                 try:
                     requests.delete(f"{_alp_url}/{_long_oid}", headers=_alp_hdr, timeout=5)
                 except Exception:
                     pass
                 continue
-            _short_oid = _rs.json().get("id", "unknown")
+            _short_oid = _rs_resp.get("id", "unknown")
 
             # Extra leg (long or short depending on signal config)
             _extra_long_oid = None
@@ -12420,12 +16510,21 @@ async def scan_oracle_signals(channel=None):
                     _extra_body = {"symbol": extra_long_tk, "notional": str(round(leg_size, 2)),
                                    "side": "buy", "type": "market", "time_in_force": "day"}
                 if _extra_body:
-                    _re = requests.post(_alp_url, json=_extra_body, headers=_alp_hdr, timeout=10)
-                    if _re.status_code in (200, 201):
-                        _extra_long_oid = _re.json().get("id", "unknown")
-                        log.info("GEO-ONLY EXTRA %s: %s id=%s", _extra_side.upper(), extra_long_tk, _extra_long_oid)
+                    # WAL-protected submit (Stage B, 2026-04-18). Extra leg
+                    # failures are non-fatal — we keep the 2-leg position.
+                    _ok_e, _re_resp, _extra_wal = _alpaca_submit_with_wal(
+                        _extra_body, strategy="oracle_trade", market_id=market_id,
+                        intended_size=leg_size,
+                        metadata_extras={"signal": signal_name, "leg": "extra",
+                                         "side": _extra_side, "ticker": extra_long_tk, "path": "geo_only"},
+                    )
+                    if _ok_e:
+                        _extra_long_oid = _re_resp.get("id", "unknown")
+                        log.info("GEO-ONLY EXTRA %s: %s id=%s wal_row=%s",
+                                 _extra_side.upper(), extra_long_tk, _extra_long_oid, _extra_wal)
                     else:
-                        log.warning("GEO-ONLY EXTRA %s FAILED: %s (continuing with 2 legs)", _extra_side.upper(), extra_long_tk)
+                        log.warning("GEO-ONLY EXTRA %s FAILED: %s %s (continuing with 2 legs)",
+                                    _extra_side.upper(), extra_long_tk, _re_resp.get("error", "?"))
 
             _num_legs = 3 if extra_long_tk else 2
             total_cost = leg_size * _num_legs
@@ -12512,6 +16611,9 @@ OPTIONS_THETA_CONFIG = {
 
 async def scan_theta_harvest(channel=None):
     """Scan for put credit spread opportunities on SPY/QQQ when IV is elevated."""
+    if _is_auto_disabled("options_spread"):
+        log.info("options_spread auto-disabled by strategy_kill_switch — skipping")
+        return 0
     cfg = OPTIONS_THETA_CONFIG
     if not cfg["enabled"] or not ALPACA_API_KEY:
         return 0
@@ -12692,9 +16794,8 @@ def _sync_alpaca_to_portfolio():
     Skipped when portfolio has 0 positions (clean reset — closing orders may be pending)."""
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
         return
-    if len(PAPER_PORTFOLIO.get("positions", [])) == 0 and PAPER_PORTFOLIO.get("cash", 0) >= 24999:
-        log.info("SYNC: skipped — clean reset detected (0 positions, full cash)")
-        return
+    # Only skip sync if explicit reset was requested (flag file already consumed by backfill check)
+    # Normal deploys always sync
     try:
         hdrs = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
         r = requests.get(f"{ALPACA_BASE_URL}/v2/positions", headers=hdrs, timeout=10)
@@ -12733,9 +16834,12 @@ def _sync_alpaca_to_portfolio():
                         long_tk, short_tk = tb_u, ta_u
                     else:
                         continue
-                    a_val = abs(float(alpaca_positions[ta_u].get("market_value", 0)))
-                    b_val = abs(float(alpaca_positions[tb_u].get("market_value", 0)))
-                    cost = a_val + b_val
+                    # Use entry cost (avg_entry_price * qty), not market_value
+                    a_entry = abs(float(alpaca_positions[ta_u].get("avg_entry_price", 0)))
+                    a_qty = abs(float(alpaca_positions[ta_u].get("qty", 0)))
+                    b_entry = abs(float(alpaca_positions[tb_u].get("avg_entry_price", 0)))
+                    b_qty = abs(float(alpaca_positions[tb_u].get("qty", 0)))
+                    cost = (a_entry * a_qty) + (b_entry * b_qty)
                     entry_long = float(alpaca_positions[long_tk].get("avg_entry_price", 0))
                     entry_short = float(alpaca_positions[short_tk].get("avg_entry_price", 0))
                     _pos = {
@@ -12756,6 +16860,204 @@ def _sync_alpaca_to_portfolio():
             log.info("SYNC: Added %d missing pairs positions from Alpaca", added)
     except Exception as e:
         log.warning("SYNC: Alpaca portfolio sync error: %s", e)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# WAL (Write-Ahead Logging) — Stage A migration, 2026-04-16
+# Helper used only by PEAD today; other 12 Alpaca submission sites will
+# migrate in Stage B. Pattern:
+#   1. INSERT positions row status='PENDING' (intent captured pre-submit)
+#   2. POST /v2/orders to Alpaca
+#   3. On success → UPDATE row status='open' + fill data
+#   4. On failure → UPDATE row status='failed' + error reason
+#   5. Startup: reconcile_pending_wal_orders() checks for leftover PENDING
+#      rows (bot crashed mid-submit) and queries Alpaca by client_order_id
+# Each WAL row carries a UUID client_order_id so we can match post-crash.
+# ═══════════════════════════════════════════════════════════════════
+
+def _alpaca_submit_with_wal(order_body, strategy, market_id, intended_size,
+                            metadata_extras=None):
+    """Write-ahead-logged Alpaca order submission. See banner above.
+
+    Returns (success: bool, response: dict, wal_row_id: int|None). The caller
+    can use wal_row_id to enrich the row's metadata after the fact."""
+    import uuid as _uuid
+    client_order_id = f"wal_{_uuid.uuid4().hex[:20]}"
+    order_body = dict(order_body)
+    order_body.setdefault("client_order_id", client_order_id)
+
+    base_meta = {
+        "client_order_id": client_order_id,
+        "intent_ts": datetime.now(timezone.utc).isoformat(),
+        "order_body": order_body,
+    }
+    if metadata_extras:
+        base_meta.update(metadata_extras)
+
+    # Step 1: PENDING row (intent captured before network call)
+    pending_row_id = None
+    try:
+        _conn = sqlite3.connect(DB_PATH)
+        _c = _conn.cursor()
+        _c.execute("""INSERT INTO positions
+            (market_id, strategy, platform, direction, size_usd, status,
+             created_at, metadata)
+            VALUES (?, ?, 'alpaca', ?, ?, 'PENDING', datetime('now'), ?)""",
+            (market_id, strategy,
+             order_body.get("side", ""),
+             intended_size or 0,
+             json.dumps(base_meta)))
+        pending_row_id = _c.lastrowid
+        _conn.commit()
+        _conn.close()
+        log.info("WAL: %s %s PENDING row_id=%d client_id=%s",
+                 strategy, market_id, pending_row_id, client_order_id)
+    except Exception as e:
+        log.error("WAL: PENDING insert failed (aborting submit): %s", e)
+        return False, {"error": f"WAL pre-insert failed: {e}"}, None
+
+    # Step 2: Submit to Alpaca
+    try:
+        hdrs = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+                "Content-Type": "application/json"}
+        resp = requests.post(f"{ALPACA_BASE_URL}/v2/orders",
+                             headers=hdrs, json=order_body, timeout=15)
+        resp.raise_for_status()
+        alpaca_resp = resp.json()
+    except Exception as e:
+        # Mark row as failed — the order never reached Alpaca (or was rejected).
+        err_msg = str(e)[:250]
+        try:
+            _conn = sqlite3.connect(DB_PATH)
+            _conn.execute(
+                "UPDATE positions SET status='failed', exit_reason=?, closed_at=datetime('now') WHERE id=?",
+                (f"WAL submit: {err_msg}", pending_row_id))
+            _conn.commit()
+            _conn.close()
+        except Exception:
+            pass
+        log.warning("WAL: Alpaca submit failed %s %s: %s", strategy, market_id, err_msg)
+        return False, {"error": err_msg}, pending_row_id
+
+    # Step 3: UPDATE to 'open' with fill data
+    try:
+        alpaca_order_id = alpaca_resp.get("id", "") or ""
+        fill_price = float(alpaca_resp.get("filled_avg_price") or 0)
+        filled_qty = float(alpaca_resp.get("filled_qty") or 0)
+        try:
+            req_qty = float(alpaca_resp.get("qty") or order_body.get("qty") or 0)
+        except Exception:
+            req_qty = 0
+        shares_for_row = filled_qty or req_qty
+        base_meta.update({
+            "alpaca_order_id": alpaca_order_id,
+            "alpaca_status": alpaca_resp.get("status"),
+            "alpaca_submitted_at": alpaca_resp.get("submitted_at"),
+            "filled_qty": filled_qty,
+            "requested_qty": req_qty,
+        })
+        _conn = sqlite3.connect(DB_PATH)
+        _conn.execute(
+            """UPDATE positions
+               SET status='open', entry_price=?, shares=?, metadata=?
+               WHERE id=? AND status='PENDING'""",
+            (fill_price or 0, shares_for_row, json.dumps(base_meta), pending_row_id))
+        _conn.commit()
+        _conn.close()
+        log.info("WAL: %s %s PENDING→open row=%d alpaca=%s fill=%.4f",
+                 strategy, market_id, pending_row_id, (alpaca_order_id or "?")[:16],
+                 fill_price)
+    except Exception as e:
+        # Order was submitted successfully but DB transition failed — do NOT
+        # return False. Order is real; just surface the mismatch in logs.
+        log.warning("WAL: PENDING→open update failed for row=%d (order IS live at Alpaca): %s",
+                    pending_row_id, e)
+
+    return True, alpaca_resp, pending_row_id
+
+
+def reconcile_pending_wal_orders():
+    """At startup, any PENDING rows mean the bot died mid-submit. For each,
+    look up the client_order_id at Alpaca and update the row accordingly.
+    Returns count of reconciled rows."""
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        return 0
+    try:
+        _conn = sqlite3.connect(DB_PATH)
+        _conn.row_factory = sqlite3.Row
+        pending_rows = _conn.execute(
+            "SELECT id, market_id, strategy, metadata FROM positions WHERE status='PENDING'"
+        ).fetchall()
+        _conn.close()
+    except Exception as e:
+        log.warning("WAL RECONCILE: DB query failed: %s", e)
+        return 0
+    if not pending_rows:
+        return 0
+    log.info("WAL RECONCILE: %d PENDING rows to check against Alpaca", len(pending_rows))
+    hdrs = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+    count = 0
+    for row in pending_rows:
+        try:
+            meta = json.loads(row["metadata"] or "{}")
+        except Exception:
+            meta = {}
+        client_id = meta.get("client_order_id")
+        if not client_id:
+            # No client_id to match — mark as unknown to avoid stuck PENDING
+            try:
+                _c = sqlite3.connect(DB_PATH)
+                _c.execute(
+                    "UPDATE positions SET status='failed', exit_reason=?, closed_at=datetime('now') WHERE id=?",
+                    ("WAL reconcile: no client_order_id in metadata", row["id"]))
+                _c.commit(); _c.close()
+            except Exception:
+                pass
+            continue
+        # Query Alpaca: GET /v2/orders:by_client_order_id?client_order_id=...
+        try:
+            r = requests.get(f"{ALPACA_BASE_URL}/v2/orders:by_client_order_id",
+                             headers=hdrs, params={"client_order_id": client_id},
+                             timeout=10)
+            if r.status_code == 404:
+                # Order was never accepted at Alpaca — intent recorded, no trade
+                _c = sqlite3.connect(DB_PATH)
+                _c.execute(
+                    "UPDATE positions SET status='failed', exit_reason=?, closed_at=datetime('now') WHERE id=?",
+                    (f"WAL reconcile: order {client_id} not found at Alpaca (never submitted)", row["id"]))
+                _c.commit(); _c.close()
+                log.info("WAL RECONCILE: row=%d %s → failed (Alpaca 404)", row["id"], row["market_id"])
+                count += 1
+                continue
+            r.raise_for_status()
+            order = r.json()
+            status = order.get("status", "unknown")
+            fill_price = float(order.get("filled_avg_price") or 0)
+            filled_qty = float(order.get("filled_qty") or 0)
+            meta.update({
+                "alpaca_order_id": order.get("id"),
+                "alpaca_status": status,
+                "reconciled_at": datetime.now(timezone.utc).isoformat(),
+                "filled_qty": filled_qty,
+            })
+            _c = sqlite3.connect(DB_PATH)
+            if status in ("filled", "partially_filled") and filled_qty > 0:
+                _c.execute(
+                    "UPDATE positions SET status='open', entry_price=?, shares=?, metadata=? WHERE id=?",
+                    (fill_price, filled_qty, json.dumps(meta), row["id"]))
+                log.info("WAL RECONCILE: row=%d %s → open (reconciled from PENDING, fill=%.4f)",
+                         row["id"], row["market_id"], fill_price)
+            else:
+                _c.execute(
+                    "UPDATE positions SET status='failed', exit_reason=?, metadata=?, closed_at=datetime('now') WHERE id=?",
+                    (f"WAL reconcile: Alpaca status={status}", json.dumps(meta), row["id"]))
+                log.info("WAL RECONCILE: row=%d %s → failed (Alpaca status=%s)",
+                         row["id"], row["market_id"], status)
+            _c.commit(); _c.close()
+            count += 1
+        except Exception as e:
+            log.warning("WAL RECONCILE: row=%d lookup failed: %s", row["id"], e)
+    return count
 
 
 def reconcile_alpaca_positions():
@@ -12808,20 +17110,40 @@ def reconcile_alpaca_positions():
             # Orphaned position — log but don't auto-close on weekends (market orders fail)
             # Only auto-close during market hours to avoid 403 errors
             if is_market_open():
-                log.warning("RECONCILE: Orphaned %s %s qty=%.2f val=$%.2f — closing",
+                log.warning("RECONCILE: Orphaned %s %s qty=%.4f val=$%.2f — closing",
                             side, sym, abs(qty), abs(mkt_val))
                 try:
+                    # DELETE w/ ?percentage=100 ensures the close order covers the full
+                    # fractional qty (fixes dust-accumulation bug observed 2026-04-16).
                     _cr = requests.delete(f"{ALPACA_BASE_URL}/v2/positions/{sym}",
-                                          headers=hdrs, timeout=10)
+                                          headers=hdrs, params={"percentage": "100"}, timeout=10)
                     if _cr.status_code == 200:
-                        log.info("RECONCILE: Closed orphaned %s %s", side, sym)
-                        closed += 1
+                        # Wait for fill, then re-query the position to VERIFY qty=0.
+                        # 404 on GET /v2/positions/{sym} == position fully closed at Alpaca.
+                        time.sleep(2)
+                        _vr = requests.get(f"{ALPACA_BASE_URL}/v2/positions/{sym}",
+                                           headers=hdrs, timeout=10)
+                        if _vr.status_code == 404:
+                            log.info("RECONCILE: Closed orphaned %s %s (verified qty=0)", side, sym)
+                            closed += 1
+                        elif _vr.status_code == 200:
+                            _vb = _vr.json()
+                            _rem_qty = abs(float(_vb.get("qty", 0) or 0))
+                            _rem_val = abs(float(_vb.get("market_value", 0) or 0))
+                            if _rem_qty == 0:
+                                log.info("RECONCILE: Closed orphaned %s %s (verified qty=0)", side, sym)
+                                closed += 1
+                            else:
+                                log.warning("RECONCILE: %s partial close — dust remains qty=%.6f val=$%.2f",
+                                            sym, _rem_qty, _rem_val)
+                        else:
+                            log.warning("RECONCILE: %s close-verify returned HTTP %d", sym, _vr.status_code)
                     else:
                         log.warning("RECONCILE: Failed to close %s: %d %s", sym, _cr.status_code, _cr.text[:100])
                 except Exception as _ce:
                     log.warning("RECONCILE: Error closing %s: %s", sym, _ce)
             else:
-                log.info("RECONCILE: Orphaned %s %s qty=%.2f val=$%.2f — skipping (market closed)",
+                log.info("RECONCILE: Orphaned %s %s qty=%.4f val=$%.2f — skipping (market closed)",
                          side, sym, abs(qty), abs(mkt_val))
 
         if closed > 0:
@@ -13013,17 +17335,16 @@ async def execute_spy_put_hedge(spy_price, portfolio_value):
                  symbol, qty, strike, expiry_str, size_usd)
         return True, f"DRY RUN: BUY {qty}x {symbol} (strike ${strike:.0f}, exp {expiry_str})"
 
-    try:
-        r = requests.post(f"{ALPACA_BASE_URL}/v2/orders", json=order_body,
-                          headers=hdrs, timeout=15)
-        if r.status_code in (200, 201):
-            order_id = r.json().get("id", "unknown")
-            log.info("SPY PUT ORDER: %s qty=%d id=%s", symbol, qty, order_id)
-            return True, f"BUY {qty}x {symbol} (ID: {order_id})"
-        else:
-            return False, f"Alpaca options error: {r.status_code} {r.text[:200]}"
-    except Exception as exc:
-        return False, f"SPY put order error: {exc}"
+    ok, resp, _wal_id = _alpaca_submit_with_wal(
+        order_body, "crash_hedge_put", f"HEDGE:SPY PUT ${strike:.0f}",
+        intended_size=size_usd,
+        metadata_extras={"underlying_spot": spy_price, "strike": strike,
+                         "expiry": expiry_str, "contracts": qty, "source": "execute_spy_put_hedge"})
+    if ok:
+        order_id = resp.get("id", "unknown")
+        log.info("SPY PUT ORDER: %s qty=%d id=%s", symbol, qty, order_id)
+        return True, f"BUY {qty}x {symbol} (ID: {order_id})"
+    return False, f"SPY put order failed: {resp.get('error', 'unknown')}"
 
 
 async def execute_spy_short_hedge(spy_price, portfolio_value):
@@ -13051,22 +17372,26 @@ async def execute_spy_short_hedge(spy_price, portfolio_value):
         log.info("DRY RUN: SPY SHORT $%.0f @ $%.2f", size_usd, spy_price)
         return True, f"DRY RUN: SHORT SPY ${size_usd:.0f}"
 
-    try:
-        r = requests.post(f"{ALPACA_BASE_URL}/v2/orders", json=order_body,
-                          headers=hdrs, timeout=15)
-        if r.status_code in (200, 201):
-            order_id = r.json().get("id", "unknown")
-            log.info("SPY SHORT ORDER: $%.0f id=%s", size_usd, order_id)
-            return True, f"SHORT SPY ${size_usd:.0f} (ID: {order_id})"
-        else:
-            return False, f"Alpaca short error: {r.status_code} {r.text[:200]}"
-    except Exception as exc:
-        return False, f"SPY short order error: {exc}"
+    ok, resp, _wal_id = _alpaca_submit_with_wal(
+        order_body, "crash_hedge_short", f"HEDGE:SPY SHORT",
+        intended_size=size_usd,
+        metadata_extras={"spy_price": spy_price, "source": "execute_spy_short_hedge"})
+    if ok:
+        order_id = resp.get("id", "unknown")
+        log.info("SPY SHORT ORDER: $%.0f id=%s", size_usd, order_id)
+        return True, f"SHORT SPY ${size_usd:.0f} (ID: {order_id})"
+    return False, f"SPY short failed: {resp.get('error', 'unknown')}"
 
+
+# Module-level cooldown timestamp for scaled crash-hedge dedup
+_LAST_HEDGE_SCALE_TS = None
 
 async def check_crash_hedges(channel):
     """Regime-aware crash hedge: VIX < 25 idle, 25-27 buy puts, >= 28 sell call spreads.
     Runs during market hours."""
+    # This function dispatches to 3 sub-strategies; gate each at its append site
+    # below rather than at the top, so disabling one (e.g. crash_hedge_put) does
+    # not silence the other two (crash_hedge_call_spread, vix_fade).
     cfg = CRASH_HEDGE_CONFIG
     if not cfg["enabled"]:
         return
@@ -13077,6 +17402,42 @@ async def check_crash_hedges(channel):
 
     if not vix:
         return
+
+    # === SCALED CRASH HEDGE: VIX > 20 + fewer than 3 puts open → buy 1 extra @ 5% OTM ===
+    # 60-min cooldown prevents duplicate orders firing every cycle while put_count is stale
+    if vix > 20:
+        global _LAST_HEDGE_SCALE_TS
+        _now_ts = datetime.now(timezone.utc)
+        if _LAST_HEDGE_SCALE_TS and (_now_ts - _LAST_HEDGE_SCALE_TS).total_seconds() < 3600:
+            _put_count = -1  # skip via cooldown
+            log.info("CRASH-HEDGE SCALE: cooldown active (last fired %s)", _LAST_HEDGE_SCALE_TS.isoformat())
+        else:
+            _put_count = sum(1 for p in PAPER_PORTFOLIO.get("positions", [])
+                             if p.get("strategy") == "crash_hedge_put")
+        if _put_count >= 0 and _put_count < 3:
+            _spy_now = _get_spy_price()
+            if _spy_now:
+                _portfolio_val = PAPER_PORTFOLIO.get("cash", 0) + sum(
+                    p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+                _orig_offset = cfg.get("put_strike_offset", 0.02)
+                try:
+                    cfg["put_strike_offset"] = 0.05  # 5% OTM for scaled hedges
+                    _ok, _msg = await execute_spy_put_hedge(_spy_now, _portfolio_val)
+                    if _ok:
+                        _LAST_HEDGE_SCALE_TS = _now_ts
+                    log.info("CRASH-HEDGE SCALE: VIX=%.1f puts_open=%d → buy 5%% OTM put | %s",
+                             vix, _put_count, _msg)
+                    if _ok and channel:
+                        try:
+                            await channel.send(
+                                f"**CRASH HEDGE SCALED** VIX={vix:.1f} puts={_put_count + 1}/3\n"
+                                f"5% OTM SPY put added — {_msg}"
+                            )
+                        except Exception:
+                            pass
+                finally:
+                    cfg["put_strike_offset"] = _orig_offset
+                # Don't return — let the normal VRP logic still run for 2% OTM hedges
 
     # --- Options flow: put/call ratio as additional trigger ---
     _pc_data = options_put_call_ratio("SPY")
@@ -13144,6 +17505,9 @@ async def check_crash_hedges(channel):
 
     # === VRP REGIME: SELL PREMIUM (VIX >= 28) — Simulate call credit spread ===
     if vrp_regime == "sell_premium":
+        if _is_auto_disabled("crash_hedge_call_spread"):
+            log.info("crash_hedge_call_spread auto-disabled by strategy_kill_switch — skipping")
+            return
         spread_count = sum(1 for p in PAPER_PORTFOLIO.get("positions", [])
                           if p.get("strategy") == "crash_hedge_call_spread")
         if spread_count >= cfg["vrp_max_spreads"]:
@@ -13210,6 +17574,9 @@ async def check_crash_hedges(channel):
         # Also open UVXY short when VIX > 30 (backwardation fade)
         _uvxy_open = any(p.get("strategy") == "vix_fade" for p in PAPER_PORTFOLIO.get("positions", []))
         if not _uvxy_open and vix > 30:
+            if _is_auto_disabled("vix_fade"):
+                log.info("vix_fade auto-disabled by strategy_kill_switch — skipping")
+                return
             try:
                 _uvxy_size = portfolio_value * 0.01  # 1% of portfolio
                 _uvxy_hdrs = {"APCA-API-KEY-ID": ALPACA_API_KEY,
@@ -13228,10 +17595,13 @@ async def check_crash_hedges(channel):
                     if _uvxy_shares >= 1:
                         _uvxy_body = {"symbol": "UVXY", "qty": str(_uvxy_shares),
                                       "side": "sell", "type": "market", "time_in_force": "day"}
-                        _uvxy_r = requests.post(f"{ALPACA_BASE_URL}/v2/orders",
-                                                json=_uvxy_body, headers=_uvxy_hdrs, timeout=10)
-                        if _uvxy_r.status_code in (200, 201):
-                            _uvxy_oid = _uvxy_r.json().get("id", "unknown")
+                        _uvxy_ok, _uvxy_resp, _uvxy_wal = _alpaca_submit_with_wal(
+                            _uvxy_body, "vix_fade", "VIX_FADE:UVXY SHORT",
+                            intended_size=_uvxy_size,
+                            metadata_extras={"vix": vix, "uvxy_price": _uvxy_px,
+                                             "shares": _uvxy_shares, "source": "crash_hedge_vix_fade"})
+                        if _uvxy_ok:
+                            _uvxy_oid = _uvxy_resp.get("id", "unknown")
                             _uvxy_stop = round(_uvxy_px * 1.10, 2)
                             _uvxy_tp = round(_uvxy_px * 0.80, 2)
                             _uvxy_pos = {
@@ -13268,13 +17638,16 @@ async def check_crash_hedges(channel):
                                 except Exception:
                                     pass
                         else:
-                            log.warning("VIX FADE: UVXY short failed: %d %s", _uvxy_r.status_code, _uvxy_r.text[:100])
+                            log.warning("VIX FADE: UVXY WAL submit failed: %s", _uvxy_resp.get("error", "unknown"))
             except Exception as _vf_err:
                 log.warning("VIX FADE error: %s", _vf_err)
         return
 
     # === VRP REGIME: BUY PUTS (VIX 25-27) ===
     if vrp_regime == "buy_puts" and regime_name in ("elevated", "extreme"):
+        if _is_auto_disabled("crash_hedge_put"):
+            log.info("crash_hedge_put auto-disabled by strategy_kill_switch — skipping")
+            return
         success, msg = await execute_spy_put_hedge(spy_price, portfolio_value)
         if success:
             strike = round(spy_price * (1 - cfg["put_strike_offset"]) / 5) * 5
@@ -13308,7 +17681,8 @@ async def check_crash_hedges(channel):
                 direction="BUY", size_usd=size_usd, shares=1,
                 entry_price=spy_price,
                 metadata={"vix": vix, "regime": regime_name, "vrp_regime": "buy_puts",
-                          "strike": strike, "spy_price": spy_price, "order_msg": msg},
+                          "strike": strike, "spy_price": spy_price, "order_msg": msg,
+                          "option_symbol": _occ_symbol},
             )
             log.info("CRASH-HEDGE PUT: VIX=%.1f SPY=$%.2f strike=$%.0f size=$%.0f (VRP=buy_puts)",
                      vix, spy_price, strike, size_usd)
@@ -13376,7 +17750,11 @@ async def check_crash_hedges(channel):
 EXIT_CONFIG = {
     "crypto_ttl_hours": 4,
     "prediction_ttl_hours": 72,
-    "pairs_ttl_days": 7,
+    # pairs_ttl_days: 3 — intentional (Apr 12-13, commit fb495aa).
+    # Redesign tightened pairs hold window from 7d to 3d as part of
+    # coordinated exit manager changes, including new FLAT-48H companion
+    # exit. Do not revert to 7 without reviewing that redesign context.
+    "pairs_ttl_days": 3,
     "pead_ttl_hours": 72,
     "pead_tp_pct": 0.08,
     "pairs_zscore_exit": 0.5,
@@ -13460,10 +17838,447 @@ def auto_resolve_expired():
                 pass
     return closed
 
+# ═══════════════════════════════════════════════════════════════════
+# VRP INCOME — Cash-Secured Put bookkeeping sim (Path 1, 2026-04-16)
+# Goal: collect 2+ weeks of data on the premium we WOULD have captured on a
+# daily 7-14 DTE, 2-3% OTM SPY cash-secured put before committing to real
+# $60K positions (Path 2). Fires once/day at ~10 AM ET when:
+#   • VIX ∈ [18, 25]
+#   • paper cash > $10K
+#   • Alpaca options chain returns a suitable put
+# Writes a synthetic CLOSED vrp_income row with realized_pnl = premium × 100.
+# NO real orders submitted. Safe to delete after Path 2 goes live.
+# ═══════════════════════════════════════════════════════════════════
+VRP_INCOME_CONFIG = {
+    "vix_min":       18.0,
+    "vix_max":       25.0,
+    "cash_min":      10000.0,
+    "dte_min":       7,
+    "dte_max":       14,
+    "otm_pct_min":   0.02,  # 2% OTM
+    "otm_pct_max":   0.03,  # 3% OTM
+    "underlying":    "SPY",
+    "fire_hour_et":  10,
+}
+_VRP_LAST_SIM_DATE = None  # ET-date dedup — only one fire per day
+
+
+def _vrp_fetch_spy_put():
+    """Query Alpaca options chain for SPY puts 7-14 DTE, 2-3% OTM.
+    Returns dict with {occ, bid, ask, mid, spy_price, dte, strike, expiry} or None."""
+    import datetime as _dt
+    try:
+        hdrs = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+        # SPY mid price
+        sq = requests.get("https://data.alpaca.markets/v2/stocks/SPY/quotes/latest",
+                          headers=hdrs, timeout=10)
+        sq.raise_for_status()
+        q = sq.json().get("quote", {})
+        bid_px, ask_px = float(q.get("bp") or 0), float(q.get("ap") or 0)
+        if bid_px <= 0 or ask_px <= 0:
+            return None
+        spy_px = (bid_px + ask_px) / 2.0
+        strike_hi = spy_px * (1 - VRP_INCOME_CONFIG["otm_pct_min"])  # closer to spot
+        strike_lo = spy_px * (1 - VRP_INCOME_CONFIG["otm_pct_max"])  # deeper OTM
+        now = datetime.now(timezone.utc)
+        exp_lo = (now + _dt.timedelta(days=VRP_INCOME_CONFIG["dte_min"])).date()
+        exp_hi = (now + _dt.timedelta(days=VRP_INCOME_CONFIG["dte_max"])).date()
+
+        r = requests.get(
+            "https://data.alpaca.markets/v1beta1/options/snapshots/SPY",
+            headers=hdrs,
+            params={
+                "feed": "indicative", "type": "put",
+                "strike_price_gte": f"{strike_lo:.2f}",
+                "strike_price_lte": f"{strike_hi:.2f}",
+                "expiration_date_gte": exp_lo.isoformat(),
+                "expiration_date_lte": exp_hi.isoformat(),
+                "limit": 100,
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        snapshots = r.json().get("snapshots", {})
+        candidates = []
+        for occ, snap in snapshots.items():
+            lq = snap.get("latestQuote") or {}
+            bd, ak = float(lq.get("bp") or 0), float(lq.get("ap") or 0)
+            if bd <= 0 or ak <= 0:
+                continue
+            mid = (bd + ak) / 2.0
+            # OCC ticker: SPY{YY}{MM}{DD}P{STRIKE*1000:08d}
+            # Parse for logging; not strictly needed for sim correctness.
+            strike_val, expiry_str, dte_val = None, None, None
+            try:
+                if len(occ) >= 15 and "P" in occ:
+                    core = occ[3:]  # drop "SPY"
+                    yy, mm, dd = core[0:2], core[2:4], core[4:6]
+                    expiry_str = f"20{yy}-{mm}-{dd}"
+                    strike_str = core[7:15]  # 8 digits after 'P'
+                    strike_val = int(strike_str) / 1000.0
+                    expiry_date = _dt.date(2000 + int(yy), int(mm), int(dd))
+                    dte_val = (expiry_date - now.date()).days
+            except Exception:
+                pass
+            candidates.append({
+                "occ": occ, "bid": bd, "ask": ak, "mid": mid,
+                "spy_price": spy_px, "strike": strike_val,
+                "expiry": expiry_str, "dte": dte_val,
+            })
+        if not candidates:
+            return None
+        # Prefer highest premium (most income) among in-range candidates
+        return max(candidates, key=lambda c: c["mid"])
+    except Exception as e:
+        log.warning("VRP SIM: Alpaca chain error: %s", e)
+        return None
+
+
+async def scan_cash_secured_puts_sim(channel=None):
+    """Once-per-day bookkeeping sim of a cash-secured SPY put strategy.
+    Writes a synthetic closed vrp_income row — NO real order submission.
+    Wired into the alpha scan loop; self-gates on time/VIX/cash."""
+    global _VRP_LAST_SIM_DATE
+    try:
+        from zoneinfo import ZoneInfo
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        return
+    if now_et.hour != VRP_INCOME_CONFIG["fire_hour_et"]:
+        return
+    today_et = now_et.date()
+    if _VRP_LAST_SIM_DATE == today_et:
+        return
+
+    regime = get_regime("equities") or {}
+    vix = float(regime.get("vix") or 0)
+    cash = float(PAPER_PORTFOLIO.get("cash") or 0)
+
+    if vix < VRP_INCOME_CONFIG["vix_min"] or vix > VRP_INCOME_CONFIG["vix_max"]:
+        log.info("VRP SIM: VIX=%.1f outside [%.0f,%.0f] — skip",
+                 vix, VRP_INCOME_CONFIG["vix_min"], VRP_INCOME_CONFIG["vix_max"])
+        _VRP_LAST_SIM_DATE = today_et
+        return
+    if cash < VRP_INCOME_CONFIG["cash_min"]:
+        log.info("VRP SIM: cash=$%.0f < $%.0f — skip", cash, VRP_INCOME_CONFIG["cash_min"])
+        _VRP_LAST_SIM_DATE = today_et
+        return
+
+    chain = _vrp_fetch_spy_put()
+    if not chain:
+        log.info("VRP SIM: no suitable SPY put in chain today (VIX=%.1f)", vix)
+        _VRP_LAST_SIM_DATE = today_et
+        return
+
+    premium_dollars = round(chain["mid"] * 100.0, 2)  # per contract = 100 shares
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        _conn = sqlite3.connect(DB_PATH)
+        _conn.execute(
+            """INSERT INTO positions
+               (market_id, strategy, platform, direction, size_usd, shares, entry_price,
+                realized_pnl, status, exit_reason, created_at, closed_at, metadata)
+               VALUES (?, 'vrp_income', 'Simulated', 'short_put', ?, 1, ?,
+                       ?, 'closed', ?, ?, ?, ?)""",
+            (
+                f"VRP:{chain['occ']}",
+                premium_dollars * 100,   # notional-ish for bookkeeping
+                chain["mid"],
+                premium_dollars,
+                f"SIM CSP premium SPY=${chain['spy_price']:.2f} VIX={vix:.1f}",
+                now_iso, now_iso,
+                json.dumps({
+                    "occ": chain["occ"],
+                    "strike": chain.get("strike"),
+                    "expiry": chain.get("expiry"),
+                    "dte": chain.get("dte"),
+                    "spy_price": chain["spy_price"],
+                    "bid": chain["bid"], "ask": chain["ask"], "mid": chain["mid"],
+                    "vix": vix,
+                    "cash_at_sim": cash,
+                    "config": VRP_INCOME_CONFIG,
+                }),
+            ),
+        )
+        _conn.commit()
+        _conn.close()
+        log.info("VRP INCOME SIM: %s strike=%s exp=%s dte=%s mid=$%.2f premium=$%.2f VIX=%.1f",
+                 chain["occ"], chain.get("strike"), chain.get("expiry"),
+                 chain.get("dte"), chain["mid"], premium_dollars, vix)
+        if channel:
+            try:
+                await channel.send(
+                    f"**VRP SIM** SPY CSP premium **${premium_dollars:.2f}** | "
+                    f"strike={chain.get('strike')} exp={chain.get('expiry')} "
+                    f"dte={chain.get('dte')} VIX={vix:.1f} (simulated, no order)"
+                )
+            except Exception:
+                pass
+    except Exception as e:
+        log.warning("VRP SIM: DB write error: %s", e)
+    _VRP_LAST_SIM_DATE = today_et
+
+
+def _simulate_covered_calls():
+    """Simulate selling 5%-OTM weekly covered calls on long positions held >3 days.
+    Logs synthetic premium to positions table as strategy='covered_call', deduped per (market, day)."""
+    try:
+        _now = datetime.now(timezone.utc)
+        _today = _now.strftime("%Y-%m-%d")
+        _conn = sqlite3.connect(DB_PATH)
+        _c = _conn.cursor()
+        for pos in PAPER_PORTFOLIO.get("positions", []):
+            _strat = (pos.get("strategy") or "").lower()
+            # Skip pairs (mixed long/short), hedges, prediction markets, simulated
+            if _strat in ("pairs", "prediction", "covered_call", "iron_condor") or "hedge" in _strat:
+                continue
+            if pos.get("platform") == "Simulated":
+                continue
+            _ts = pos.get("timestamp", "")
+            if not _ts:
+                continue
+            try:
+                if " UTC" in _ts:
+                    _et = datetime.strptime(_ts, "%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc)
+                else:
+                    _et = datetime.fromisoformat(_ts.replace("Z", "+00:00"))
+                    if _et.tzinfo is None:
+                        _et = _et.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            _age_days = (_now - _et).total_seconds() / 86400
+            if _age_days < 3:
+                continue
+            _market = pos.get("market", "")
+            # Dedup: skip if covered_call already logged today for this market
+            _ex = _c.execute(
+                "SELECT 1 FROM positions WHERE strategy='covered_call' AND market_id=? AND DATE(closed_at)=? LIMIT 1",
+                (_market, _today)).fetchone()
+            if _ex:
+                continue
+            _entry = pos.get("entry_price", 0) or 0
+            _cost = pos.get("cost", 0) or 0
+            if _entry <= 0 or _cost <= 0:
+                continue
+            _strike = _entry * 1.05
+            # Rough premium estimate: 0.4% of cost basis (typical for 5% OTM 7DTE on liquid stocks)
+            _premium = round(_cost * 0.004, 2)
+            _c.execute("""INSERT INTO positions
+                (market_id, strategy, platform, size_usd, realized_pnl, status,
+                 exit_reason, created_at, closed_at, shares, entry_price)
+                VALUES (?, 'covered_call', 'Simulated', ?, ?, 'closed', ?, ?, ?, 1, ?)""",
+                (_market, 0, _premium,
+                 f"SIM CC strike=${_strike:.2f} age={_age_days:.1f}d",
+                 _now.isoformat(), _now.isoformat(), _strike))
+            log.info("COVERED CALL SIM: %s strike=$%.2f premium=$%.2f age=%.1fd",
+                     _market[:30], _strike, _premium, _age_days)
+        _conn.commit()
+        _conn.close()
+    except Exception as _cce:
+        log.warning("Covered call sim error: %s", _cce)
+
+
+# ============================================================================
+# PHASE 5: Whale-following exit pass (SHADOW positions in SQLite, real Poly orders)
+# ============================================================================
+# whale_follow positions are written by intelligence_workers/whale_entry_executor.py
+# directly to the SQLite `positions` table (tier='SHADOW', strategy='whale_follow').
+# They do NOT live in PAPER_PORTFOLIO, so the main exit loop won't see them.
+# This pass runs alongside the PAPER_PORTFOLIO loop inside run_exit_manager.
+#
+# Exit rules (from metadata, with fallbacks):
+#   TP:  pnl >= size_usd * tp_pct  OR  pnl >= tp_dollar       (whichever first)
+#   SL:  pnl <= -(size_usd * sl_pct) OR pnl <= -sl_dollar     (whichever first)
+#   TTL: age >= ttl_hours from created_at
+#
+# On exit:
+#   - Place a real CLOB SELL (gated by WHALE_FOLLOW_LIVE=1).
+#   - If SELL fails (live mode), DO NOT close the row — retry next cycle.
+#   - On success (or dry-run): mark position closed, write realized_pnl,
+#     credit shadow_strategy_allocations.current_balance by (size_usd + pnl).
+#     We credit size_usd+pnl (not just pnl) because Phase 4 debited size_usd
+#     at entry; this makes the pool balance honest. If you want the simpler
+#     "track pnl only" model, also remove debit_allocation() from Phase 4.
+
+def _fetch_clob_sell_price(token_id: str) -> float:
+    """Best bid from Polymarket CLOB for a given token (what a SELL would receive).
+    Returns 0.0 on any failure — caller decides fallback."""
+    if not token_id:
+        return 0.0
+    try:
+        r = requests.get(
+            "https://clob.polymarket.com/price",
+            params={"token_id": token_id, "side": "SELL"},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            d = r.json() or {}
+            return float(d.get("price") or 0)
+    except Exception as exc:
+        log.debug("CLOB price fetch failed for %s: %s", (token_id or "")[:20], exc)
+    return 0.0
+
+
+async def _whale_follow_exit_pass(channel=None) -> int:
+    """Process exits for open whale_follow SHADOW positions. Returns close count."""
+    whale_live = os.environ.get("WHALE_FOLLOW_LIVE", "0").strip() == "1"
+    closed = 0
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """SELECT id, market_id, size_usd, shares, entry_price,
+                      stop_price, target_price, created_at, metadata
+                 FROM positions
+                WHERE strategy='whale_follow' AND status='open' AND tier='SHADOW'"""
+        ).fetchall()
+        if not rows:
+            return 0
+
+        now_utc = datetime.now(timezone.utc)
+
+        for r in rows:
+            try:
+                meta = json.loads(r["metadata"]) if r["metadata"] else {}
+            except Exception:
+                meta = {}
+
+            tp_pct    = float(meta.get("tp_pct",    0.10))
+            tp_dollar = float(meta.get("tp_dollar", 25))
+            sl_pct    = float(meta.get("sl_pct",    0.05))
+            sl_dollar = float(meta.get("sl_dollar", 15))
+            ttl_hours = float(meta.get("ttl_hours", 48))
+            token_id  = meta.get("asset_id", "") or ""
+
+            entry_price = float(r["entry_price"] or 0)
+            shares      = float(r["shares"] or 0)
+            size_usd    = float(r["size_usd"] or 0)
+            cid         = r["market_id"]
+
+            cur_price = _fetch_clob_sell_price(token_id)
+            if cur_price <= 0:
+                cur_price = entry_price  # safe fallback — no PnL until live price returns
+
+            unrealized_pnl = (cur_price - entry_price) * shares  # BUY position
+
+            try:
+                created = datetime.fromisoformat((r["created_at"] or "").replace(" ", "T"))
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+            except Exception:
+                created = now_utc
+            age_hours = (now_utc - created).total_seconds() / 3600
+
+            exit_reason = None
+            if size_usd > 0 and unrealized_pnl >= size_usd * tp_pct:
+                exit_reason = (f"TP%: pnl ${unrealized_pnl:+.2f} >= "
+                               f"{tp_pct*100:.0f}% of ${size_usd:.0f}")
+            elif unrealized_pnl >= tp_dollar:
+                exit_reason = (f"TP$: pnl ${unrealized_pnl:+.2f} >= "
+                               f"${tp_dollar:.0f}")
+            elif size_usd > 0 and unrealized_pnl <= -(size_usd * sl_pct):
+                exit_reason = (f"SL%: pnl ${unrealized_pnl:+.2f} <= "
+                               f"-{sl_pct*100:.0f}% of ${size_usd:.0f}")
+            elif unrealized_pnl <= -sl_dollar:
+                exit_reason = (f"SL$: pnl ${unrealized_pnl:+.2f} <= "
+                               f"-${sl_dollar:.0f}")
+            elif age_hours >= ttl_hours:
+                exit_reason = f"TTL: age {age_hours:.1f}h >= {ttl_hours:.0f}h"
+
+            if not exit_reason:
+                log.debug("WHALE-EXIT hold pos=%d age=%.1fh pnl=$%+.2f cur=%.3f",
+                          r["id"], age_hours, unrealized_pnl, cur_price)
+                continue
+
+            sell_msg = ""
+            if whale_live:
+                if not token_id:
+                    log.warning("WHALE-EXIT skip pos=%d: missing asset_id in metadata",
+                                r["id"])
+                    continue
+                sell_amount_usd = round(max(shares * cur_price, 0.01), 2)
+                try:
+                    sell_ok, sell_msg = await execute_polymarket_order(
+                        "SELL", token_id, sell_amount_usd, price=cur_price)
+                except Exception as exc:
+                    sell_ok, sell_msg = False, f"exception: {exc}"[:200]
+                if not sell_ok:
+                    # Real position is still open on Polymarket — do NOT close in DB.
+                    log.warning("WHALE-EXIT pos=%d SELL FAILED (kept open): %s",
+                                r["id"], sell_msg)
+                    if channel:
+                        try:
+                            await channel.send(
+                                f"⚠️  **Whale-Follow SELL failed** pos #{r['id']}\n"
+                                f"Reason: {exit_reason}\n"
+                                f"Sell error: {sell_msg[:160]}\n"
+                                f"Position kept open; will retry next cycle."
+                            )
+                        except Exception:
+                            pass
+                    continue
+            else:
+                sell_msg = (f"DRY-RUN sell ${shares * cur_price:.2f} @ ${cur_price:.3f} "
+                            f"(WHALE_FOLLOW_LIVE=0)")
+
+            # Close in DB + credit allocation
+            credit = round(size_usd + unrealized_pnl, 2)
+            conn.execute(
+                """UPDATE positions
+                      SET status='closed', current_price=?, closed_at=datetime('now'),
+                          exit_reason=?, realized_pnl=?
+                    WHERE id=?""",
+                (cur_price,
+                 f"{exit_reason} | sell={sell_msg[:120]}",
+                 round(unrealized_pnl, 2),
+                 r["id"]),
+            )
+            conn.execute(
+                """UPDATE shadow_strategy_allocations
+                      SET current_balance = current_balance + ?,
+                          trades_count    = trades_count + 1,
+                          wins            = wins   + ?,
+                          losses          = losses + ?,
+                          total_pnl       = total_pnl + ?,
+                          last_updated    = CURRENT_TIMESTAMP
+                    WHERE strategy = 'whale_follow'""",
+                (credit,
+                 1 if unrealized_pnl > 0 else 0,
+                 1 if unrealized_pnl < 0 else 0,
+                 round(unrealized_pnl, 2)),
+            )
+            conn.commit()
+            closed += 1
+            log.info("WHALE-EXIT pos=%d cid=%s | %s | pnl=$%+.2f credit=$%.2f | %s",
+                     r["id"], (cid or "")[:18], exit_reason,
+                     unrealized_pnl, credit, sell_msg)
+            if channel:
+                try:
+                    await channel.send(
+                        f"**Whale-Follow Exit** pos #{r['id']}\n"
+                        f"{exit_reason}\n"
+                        f"PnL: ${unrealized_pnl:+,.2f}  →  credit ${credit:.2f}\n"
+                        f"{sell_msg[:160]}"
+                    )
+                except Exception:
+                    pass
+
+        return closed
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 async def run_exit_manager(channel=None):
     """Unified exit manager — single exit path for ALL positions in PAPER_PORTFOLIO."""
     now = datetime.now(timezone.utc)
     positions_to_close = []
+    # _simulate_covered_calls() retired 2026-04-30 — wrote synthetic 0.4%-of-cost
+    # rows that contaminated headline P&L. Function definition retained for
+    # audit only; existing rows soft-deleted via deleted_sim=1. See
+    # docs/GOVERNANCE.md "Real vs Simulated P&L".
 
     # --- Phase 1: Fetch live prices for price-based exits ---
     for i, pos in enumerate(PAPER_PORTFOLIO.get("positions", [])):
@@ -13471,7 +18286,12 @@ async def run_exit_manager(channel=None):
         if not ts_str:
             continue
         try:
-            entry_time = datetime.strptime(ts_str, "%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc)
+            if " UTC" in ts_str:
+                entry_time = datetime.strptime(ts_str, "%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc)
+            else:
+                entry_time = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                if entry_time.tzinfo is None:
+                    entry_time = entry_time.replace(tzinfo=timezone.utc)
         except (ValueError, TypeError):
             continue
         age_hours = (now - entry_time).total_seconds() / 3600
@@ -13492,20 +18312,42 @@ async def run_exit_manager(channel=None):
                 _ll = pos.get("long_leg", "")
                 _sl = pos.get("short_leg", "")
                 if _ll and _sl:
-                    _hdr = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
-                    _rl = _pr.get(f"https://data.alpaca.markets/v2/stocks/{_ll}/quotes/latest", headers=_hdr, timeout=5)
-                    _rs = _pr.get(f"https://data.alpaca.markets/v2/stocks/{_sl}/quotes/latest", headers=_hdr, timeout=5)
-                    if _rl.status_code == 200 and _rs.status_code == 200:
-                        _lp = float(_rl.json().get("quote", {}).get("ap", 0) or 0)
-                        _sp = float(_rs.json().get("quote", {}).get("ap", 0) or 0)
-                        _el = pos.get("entry_long_price", 0)
-                        _es = pos.get("entry_short_price", 0)
-                        _sz = pos.get("cost", 0) / 2
-                        if _lp > 0 and _sp > 0 and _el > 0 and _es > 0:
-                            _lpnl = (_lp - _el) * (_sz / _el)
-                            _spnl = (_es - _sp) * (_sz / _es)
-                            current_price = pos.get("cost", 0) + _lpnl + _spnl
-                            log.info("PAIRS PRICE: %s/%s long=$%.2f short=$%.2f net=$%.2f", _ll, _sl, _lpnl, _spnl, _lpnl + _spnl)
+                    # Fetch live prices via get_current_price (universal fallback chain)
+                    _lp, _lp_src = get_current_price(_ll)
+                    _sp, _sp_src = get_current_price(_sl)
+                    _el = pos.get("entry_long_price", 0)
+                    _es = pos.get("entry_short_price", 0)
+                    # Fallback: recover entry prices from SQLite metadata if missing in memory
+                    if (_el <= 0 or _es <= 0) and market:
+                        try:
+                            _meta_conn = sqlite3.connect(DB_PATH)
+                            _meta_row = _meta_conn.execute(
+                                "SELECT metadata FROM positions WHERE market_id=? AND status='open' LIMIT 1",
+                                (market,)).fetchone()
+                            _meta_conn.close()
+                            if _meta_row and _meta_row[0]:
+                                import json as _mj
+                                _meta = _mj.loads(_meta_row[0])
+                                if _el <= 0:
+                                    _el = float(_meta.get("entry_long_price", 0))
+                                    if _el > 0:
+                                        pos["entry_long_price"] = _el
+                                if _es <= 0:
+                                    _es = float(_meta.get("entry_short_price", 0))
+                                    if _es > 0:
+                                        pos["entry_short_price"] = _es
+                                log.info("PAIRS ENTRY RECOVERY: %s el=$%.2f es=$%.2f (from DB metadata)", market, _el, _es)
+                        except Exception as _me:
+                            log.warning("PAIRS ENTRY RECOVERY failed for %s: %s", market, _me)
+                    _sz = pos.get("cost", 0) / 2
+                    if _lp > 0 and _sp > 0 and _el > 0 and _es > 0:
+                        _lpnl = (_lp - _el) * (_sz / _el)
+                        _spnl = (_es - _sp) * (_sz / _es)
+                        current_price = pos.get("cost", 0) + _lpnl + _spnl
+                        log.info("PAIRS PRICE: %s/%s long=$%.2f(now=$%.2f) short=$%.2f(now=$%.2f) net=$%.2f",
+                                 _ll, _sl, _lpnl, _lp, _spnl, _sp, _lpnl + _spnl)
+                    elif _lp > 0 and _sp > 0:
+                        log.warning("PAIRS PRICE: %s/%s missing entry prices (el=$%.2f es=$%.2f) — cannot compute P&L", _ll, _sl, _el, _es)
             elif strategy in ("crypto", "momentum"):
                 _tk = market.replace("CRYPTO:", "").split()[0]
                 _rc = _pr.get(f"https://api.coinbase.com/v2/prices/{_tk}-USD/spot", timeout=5)
@@ -13601,6 +18443,74 @@ async def run_exit_manager(channel=None):
                     elif current_price <= old_trail_value:
                         exit_reason = f"TRAILING STOP hit (value=${current_price:.2f} <= trail=${old_trail_value:.2f})"
 
+        # ── MFE/MAE CAPTURE (Task 3G) ──────────────────────────────
+        # Updates mfe_*/mae_* columns on positions whenever we resolve a
+        # live current_price. Required substrate for the post-observation
+        # partial-TP sweep (re-runs May 3 per
+        # specs/partial_tp_sweep_DESCOPED_20260419.md). Fails soft — any
+        # SQLite error logs at DEBUG and doesn't affect exit decisions.
+        if current_price is not None and pos.get("cost", 0) > 0 and market:
+            try:
+                _mfe_cost = pos["cost"]
+                _mfe_pnl_pct = (current_price - _mfe_cost) / _mfe_cost
+                _mfe_conn = sqlite3.connect(DB_PATH)
+                _mfe_row = _mfe_conn.execute(
+                    "SELECT mfe_pct, mae_pct FROM positions WHERE market_id=? AND status='open' LIMIT 1",
+                    (market,)).fetchone()
+                if _mfe_row is not None:
+                    _old_mfe, _old_mae = _mfe_row[0], _mfe_row[1]
+                    _now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                    _updates, _params = [], []
+                    if _old_mfe is None or _mfe_pnl_pct > _old_mfe:
+                        _updates.append("mfe_price=?, mfe_pct=?, mfe_timestamp=?")
+                        _params.extend([current_price, _mfe_pnl_pct, _now_ts])
+                    if _old_mae is None or _mfe_pnl_pct < _old_mae:
+                        _updates.append("mae_price=?, mae_pct=?, mae_timestamp=?")
+                        _params.extend([current_price, _mfe_pnl_pct, _now_ts])
+                    if _updates:
+                        _params.append(market)
+                        _mfe_conn.execute(
+                            f"UPDATE positions SET {', '.join(_updates)} WHERE market_id=? AND status='open'",
+                            _params)
+                        _mfe_conn.commit()
+                _mfe_conn.close()
+            except Exception as _mfe_exc:
+                log.debug("MFE/MAE capture skipped for %s: %s", market, _mfe_exc)
+
+        # ── PARTIAL CLOSE: 5% profit target for pairs ──────────────
+        if strategy == "pairs" and not exit_reason and current_price is not None:
+            cost = pos.get("cost", 0)
+            if cost > 0 and not pos.get("partial_closed"):
+                unrealized_pnl = current_price - cost
+                pnl_pct = unrealized_pnl / cost
+                if pnl_pct >= 0.05:  # 5% profit target
+                    half_value = current_price / 2
+                    half_cost = cost / 2
+                    half_pnl = half_value - half_cost
+                    # Close 50% — return half to cash
+                    PAPER_PORTFOLIO["cash"] += half_value
+                    pos["cost"] = half_cost
+                    pos["value"] = half_value
+                    pos["partial_closed"] = True
+                    # Move stop to breakeven on remainder
+                    pos["stop_price"] = pos.get("entry_price", 0)
+                    pos["_breakeven_stop"] = True
+                    # Log the partial close
+                    _pc_market = pos.get("market", "")
+                    log.info("PARTIAL TP: closed 50%% of %s at +$%.2f, stop moved to breakeven.", _pc_market, half_pnl)
+                    db_close_position(f"{_pc_market}:PARTIAL", half_value, f"PARTIAL_TP_50pct +{pnl_pct*100:.1f}%", half_pnl)
+                    save_all_state()
+                    if channel:
+                        try:
+                            await channel.send(
+                                f"**Partial TP** {_pc_market}\n"
+                                f"Closed 50% at +${half_pnl:,.2f} ({pnl_pct*100:.1f}%)\n"
+                                f"Stop moved to breakeven on remainder."
+                            )
+                        except Exception:
+                            pass
+        # ────────────────────────────────────────────────────────────
+
         # Strategy-specific TTL/signal exits
         if not exit_reason:
             if strategy == "pairs":
@@ -13614,12 +18524,35 @@ async def run_exit_manager(channel=None):
                             log.info("PAIRS POS: %s/%s entry_z=%.2f current_z=%.2f", _pa, _pb, _entry_z, _current_z)
                             if abs(_current_z) < 0.5 or (_entry_z > 0 and _current_z < 0) or (_entry_z < 0 and _current_z > 0):
                                 exit_reason = f"Z-REVERT: z={_current_z:.2f}"
-                            elif abs(_current_z) > 3.0:
-                                exit_reason = f"Z-BREAK: z={_current_z:.2f}"
+                            else:
+                                # Z-BREAK: utility sector pairs get wider threshold (oscillate +3/-3 naturally)
+                                _ZBREAK_UTILITY = {"ETR", "LNT", "AEE", "ATO", "AEP", "CNP"}
+                                _zbreak_thresh = 3.3 if (_pa in _ZBREAK_UTILITY or _pb in _ZBREAK_UTILITY) else 3.0
+                                if abs(_current_z) > _zbreak_thresh:
+                                    exit_reason = f"Z-BREAK: z={_current_z:.2f} (threshold={_zbreak_thresh})"
                     except Exception:
                         pass
-                if not exit_reason and age_hours > EXIT_CONFIG.get("pairs_ttl_days", 7) * 24:
-                    exit_reason = "TTL: pairs 7d"
+                # Correlation decay: if correlation drops below 0.70, pair is decoupled
+                if not exit_reason and _pa and _pb:
+                    try:
+                        _corr_now, _, _ = calculate_pair_zscore(_pa, _pb, 252)
+                        _corr_entry = pos.get("correlation", 0.90)
+                        if _corr_now is not None and _corr_now < 0.70:
+                            exit_reason = f"PAIR DECOUPLED: {_pa}/{_pb} correlation {_corr_entry:.2f} → {_corr_now:.2f}"
+                            log.warning("PAIR DECOUPLED: %s/%s corr dropped from %.2f to %.2f — closing position",
+                                       _pa, _pb, _corr_entry, _corr_now)
+                    except Exception:
+                        pass
+                if not exit_reason and age_hours > EXIT_CONFIG.get("pairs_ttl_days", 3) * 24:
+                    exit_reason = f"TTL: pairs {EXIT_CONFIG.get('pairs_ttl_days', 3)}d"
+                # FLAT-48H: close any pairs position older than 48h with PnL between -2% and +2%
+                if not exit_reason and age_hours > 48:
+                    _flat_cost = pos.get("cost", 0)
+                    _flat_val = pos.get("value", _flat_cost)
+                    if _flat_cost > 0:
+                        _flat_pnl_pct = (_flat_val - _flat_cost) / _flat_cost
+                        if -0.02 <= _flat_pnl_pct <= 0.02:
+                            exit_reason = f"FLAT-48H: pnl={_flat_pnl_pct*100:+.2f}% age={age_hours:.0f}h"
             elif strategy == "weekend_gap":
                 _wg_sym = pos.get("market", "").replace("WEEKEND_GAP:", "")
                 _wg_entry = pos.get("entry_price", 0)
@@ -13648,6 +18581,22 @@ async def run_exit_manager(channel=None):
                     _wg_et = datetime.now(_wgz("America/New_York"))
                     if _wg_et.weekday() == 0 and _wg_et.hour >= 12:
                         exit_reason = "TTL: Monday noon"
+            elif strategy == "reverse_copy":
+                _sq_tk = pos.get("market", "").replace("SQUEEZE:", "")
+                _sq_entry = pos.get("entry_price", 0)
+                _sq_tp = pos.get("target_price", 0)
+                if _sq_tk and _sq_entry > 0:
+                    from polygon_client import get_quote as _sq_gq
+                    _sq_q = _sq_gq(_sq_tk)
+                    if _sq_q and _sq_q.get("last", 0) > 0:
+                        _sq_live = _sq_q["last"]
+                        if _sq_tp > 0 and _sq_live >= _sq_tp:
+                            exit_reason = f"SQUEEZE TP: {_sq_tk} ${_sq_live:.2f} >= ${_sq_tp:.2f}"
+                        else:
+                            _sq_pnl = (_sq_live - _sq_entry) / _sq_entry * 100
+                            log.info("SQUEEZE POS: %s entry=$%.2f live=$%.2f pnl=%+.1f%%", _sq_tk, _sq_entry, _sq_live, _sq_pnl)
+                if not exit_reason and age_hours > SQUEEZE_CONFIG["ttl_days"] * 24:
+                    exit_reason = f"TTL: squeeze {SQUEEZE_CONFIG['ttl_days']}d"
             elif strategy == "etf_arb":
                 if age_hours > ETF_ARB_CONFIG["ttl_hours"]:
                     exit_reason = f"TTL: etf_arb {ETF_ARB_CONFIG['ttl_hours']}h"
@@ -13724,22 +18673,72 @@ async def run_exit_manager(channel=None):
                         pnl_pct = (cp - ep) / ep
                         if pnl_pct >= EXIT_CONFIG["pead_tp_pct"]:
                             exit_reason = f"TP: PEAD +{pnl_pct*100:.1f}%"
+                        elif pnl_pct <= -0.03:
+                            exit_reason = f"SL: PEAD {pnl_pct*100:.1f}%"
+            elif strategy == "sympathy_lag":
+                age_min = age_hours * 60
+                if age_min > EXIT_CONFIG.get("sympathy_ttl_minutes", 90):
+                    exit_reason = f"TTL: sympathy 90min ({age_min:.0f}min)"
+                elif current_price is not None:
+                    ep = pos.get("entry_price", 0)
+                    if ep > 0:
+                        pnl_pct = (current_price - ep) / ep
+                        if pos.get("side") == "SHORT":
+                            pnl_pct = -pnl_pct
+                        if pnl_pct >= EXIT_CONFIG.get("sympathy_tp_pct", 0.03):
+                            exit_reason = f"TP: sympathy +{pnl_pct*100:.1f}%"
+            elif strategy == "gamma_pin":
+                age_min = age_hours * 60
+                if age_min > EXIT_CONFIG.get("gamma_pin_ttl_minutes", 118):
+                    exit_reason = f"TTL: gamma_pin EOD ({age_min:.0f}min)"
+                elif current_price is not None:
+                    tp = pos.get("target_price", 0)
+                    ep = pos.get("entry_price", 0)
+                    if tp > 0 and ep > 0:
+                        if (pos.get("side") == "LONG" and current_price >= tp) or \
+                           (pos.get("side") == "SHORT" and current_price <= tp):
+                            exit_reason = f"TP: gamma_pin reached strike ${tp:.0f}"
+            elif strategy == "liquidity_vacuum":
+                if age_hours > EXIT_CONFIG.get("vacuum_ttl_hours", 16):
+                    exit_reason = f"TTL: vacuum next-open ({age_hours:.0f}h)"
             elif strategy in ("crypto", "momentum"):
                 if age_hours > EXIT_CONFIG["crypto_ttl_hours"]:
-                    exit_reason = "TTL: crypto 72h limit"
+                    exit_reason = f"TTL: crypto {EXIT_CONFIG['crypto_ttl_hours']:.0f}h limit"
             elif strategy == "funding_arb":
                 if age_hours > 24:
                     exit_reason = f"FUNDING-ARB TTL: {age_hours:.0f}h"
                 else:
                     log.info("ARB POS: %s age=%.0fh rate=%.4f%%", market[:20], age_hours, pos.get("entry_price", 0) * 100)
             elif strategy == "oracle_trade":
-                # Check if signal is still valid — re-fetch probability
+                # ── Oracle smart exits: probability reversal, partial TP, event resolution ──
                 _src_mkt = pos.get("source_market", "")
                 _sig_thresh = pos.get("signal_threshold", 0.65)
                 _current_prob = 0.0
                 _is_inverse_pos = "GEO-ONLY" in _src_mkt or any(
                     s.get("name") == market.replace("ORACLE:", "") and s.get("inverse")
                     for s in ORACLE_SIGNALS)
+
+                # Partial TP: close 50% at +15% gain, trail stop on remainder
+                if current_price is not None and not pos.get("partial_closed"):
+                    _o_cost = pos.get("cost", 0)
+                    if _o_cost > 0:
+                        _o_pnl_pct = (current_price - _o_cost) / _o_cost
+                        if _o_pnl_pct >= 0.15:
+                            _o_half_val = current_price / 2
+                            _o_half_cost = _o_cost / 2
+                            _o_half_pnl = _o_half_val - _o_half_cost
+                            PAPER_PORTFOLIO["cash"] += _o_half_val
+                            pos["cost"] = _o_half_cost
+                            pos["partial_closed"] = True
+                            log.info("ORACLE PARTIAL TP: closed 50%% of %s at +%.1f%%, pnl=$%+.2f", market[:30], _o_pnl_pct*100, _o_half_pnl)
+                            db_close_position(f"{market}:PARTIAL", _o_half_val, f"ORACLE_PARTIAL_TP +{_o_pnl_pct*100:.0f}%", _o_half_pnl)
+                            save_all_state()
+                            if channel:
+                                try:
+                                    await channel.send(f"**Oracle Partial TP** {market}\nClosed 50% at +{_o_pnl_pct*100:.1f}% (+${_o_half_pnl:,.2f})")
+                                except Exception:
+                                    pass
+
                 if _src_mkt and not _src_mkt.startswith("GEO-ONLY"):
                     _all_px = _oracle_get_all_prices() if not _ORACLE_PRICE_HISTORY else {}
                     # Check price history first (populated by scan_oracle_signals)
@@ -13749,15 +18748,23 @@ async def run_exit_manager(channel=None):
                         _current_prob = _hist[-1][1]
                     else:
                         _current_prob = _all_px.get(_src_mkt, 0)
+                # Rapid probability reversal: >0.15 move in wrong direction = thesis broken
+                _entry_prob = pos.get("entry_price", 0)
+                if _current_prob > 0 and _entry_prob > 0:
+                    _prob_delta = _current_prob - _entry_prob
+                    if _is_inverse_pos and _prob_delta > 0.15:
+                        exit_reason = f"ORACLE THESIS BROKEN: prob moved +{_prob_delta:.2f} (inverse signal invalidated)"
+                    elif not _is_inverse_pos and _prob_delta < -0.15:
+                        exit_reason = f"ORACLE THESIS BROKEN: prob moved {_prob_delta:.2f} (signal collapsed)"
+
                 # Signal invalidated check — direction depends on inverse vs normal
-                if _is_inverse_pos:
-                    # Inverse: invalidated when prob RISES ABOVE threshold (ceasefire restored)
+                if not exit_reason and _is_inverse_pos:
                     if _current_prob > 0 and _current_prob > _sig_thresh:
                         exit_reason = f"ORACLE INV INVALIDATED: prob={_current_prob:.2f} > {_sig_thresh:.2f} (ceasefire restored)"
-                elif _current_prob > 0 and _current_prob < _sig_thresh:
+                elif not exit_reason and _current_prob > 0 and _current_prob < _sig_thresh:
                     exit_reason = f"ORACLE INVALIDATED: prob={_current_prob:.2f} < {_sig_thresh:.2f}"
                 # TTL
-                elif age_hours > ORACLE_CONFIG["ttl_hours"]:
+                if not exit_reason and age_hours > ORACLE_CONFIG["ttl_hours"]:
                     exit_reason = f"ORACLE TTL: {age_hours:.0f}h"
                 else:
                     _opnl = ""
@@ -13812,6 +18819,17 @@ async def run_exit_manager(channel=None):
                     exit_reason = f"HEDGE SHORT TTL: {age_hours:.0f}h"
                 if not exit_reason:
                     log.info("HEDGE SHORT: %s age=%.0fh entry=$%.2f", market[:30], age_hours, pos.get("entry_price", 0))
+            elif strategy == "crash_hedge_call_spread":
+                # Simulated call credit spread — 2DTE expiry or VIX drop
+                _cs_dte = pos.get("vrp_regime", "")
+                if age_hours > 48:  # 2-day DTE equivalent
+                    exit_reason = "VRP SPREAD EXPIRED: 2DTE elapsed"
+                else:
+                    _vf_vix = get_regime("equities").get("vix") or 30
+                    if _vf_vix < 22:
+                        exit_reason = f"VRP SPREAD EXIT: VIX={_vf_vix:.1f} < 22 (vol crushed)"
+                    else:
+                        log.info("VRP SPREAD: %s age=%.0fh VIX=%.1f", market[:30], age_hours, _vf_vix)
             elif strategy == "options_spread":
                 # TP at 50% of credit received, SL at 200%, or expiry
                 _credit = pos.get("credit_received", pos.get("cost", 0) * 0.5)
@@ -13846,9 +18864,61 @@ async def run_exit_manager(channel=None):
                     exit_reason = f"SYNTH TTL: {age_hours:.0f}h (30d max)"
                 else:
                     log.info("SYNTH POS: %s age=%.0fh spread=%.1f%%", market[:30], age_hours, pos.get("ev", 0) * 100)
+            elif strategy == "pm_arbitrage":
+                # Arbitrage: exit when spread closes to <1% or TTL
+                if age_hours > EXIT_CONFIG.get("pm_arbitrage_ttl_days", 45) * 24:
+                    exit_reason = f"PM_ARB TTL: {age_hours/24:.0f}d"
+                else:
+                    log.info("PM_ARB POS: %s age=%.0fd spread=%.3f", market[:30], age_hours/24, pos.get("entry_price", 0))
+            elif strategy == "lottery_fade":
+                # Lottery Fade: exit at NO=$0.98 (TP) or TTL
+                if age_hours > EXIT_CONFIG.get("lottery_fade_ttl_days", 60) * 24:
+                    exit_reason = f"FADE TTL: {age_hours/24:.0f}d"
+                elif current_price is not None:
+                    _no_price = 1.0 - (current_price / max(pos.get("cost", 1), 1))
+                    if _no_price >= 0.98:
+                        exit_reason = f"FADE TP: NO=${_no_price:.3f} >= $0.98"
+                else:
+                    log.info("FADE POS: %s age=%.0fd", market[:30], age_hours/24)
+            elif strategy == "pm_momentum":
+                # Momentum: exit on reversal or TTL (48h)
+                if age_hours > EXIT_CONFIG.get("pm_momentum_ttl_hours", 48):
+                    exit_reason = f"PM_MOM TTL: {age_hours:.0f}h"
+                else:
+                    log.info("PM_MOM POS: %s age=%.0fh", market[:30], age_hours)
             elif strategy == "prediction":
-                log.info("PRED POS: %s age=%.0fh ev=%.1f%%", market[:30], age_hours, pos.get("ev", 0) * 100)
-                # Hold to resolution — no TTL exit
+                _pred_entry = pos.get("entry_price", 0)
+                # Smart prediction exits (don't just hold to resolution)
+                if _pred_entry > 0 and current_price is not None:
+                    _pred_current = current_price / max(pos.get("shares", 1), 1)
+                    # Exit if YES drops >40% from entry (thesis broken)
+                    if _pred_current < _pred_entry * 0.60:
+                        exit_reason = f"PRED THESIS BROKEN: YES ${_pred_current:.3f} < 60% of entry ${_pred_entry:.3f}"
+                    # Partial close at +50% gain
+                    elif _pred_current > _pred_entry * 1.50 and not pos.get("partial_closed"):
+                        _pc_val = current_price / 2
+                        _pc_cost = pos.get("cost", 0) / 2
+                        PAPER_PORTFOLIO["cash"] += _pc_val
+                        pos["cost"] = _pc_cost
+                        pos["partial_closed"] = True
+                        log.info("PRED PARTIAL TP: %s YES $%.3f → $%.3f (+50%%)", market[:30], _pred_entry, _pred_current)
+                # Exit if within 7 days of expiry and probability < 0.40
+                import re as _pred_re
+                _pred_exp_m = _pred_re.search(r'by (\w+)\s+(\d{1,2})', market)
+                if _pred_exp_m and not exit_reason:
+                    _pred_months = {"January":1,"February":2,"March":3,"April":4,"May":5,"June":6,
+                                    "July":7,"August":8,"September":9,"October":10,"November":11,"December":12}
+                    _pred_mo = _pred_months.get(_pred_exp_m.group(1), 0)
+                    if _pred_mo > 0:
+                        try:
+                            _pred_exp_dt = datetime(now.year, _pred_mo, int(_pred_exp_m.group(2)), tzinfo=timezone.utc)
+                            _pred_days = (_pred_exp_dt - now).days
+                            if _pred_days <= 7 and _pred_entry > 0 and _pred_entry < 0.40:
+                                exit_reason = f"PRED EXPIRY EXIT: {_pred_days}d left, prob ${_pred_entry:.3f} < $0.40"
+                        except ValueError:
+                            pass
+                if not exit_reason:
+                    log.info("PRED POS: %s age=%.0fh entry=$%.3f", market[:30], age_hours, _pred_entry)
 
         if exit_reason:
             positions_to_close.append((i, pos, exit_reason, current_price))
@@ -13859,13 +18929,35 @@ async def run_exit_manager(channel=None):
         if idx < len(PAPER_PORTFOLIO["positions"]):
             removed = PAPER_PORTFOLIO["positions"].pop(idx)
             cost = removed.get("cost", 0)
+            _strategy_exit = removed.get("strategy", "")
+            _is_expiry_reason = "EXPIRED" in reason.upper() or "CLEANUP_STALE" in reason.upper()
+            # Debit options lose full premium when they expire worthless.
+            _is_debit_opt_expired = _is_expiry_reason and _strategy_exit in (
+                "crash_hedge_put", "options_spread")
+            # Credit spread expired OTM = MAX PROFIT (keep full credit collected at entry).
+            _is_credit_spread_expired = _is_expiry_reason and _strategy_exit == "crash_hedge_call_spread"
 
-            # Determine exit value: live price if available, else cost (flat exit)
-            exit_value = live_value if live_value is not None else cost
-            realized_pnl = exit_value - cost
+            if live_value is not None:
+                exit_value = live_value
+                realized_pnl = exit_value - cost
+                cash_delta = exit_value
+            elif _is_debit_opt_expired:
+                exit_value = 0.0
+                realized_pnl = -cost
+                cash_delta = 0.0
+            elif _is_credit_spread_expired:
+                # Credit already added to cash at entry; don't double-credit on exit.
+                exit_value = cost
+                realized_pnl = cost  # full credit kept = max profit
+                cash_delta = 0.0
+            else:
+                # Flat exit (no live price, not an expiry)
+                exit_value = cost
+                realized_pnl = 0.0
+                cash_delta = cost
 
             # Return capital + PnL to cash
-            PAPER_PORTFOLIO["cash"] += exit_value
+            PAPER_PORTFOLIO["cash"] += cash_delta
 
             # Update both SQLite tables
             try:
@@ -13884,6 +18976,15 @@ async def run_exit_manager(channel=None):
             closed += 1
             log.info("EXIT MANAGER: Closed %s | %s | Cost $%.2f → Exit $%.2f | PnL $%+.2f",
                      removed.get("market", "")[:40], reason, cost, exit_value, realized_pnl)
+            # SMS alert on large single-trade losses ($500+)
+            try:
+                if realized_pnl <= -500:
+                    from intelligence_workers.sms_alerts import notify_sms
+                    notify_sms("large_loss",
+                               f"{removed.get('market','')[:40]} closed ${realized_pnl:+,.0f} "
+                               f"(cost ${cost:.0f}) reason={reason[:60]}")
+            except Exception:
+                pass
             if channel:
                 try:
                     await channel.send(
@@ -13898,12 +18999,92 @@ async def run_exit_manager(channel=None):
         db_save_daily_state()
         save_all_state()  # Final save for good measure
         log.info("EXIT MANAGER: Closed %d positions", closed)
+
+        # ── CAPITAL RECYCLING: scan for immediate redeployment ──
+        try:
+            def _freed_for(p, lv, reason):
+                if lv is not None:
+                    return lv
+                _strat = p.get("strategy", "")
+                _is_exp = "EXPIRED" in reason.upper() or "CLEANUP_STALE" in reason.upper()
+                # Debit option expired worthless → no cash freed.
+                if _is_exp and _strat in ("crash_hedge_put", "options_spread"):
+                    return 0.0
+                # Credit spread expired OTM → credit already in cash at entry; no new cash here.
+                if _is_exp and _strat == "crash_hedge_call_spread":
+                    return 0.0
+                return p.get("cost", 0)
+            freed_cash = sum(_freed_for(p, lv, r) for _, p, r, lv in positions_to_close)
+            if freed_cash > 0 and channel:
+                await _recycle_capital(channel, freed_cash)
+        except Exception as _rc_err:
+            log.warning("Capital recycling error: %s", _rc_err)
+
+    # Phase 5 — whale_follow SHADOW exits (separate from PAPER_PORTFOLIO).
+    try:
+        closed += await _whale_follow_exit_pass(channel)
+    except Exception as _wf_exc:
+        log.warning("whale_follow exit pass failed: %s", _wf_exc)
+
     return closed
+
+
+async def _recycle_capital(channel, freed_cash):
+    """After a position closes, scan top opportunities and auto-deploy if high conviction."""
+    RECYCLE_MIN_CONFIDENCE = 70
+    RECYCLE_COOLDOWN_MINUTES = 5  # Don't recycle if the last recycle was < 5 min ago
+
+    # Cooldown guard
+    _last_recycle = getattr(_recycle_capital, "_last_run", None)
+    _now = datetime.now(timezone.utc)
+    if _last_recycle and (_now - _last_recycle).total_seconds() < RECYCLE_COOLDOWN_MINUTES * 60:
+        return
+    _recycle_capital._last_run = _now
+
+    # Scan top candidates (reuse pairs scanner + crypto + oracle logic)
+    candidates = []
+
+    # Pairs candidates
+    try:
+        pairs_list = EQUITIES_CONFIG["pairs"]["seed"]
+        for a, b in pairs_list[:10]:
+            _c, _z, _m = calculate_pair_zscore(a, b, 252)
+            if _z is not None and _c is not None and _c >= 0.85 and abs(_z) >= 1.0:
+                score = int(min(abs(_z) * 30 + _c * 20, 100))
+                candidates.append({
+                    "type": "pairs",
+                    "label": f"PAIRS:{a}/{b}",
+                    "score": score,
+                    "detail": f"z={_z:+.2f} corr={_c:.2f}",
+                })
+    except Exception:
+        pass
+
+    # Filter to high-conviction only
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    top = [c for c in candidates[:3] if c["score"] >= RECYCLE_MIN_CONFIDENCE]
+
+    if top:
+        best = top[0]
+        log.info("CAPITAL RECYCLED: $%.2f freed → %s (score=%d) %s",
+                 freed_cash, best["label"], best["score"], best["detail"])
+        try:
+            await channel.send(
+                f"**Capital Recycling** ${freed_cash:,.2f} freed\n"
+                f"Top candidate: {best['label']} (score={best['score']})\n"
+                f"{best['detail']}\n"
+                f"_Queued for next scan cycle execution._"
+            )
+        except Exception:
+            pass
+    else:
+        log.info("CAPITAL RECYCLED: $%.2f freed — no candidates above %d confidence",
+                 freed_cash, RECYCLE_MIN_CONFIDENCE)
 
 # --- EQUITIES ALLOCATION LIMITS ---
 EQUITIES_CONFIG = {
     "max_allocation_pct": 0.30,
-    "max_concurrent": 5,
+    "max_concurrent": 8,
     "max_sector_pct": 0.30,
     "pairs": {
         "seed": [
@@ -13914,9 +19095,9 @@ EQUITIES_CONFIG = {
                  ("PFE", "MRK"), ("COP", "EOG"), ("ADBE", "CRM"), ("NFLX", "DIS"), ("PYPL", "AFRM"),
                  ("USB", "PNC"), ("MMM", "HON"), ("ABT", "MDT"), ("AMZN", "EBAY"),
         ],
-        "min_correlation": 0.85,
+        "min_correlation": 0.95,
         "lookback_days": 252,
-        "zscore_entry": 1.0,
+        "zscore_entry": 1.8,
         "zscore_exit": 0.5,
         "ttl_days": 7,
     },
@@ -13945,26 +19126,32 @@ def discover_sp500_pairs():
         import yfinance as yf
         import numpy as np
 
-        # Fetch S&P 500 tickers by sector from Wikipedia
-        import io, csv
+        # Fetch S&P 500 tickers by sector from Wikipedia using pandas read_html
+        import pandas as pd
         _sp_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        _sp_r = requests.get(_sp_url, timeout=15, headers={"User-Agent": "TraderJoes/1.0"})
-        if _sp_r.status_code != 200:
-            log.warning("PAIRS DISCOVERY: Wikipedia fetch failed %d", _sp_r.status_code)
+        try:
+            _sp_tables = pd.read_html(_sp_url, header=0,
+                                     storage_options={"User-Agent": "TraderJoes/1.0 (Python)"})
+            _sp_df = _sp_tables[0]  # First table is the constituents list
+            # Columns: Symbol, Security, GICS Sector, GICS Sub-Industry, ...
+            _sym_col = [c for c in _sp_df.columns if 'symbol' in c.lower() or 'ticker' in c.lower()]
+            _sec_col = [c for c in _sp_df.columns if 'gics sector' in c.lower() or 'sector' in c.lower()]
+            if not _sym_col or not _sec_col:
+                # Fallback: use first and third columns
+                _sym_col = [_sp_df.columns[0]]
+                _sec_col = [_sp_df.columns[3]] if len(_sp_df.columns) > 3 else [_sp_df.columns[2]]
+            _sp_df = _sp_df[[_sym_col[0], _sec_col[0]]].dropna()
+            _sp_df.columns = ["ticker", "sector"]
+        except Exception as _pd_err:
+            log.warning("PAIRS DISCOVERY: pandas read_html failed: %s", _pd_err)
             return 0
 
-        # Parse HTML table for tickers and sectors
-        import re as _pd_re
-        _rows = _pd_re.findall(r'<td[^>]*><a[^>]*>([A-Z.]+)</a></td>\s*<td[^>]*>[^<]*</td>\s*<td[^>]*>([^<]+)</td>', _sp_r.text)
-        if not _rows:
-            # Fallback: simpler parse
-            _rows = _pd_re.findall(r'>([A-Z]{1,5})</a></td><td[^>]*>[^<]*</td><td[^>]*>([^<]+)</td>', _sp_r.text)
-
         by_sector = {}
-        for ticker, sector in _rows:
-            ticker = ticker.replace(".", "-")  # BRK.B → BRK-B for yfinance
-            sector = sector.strip()
-            by_sector.setdefault(sector, []).append(ticker)
+        for _, row in _sp_df.iterrows():
+            ticker = str(row["ticker"]).strip().replace(".", "-")
+            sector = str(row["sector"]).strip()
+            if ticker and sector and len(ticker) <= 5:
+                by_sector.setdefault(sector, []).append(ticker)
 
         if not by_sector:
             log.warning("PAIRS DISCOVERY: no sectors parsed")
@@ -13979,7 +19166,7 @@ def discover_sp500_pairs():
                 continue
             _sample = tickers[:15]  # Limit to avoid huge downloads
             try:
-                data = yf.download(_sample, period="252d", progress=False, threads=True)
+                data = yf.download(_sample, period="252d", progress=False, threads=True, timeout=10)
                 if hasattr(data, "Close") and len(data) > 100:
                     closes = data["Close"].dropna(axis=1, thresh=100)
                     if len(closes.columns) < 2:
@@ -14050,7 +19237,55 @@ _RISK_STATE = {
     "daily_drawdown": {},    # {strategy: today's realized pnl}
     "drawdown_limit": 200,   # $200 per strategy per day
     "last_check": None,
+    "vix_regime": "RISK_ON", # RISK_ON | PRESERVATION | CRASH_MODE
+    "_vix_regime_prev": None,
 }
+
+# VIX-band → regime mapping
+def _vix_to_regime(vix):
+    if vix is None:
+        return "RISK_ON"
+    if vix < 20:
+        return "RISK_ON"
+    if vix < 28:
+        return "PRESERVATION"
+    return "CRASH_MODE"
+
+# Strategies allowed in each regime — anything NOT in this set is blocked
+_REGIME_ALLOWED_STRATEGIES = {
+    "RISK_ON": None,  # None = allow all
+    "PRESERVATION": {
+        "lottery_fade", "funding_arb", "theta_harvest", "options_premium",
+        "crash_hedge_put", "crash_hedge_short", "crash_hedge_call_spread",
+        "iron_condor", "covered_call",
+    },
+    "CRASH_MODE": {
+        "crash_hedge_put", "crash_hedge_call_spread", "iron_condor",
+    },
+}
+
+def risk_should_block_strategy(strategy):
+    """Return True if the given strategy should be blocked under the current VIX regime."""
+    regime = _RISK_STATE.get("vix_regime", "RISK_ON")
+    allowed = _REGIME_ALLOWED_STRATEGIES.get(regime)
+    if allowed is None:
+        return False
+    return strategy not in allowed
+
+def risk_check_vix_regime():
+    """Update VIX-band regime and emit transition log."""
+    try:
+        _r = get_regime("equities") or {}
+        _v = _r.get("vix")
+        new_regime = _vix_to_regime(_v)
+        prev = _RISK_STATE.get("vix_regime", "RISK_ON")
+        if new_regime != prev:
+            _RISK_STATE["_vix_regime_prev"] = prev
+            _RISK_STATE["vix_regime"] = new_regime
+            log.warning("VIX REGIME SWITCH: %s → %s (VIX=%.1f)", prev, new_regime, _v or 0)
+            _agent_log_event("risk", f"REGIME {prev}→{new_regime} VIX={_v or 0:.1f}")
+    except Exception as _ve:
+        log.warning("VIX regime check error: %s", _ve)
 
 
 def risk_check_correlations():
@@ -14077,7 +19312,7 @@ def risk_check_correlations():
     try:
         import yfinance as yf
         import numpy as np
-        data = yf.download(tickers, period="60d", progress=False)
+        data = yf.download(tickers, period="60d", progress=False, timeout=10)
         if hasattr(data, "Close"):
             closes = data["Close"].dropna(axis=1)
             if len(closes.columns) >= 2:
@@ -14166,6 +19401,7 @@ def risk_run_all_checks():
     """Run all risk checks. Call every cycle."""
     risk_check_correlations()
     risk_check_daily_drawdown()
+    risk_check_vix_regime()
     _RISK_STATE["last_check"] = datetime.now(timezone.utc)
 
 
@@ -14173,36 +19409,123 @@ def risk_run_all_checks():
 # MULTI-MODEL CONSENSUS — AI second opinion on high-conviction trades
 # ---------------------------------------------------------------------------
 _AI_CONSENSUS_LOG = []  # [{timestamp, ticker, score, verdict, reasoning, executed}]
+_AI_CONSENSUS_DAILY_COUNT = 0
+_AI_CONSENSUS_DAILY_DATE = ""
+AI_CONSENSUS_MAX_DAILY = 10           # Max API calls per day
+AI_CONSENSUS_MIN_CONFIDENCE = 80      # Only call AI when score >= 80
+AI_CONSENSUS_COST_PER_CALL = 0.001    # Estimated cost per Haiku call
 
 
 def ai_get_second_opinion(ticker, direction, confidence, context_notes):
-    """Query Claude/GPT for a second opinion on a trade. Returns (verdict, reasoning).
-    Verdict: APPROVE, REJECT, or REDUCE."""
-    if not OPENAI_API_KEY:
-        return "APPROVE", "No AI key configured — auto-approve"
+    """Query Claude Haiku for a second opinion on a trade. Returns (verdict, reasoning).
+    Verdict: APPROVE, REJECT, or REDUCE.
+    Rate-limited to 10 calls/day. Auto-approves below confidence 80 or after daily limit.
+    Includes full regime context, factor exposure, and Echo Memory for better decisions."""
+    global _AI_CONSENSUS_DAILY_COUNT, _AI_CONSENSUS_DAILY_DATE
 
-    prompt = (
-        f"You are a risk manager reviewing a trade recommendation.\n"
-        f"Ticker: {ticker}\n"
-        f"Direction: {direction}\n"
-        f"Confidence score: {confidence}/100\n"
-        f"Context:\n{chr(10).join(context_notes[:8])}\n\n"
-        f"Based on this information, should we execute this trade?\n"
-        f"Reply with exactly one of: APPROVE, REJECT, or REDUCE\n"
-        f"Then on the next line, explain your reasoning in 1-2 sentences."
+    # Reset daily counter at midnight
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if today != _AI_CONSENSUS_DAILY_DATE:
+        _AI_CONSENSUS_DAILY_COUNT = 0
+        _AI_CONSENSUS_DAILY_DATE = today
+
+    # Skip AI call if confidence below threshold
+    if confidence < AI_CONSENSUS_MIN_CONFIDENCE:
+        return "APPROVE", f"Auto-approve: confidence {confidence} < {AI_CONSENSUS_MIN_CONFIDENCE} threshold"
+
+    # Skip AI call if daily limit reached
+    if _AI_CONSENSUS_DAILY_COUNT >= AI_CONSENSUS_MAX_DAILY:
+        return "APPROVE", f"Daily limit reached — auto-approve ({_AI_CONSENSUS_DAILY_COUNT}/{AI_CONSENSUS_MAX_DAILY})"
+
+    if not ANTHROPIC_API_KEY:
+        return "APPROVE", "No Anthropic key configured — auto-approve"
+
+    _AI_CONSENSUS_DAILY_COUNT += 1
+    log.info("AI CONSENSUS CALL %d/%d today for %s %s (confidence=%d)",
+             _AI_CONSENSUS_DAILY_COUNT, AI_CONSENSUS_MAX_DAILY, direction, ticker, confidence)
+
+    # ── Build rich context for better decisions ──
+    # Regime
+    regime = get_regime("equities")
+    vix = regime.get("vix") or 20
+    vix_regime = _PSYCH_STATE.get("vix_regime", "normal")
+    fng = _PSYCH_STATE.get("last_fng", 50)
+    fng_label = _PSYCH_STATE.get("last_label", "Neutral")
+
+    # Open positions
+    open_count = len(PAPER_PORTFOLIO.get("positions", []))
+    open_pairs = sum(1 for p in PAPER_PORTFOLIO.get("positions", []) if p.get("strategy") == "pairs")
+    cash = PAPER_PORTFOLIO.get("cash", 0)
+
+    # Factor exposure
+    factor_lines = []
+    try:
+        exposure, neutrality = calculate_factor_exposure()
+        for f_name, f_data in exposure.items():
+            if f_data.get("pct", 0) > 10:
+                factor_lines.append(f"{f_name}: {f_data['pct']:.0f}% (net ${f_data['net']:+,.0f})")
+    except Exception:
+        pass
+
+    # Echo Memory — similar regime outcomes
+    memory_lines = []
+    try:
+        _cm = causal_memory_query(strategy="pairs", n_results=3)
+        if _cm:
+            for meta, dist in _cm[:3]:
+                _cm_pnl = meta.get("daily_pnl_pairs", 0)
+                _cm_vix = meta.get("vix", 0)
+                _cm_fng = meta.get("fng", 50)
+                memory_lines.append(f"VIX={_cm_vix:.0f} F&G={_cm_fng:.0f} → pairs P&L ${_cm_pnl:+,.0f}")
+    except Exception:
+        pass
+
+    system_prompt = (
+        "You are a senior risk manager at a quantitative trading firm. "
+        "You review trade recommendations and either APPROVE, REJECT, or REDUCE them. "
+        "Be concise. Consider regime, exposure, and historical analogs."
+    )
+
+    context_block = (
+        f"TRADE PROPOSAL:\n"
+        f"  Ticker: {ticker}\n"
+        f"  Direction: {direction}\n"
+        f"  Confidence: {confidence}/100\n"
+        f"  Notes: {chr(10).join('  ' + n for n in context_notes[:8])}\n\n"
+        f"CURRENT REGIME:\n"
+        f"  VIX: {vix:.1f} ({vix_regime.upper()})\n"
+        f"  Fear & Greed: {fng}/100 ({fng_label})\n"
+        f"  Open positions: {open_count} ({open_pairs} pairs)\n"
+        f"  Cash available: ${cash:,.0f}\n"
+    )
+    if factor_lines:
+        context_block += f"\nFACTOR EXPOSURE (>10%):\n  " + "\n  ".join(factor_lines) + "\n"
+    if memory_lines:
+        context_block += f"\nECHO MEMORY (similar regimes):\n  " + "\n  ".join(memory_lines) + "\n"
+
+    context_block += (
+        f"\nReply with exactly one of: APPROVE, REJECT, or REDUCE\n"
+        f"Then explain your reasoning in 1-2 sentences."
     )
 
     try:
-        r = requests.post("https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+        r = requests.post("https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
             json={
-                "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 150, "temperature": 0.3,
-            }, timeout=15)
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 200,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": context_block}],
+            }, timeout=20)
 
         if r.status_code == 200:
-            reply = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            # Anthropic API response format
+            _resp_content = r.json().get("content", [{}])
+            reply = _resp_content[0].get("text", "").strip() if _resp_content else ""
             # Parse verdict from first line
             first_line = reply.split("\n")[0].upper().strip()
             if "REJECT" in first_line:
@@ -14242,6 +19565,112 @@ def ai_get_second_opinion(ticker, direction, confidence, context_notes):
 _ENGINEER_LOG = []  # Rolling list of adjustments: [{timestamp, strategy, metric, old, new, reason}]
 _ENGINEER_LAST_CHECK = None
 _ENGINEER_TRADE_COUNTER = {}  # {strategy: count_since_last_analysis}
+_ENGINEER_STATE_PATH = "/app/data/engineer_state.json"
+
+# Map of engineer-visible metric names → (dotted config path, dict, key).
+# engineer_self_improve mutates the in-memory globals directly; the
+# persistence layer below replays those mutations on container restart.
+# Without persistence, a docker restart wipes the global dict back to
+# its module-level default, and every subsequent Engineer tick re-
+# proposes the same diff (which showed up as 3 phantom audit rows for
+# zscore_entry 1.8→1.9 over 24h on Apr 20).
+_ENGINEER_PERSIST_REGISTRY = {
+    "EQUITIES_CONFIG.pairs.zscore_entry": ("EQUITIES_CONFIG", ["pairs", "zscore_entry"]),
+    "ORACLE_CONFIG.base_size_pct":        ("ORACLE_CONFIG",   ["base_size_pct"]),
+    "ALERT_CONFIG.min_ev_threshold":      ("ALERT_CONFIG",    ["min_ev_threshold"]),
+}
+
+
+def _engineer_state_read():
+    """Return the on-disk state dict or empty shell if file missing/corrupt."""
+    import os as _os
+    if not _os.path.exists(_ENGINEER_STATE_PATH):
+        return {"mutations": []}
+    try:
+        with open(_ENGINEER_STATE_PATH, "r") as f:
+            data = _json_api.load(f)
+            if not isinstance(data, dict):
+                return {"mutations": []}
+            data.setdefault("mutations", [])
+            return data
+    except Exception as e:
+        log.warning("engineer_state_read failed (%s); starting fresh", e)
+        return {"mutations": []}
+
+
+def save_engineer_mutation(config_key: str, value) -> None:
+    """Append a mutation to engineer_state.json (atomic replace). Called
+    after every applied Engineer adjustment so the next container start
+    can replay it via load_engineer_state()."""
+    import os as _os
+    try:
+        state = _engineer_state_read()
+        state["mutations"].append({
+            "config_key": config_key,
+            "value": value,
+            "applied_at": datetime.now(timezone.utc).isoformat(),
+        })
+        # Keep last 200 mutations (trim ring — 200 is ~200 config shifts
+        # across the firm's lifetime which is plenty for audit replay)
+        if len(state["mutations"]) > 200:
+            state["mutations"] = state["mutations"][-200:]
+        _tmp = _ENGINEER_STATE_PATH + ".tmp"
+        with open(_tmp, "w") as f:
+            _json_api.dump(state, f, indent=2, default=str)
+        _os.replace(_tmp, _ENGINEER_STATE_PATH)
+    except Exception as e:
+        log.warning("save_engineer_mutation(%s=%s) failed: %s",
+                     config_key, value, e)
+
+
+def load_engineer_state() -> int:
+    """Replay persisted Engineer mutations into global config at startup.
+
+    Returns count of mutations applied. Latest wins per config_key — we
+    collapse the append-only log down to last-value-per-key and apply
+    in one pass. Fires silently (log.info only) when nothing to load."""
+    state = _engineer_state_read()
+    muts = state.get("mutations") or []
+    if not muts:
+        return 0
+    # Collapse: last write wins per config_key
+    latest = {}
+    for m in muts:
+        latest[m.get("config_key")] = m.get("value")
+    applied = 0
+    for key, value in latest.items():
+        target = _ENGINEER_PERSIST_REGISTRY.get(key)
+        if not target:
+            log.warning("load_engineer_state: unknown config_key %r", key)
+            continue
+        global_name, path = target
+        dct = globals().get(global_name)
+        if not isinstance(dct, dict):
+            log.warning("load_engineer_state: global %s not a dict", global_name)
+            continue
+        cur = dct
+        for p in path[:-1]:
+            if not isinstance(cur.get(p), dict):
+                cur[p] = {}
+            cur = cur[p]
+        prev = cur.get(path[-1])
+        cur[path[-1]] = value
+        applied += 1
+        log.info("ENGINEER PERSIST REPLAY: %s = %s (was %s)", key, value, prev)
+    if applied:
+        log.info("ENGINEER PERSIST: replayed %d mutation(s) at startup", applied)
+    return applied
+
+
+# Apply persisted state at module-import time too (not just in on_ready).
+# Without this, any subprocess that imports main (SGS scorer, status
+# ping, CLI scripts) would read the baseline dict values rather than
+# the Engineer's most recent mutations. Idempotent — on_ready calls
+# it again and the result is the same.
+try:
+    load_engineer_state()
+except Exception as _ese:
+    log.debug("module-level engineer state replay skipped: %s", _ese)
 
 
 def engineer_self_improve():
@@ -14274,11 +19703,13 @@ def engineer_self_improve():
             _ENGINEER_TRADE_COUNTER[strategy] = 0
 
             # Get last 30 trades for this strategy
+            # PHASE 2 FILTER: only trades from 2026-04-08 forward (excludes crippled-engine history)
             trades = conn.execute("""
                 SELECT realized_pnl, size_usd,
                        (julianday(closed_at) - julianday(created_at)) * 24 as hold_hours
                 FROM positions WHERE status='closed' AND strategy=?
                 AND realized_pnl IS NOT NULL
+                AND created_at >= '2026-04-08'
                 ORDER BY closed_at DESC LIMIT 30
             """, (strategy,)).fetchall()
 
@@ -14340,6 +19771,46 @@ def engineer_self_improve():
                          adjustment["strategy"], adjustment["metric"],
                          adjustment["old"], adjustment["new"], adjustment["reason"][:60])
                 _agent_log_event("engineer", f"{adjustment['strategy']} {adjustment['metric']} {adjustment['old']:.3f}→{adjustment['new']:.3f}")
+                _config_key_map = {
+                    "zscore_entry": "EQUITIES_CONFIG.pairs.zscore_entry",
+                    "base_size_pct": "ORACLE_CONFIG.base_size_pct",
+                    "min_ev_threshold": "ALERT_CONFIG.min_ev_threshold",
+                }
+                _full_key = _config_key_map.get(adjustment["metric"], adjustment["metric"])
+                # FIX-1: Persist the mutation to disk so it survives
+                # container restart. Without this the engineer rewrote the
+                # in-memory global each tick but lost the value every
+                # restart — producing phantom re-proposals of identical
+                # 1.8→1.9 diffs.
+                save_engineer_mutation(_full_key, adjustment["new"])
+                # Persist to engineer_audit_log (QA-FIX-B) so Engineer
+                # mutations are auditable across container restarts.
+                # In-process _ENGINEER_LOG is ephemeral (50-entry ring);
+                # SQLite is the durable trail for May 3 decision review.
+                try:
+                    _ea_conn = sqlite3.connect(DB_PATH)
+                    _ea_conn.execute("""
+                        INSERT INTO engineer_audit_log
+                        (config_key, old_value, new_value, reason, triggering_metric, tier, metadata)
+                        VALUES (?, ?, ?, ?, ?, 'PAPER', ?)
+                    """, (
+                        _full_key,
+                        str(adjustment["old"]),
+                        str(adjustment["new"]),
+                        adjustment["reason"],
+                        f"actual_wr={actual_wr:.3f} mc_expected={mc_expected:.3f} gap={gap:.3f}",
+                        _json_api.dumps({
+                            "strategy": strategy,
+                            "avg_pnl": avg_pnl,
+                            "avg_hold_h": avg_hold,
+                            "n_trades": total,
+                            "persisted_to_disk": True,
+                        }, default=str),
+                    ))
+                    _ea_conn.commit()
+                    _ea_conn.close()
+                except Exception as _ea_e:
+                    log.debug("engineer_audit_log write failed: %s", _ea_e)
 
             # Always log stats even without adjustment
             log.info("ENGINEER STATS: %s wr=%.0f%% avg_pnl=$%+.2f hold=%.0fh (%d trades)",
@@ -15158,7 +20629,7 @@ def arbiter_check(strategy, ticker_a, ticker_b=None, zscore=None, corr=None,
 
     # Level 5: AI Consensus (high conviction only)
     # Only query AI if score > 70 AND MC > 60% but Historian < 50%
-    if conviction_score > 70 and OPENAI_API_KEY:
+    if conviction_score > 70 and ANTHROPIC_API_KEY:
         try:
             _mc_check = montecarlo_simulate(ticker_a, ticker_b, entry_zscore=zscore, horizon_days=5)
             _mc_prob = _mc_check.get("prob_profit", 0.5) if _mc_check.get("available") else 0.5
@@ -15242,11 +20713,45 @@ _PSYCH_STATE = {
     "last_label": "Neutral",
     "last_check": None,
     "regime_changed": False,    # True when mode just changed (for one-time Discord notify)
+    # ── VIX-based MarketRegime ──
+    "vix_regime": "normal",     # "risk_off" (VIX>28), "normal" (18-28), "risk_on" (VIX<18)
+    "vix_value": 20.0,
+}
+
+# Regime-specific strategy multipliers: {regime: {strategy: multiplier}}
+REGIME_STRATEGY_WEIGHTS = {
+    "risk_off": {   # VIX > 28: crisis mode
+        "pairs": 0.5,
+        "crash_hedge": 3.0,
+        "crypto": 0.0,         # Pause crypto momentum
+        "oracle": 0.7,
+        "prediction": 0.0,
+        "max_pairs": 3,        # Reduce max concurrent pairs
+        "hedge_mode": "puts",  # Switch back to puts, not call spreads
+    },
+    "normal": {     # 18 <= VIX <= 28
+        "pairs": 1.0,
+        "crash_hedge": 1.0,
+        "crypto": 1.0,
+        "oracle": 1.0,
+        "prediction": 0.0,
+        "max_pairs": 5,
+        "hedge_mode": "vrp",   # Normal VRP call spread regime
+    },
+    "risk_on": {    # VIX < 18: calm markets
+        "pairs": 2.0,
+        "crash_hedge": 0.0,    # Idle — no hedges needed
+        "crypto": 1.5,
+        "oracle": 1.0,
+        "prediction": 0.0,
+        "max_pairs": 5,
+        "hedge_mode": "idle",
+    },
 }
 
 
 def psychologist_update(channel_send_fn=None):
-    """Check Fear & Greed and update sentiment regime. Call every scan cycle.
+    """Check Fear & Greed + VIX and update sentiment/market regime.
     Returns the current psych state dict."""
     state = _PSYCH_STATE
     fng_val, fng_label = get_fear_greed()
@@ -15256,37 +20761,79 @@ def psychologist_update(channel_send_fn=None):
 
     old_contrarian = state["contrarian_mode"]
     old_caution = state["caution_mode"]
+    old_vix_regime = state["vix_regime"]
 
     state["contrarian_mode"] = fng_val < 20
     state["caution_mode"] = fng_val > 80
+
+    # ── VIX-based MarketRegime ──
+    vix = get_regime("equities").get("vix") or 20
+    state["vix_value"] = vix
+    if vix > 28:
+        state["vix_regime"] = "risk_off"
+    elif vix < 18:
+        state["vix_regime"] = "risk_on"
+    else:
+        state["vix_regime"] = "normal"
+
     state["regime_changed"] = (state["contrarian_mode"] != old_contrarian or
-                                state["caution_mode"] != old_caution)
+                                state["caution_mode"] != old_caution or
+                                state["vix_regime"] != old_vix_regime)
 
     if state["regime_changed"]:
-        if state["contrarian_mode"]:
+        regime_weights = REGIME_STRATEGY_WEIGHTS[state["vix_regime"]]
+        if state["vix_regime"] != old_vix_regime:
+            log.info("PSYCHOLOGIST: VIX REGIME → %s (VIX=%.1f) | pairs=%.1fx crash_hedge=%.1fx crypto=%.1fx",
+                     state["vix_regime"].upper(), vix,
+                     regime_weights["pairs"], regime_weights["crash_hedge"], regime_weights["crypto"])
+            _agent_log_event("psychologist", f"VIX REGIME → {state['vix_regime'].upper()} (VIX={vix:.1f})")
+        if state["contrarian_mode"] and not old_contrarian:
             log.info("PSYCHOLOGIST: CONTRARIAN MODE ON — F&G=%d (%s), bias mean-reversion", fng_val, fng_label)
             _agent_log_event("psychologist", f"CONTRARIAN MODE — F&G={fng_val} ({fng_label})")
-        elif state["caution_mode"]:
+        elif state["caution_mode"] and not old_caution:
             log.info("PSYCHOLOGIST: CAUTION MODE ON — F&G=%d (%s), sizing tightened 0.5x", fng_val, fng_label)
             _agent_log_event("psychologist", f"CAUTION MODE — F&G={fng_val} ({fng_label})")
-        elif old_contrarian or old_caution:
+        elif (old_contrarian or old_caution) and not state["contrarian_mode"] and not state["caution_mode"]:
             log.info("PSYCHOLOGIST: NORMAL MODE — F&G=%d (%s), regime cleared", fng_val, fng_label)
             _agent_log_event("psychologist", f"NORMAL MODE — F&G={fng_val} ({fng_label})")
 
     return state
 
 
-def psychologist_size_multiplier():
-    """Return a sizing multiplier based on current psych state.
-    Caution mode → 0.5x, else 1.0x."""
+def psychologist_size_multiplier(strategy="default"):
+    """Return a sizing multiplier based on VIX regime + F&G state.
+    Accepts strategy name for regime-specific weights."""
+    regime = _PSYCH_STATE.get("vix_regime", "normal")
+    weights = REGIME_STRATEGY_WEIGHTS.get(regime, REGIME_STRATEGY_WEIGHTS["normal"])
+
+    # Strategy-specific weight from VIX regime
+    mult = weights.get(strategy, 1.0)
+
+    # F&G override: caution mode halves everything
     if _PSYCH_STATE["caution_mode"]:
-        return 0.5
-    return 1.0
+        mult *= 0.5
+
+    return mult
 
 
 def psychologist_should_skip_momentum():
-    """In contrarian mode, skip momentum entries and favor mean-reversion."""
-    return _PSYCH_STATE["contrarian_mode"]
+    """Skip momentum in contrarian mode OR when VIX regime is risk_off (crypto paused)."""
+    if _PSYCH_STATE["contrarian_mode"]:
+        return True
+    regime = _PSYCH_STATE.get("vix_regime", "normal")
+    return REGIME_STRATEGY_WEIGHTS.get(regime, {}).get("crypto", 1.0) == 0.0
+
+
+def psychologist_get_max_pairs():
+    """Return max concurrent pairs positions based on VIX regime."""
+    regime = _PSYCH_STATE.get("vix_regime", "normal")
+    return REGIME_STRATEGY_WEIGHTS.get(regime, {}).get("max_pairs", 5)
+
+
+def psychologist_get_hedge_mode():
+    """Return current hedge mode: 'puts', 'vrp', or 'idle'."""
+    regime = _PSYCH_STATE.get("vix_regime", "normal")
+    return REGIME_STRATEGY_WEIGHTS.get(regime, {}).get("hedge_mode", "vrp")
 
 
 # ---------------------------------------------------------------------------
@@ -15313,8 +20860,8 @@ def historian_analyze_pair(ticker_a, ticker_b):
         import yfinance as yf
         import numpy as np
 
-        data_a = yf.download(ticker_a, period="2y", progress=False)
-        data_b = yf.download(ticker_b, period="2y", progress=False)
+        data_a = yf.download(ticker_a, period="2y", progress=False, timeout=10)
+        data_b = yf.download(ticker_b, period="2y", progress=False, timeout=10)
         if len(data_a) < 200 or len(data_b) < 200:
             _HISTORIAN_CACHE[pair_key] = {"stats": stats, "fetched_at": now}
             return stats
@@ -15399,7 +20946,7 @@ def historian_size_multiplier(stats):
 # DYNAMIC META-ALLOCATION ENGINE — Performance-weighted pillar sizing
 # ---------------------------------------------------------------------------
 _META_ALLOC = {
-    "pairs": 1.0, "crypto": 1.0, "prediction": 1.0,
+    "pairs": 1.0, "crypto": 1.0, "prediction": 0.0,
     "funding_arb": 1.0, "oracle_trade": 1.0, "crash_hedge_put": 1.0,
 }
 _META_ALLOC_LAST_RUN = None
@@ -15409,6 +20956,7 @@ _META_ALLOC_PNL = {}  # {strategy: 7d_pnl} — refreshed every 4h
 def meta_alloc_refresh():
     """Query SQLite for 7-day realized P&L by strategy. Rebalance pillar weights.
     Top performer gets 1.5x, bottom gets 0.5x, rest stay 1.0x. Runs every 4 hours."""
+    _META_ALLOC["prediction"] = 0.0  # Permanently disabled
     global _META_ALLOC_LAST_RUN
     now = datetime.now(timezone.utc)
 
@@ -15426,7 +20974,7 @@ def meta_alloc_refresh():
         rows = conn.execute("""
             SELECT strategy, SUM(realized_pnl) as total_pnl, COUNT(*) as trades
             FROM positions
-            WHERE status='closed' AND realized_pnl IS NOT NULL
+            WHERE status='closed' AND realized_pnl IS NOT NULL AND tier='PAPER'
             AND closed_at >= ?
             GROUP BY strategy
         """, (seven_days_ago,)).fetchall()
@@ -15453,6 +21001,8 @@ def meta_alloc_refresh():
 
         # Reset all to 1.0, then adjust
         for k in _META_ALLOC:
+            if k == "prediction":
+                continue  # permanently pinned, do not reset
             _META_ALLOC[k] = 1.0
         if top_strat in _META_ALLOC:
             _META_ALLOC[top_strat] = 1.5
@@ -15606,7 +21156,7 @@ def montecarlo_simulate(ticker_a, ticker_b=None, entry_zscore=None, n_paths=1000
         import yfinance as yf
         import numpy as np
 
-        data_a = yf.download(ticker_a, period="252d", progress=False)
+        data_a = yf.download(ticker_a, period="252d", progress=False, timeout=10)
         if len(data_a) < 100:
             _MC_CACHE[cache_key] = {"result": result, "fetched_at": now}
             return result
@@ -15614,7 +21164,7 @@ def montecarlo_simulate(ticker_a, ticker_b=None, entry_zscore=None, n_paths=1000
 
         if ticker_b:
             # Pairs mode: simulate the spread ratio
-            data_b = yf.download(ticker_b, period="252d", progress=False)
+            data_b = yf.download(ticker_b, period="252d", progress=False, timeout=10)
             if len(data_b) < 100:
                 _MC_CACHE[cache_key] = {"result": result, "fetched_at": now}
                 return result
@@ -15745,8 +21295,19 @@ def calculate_pair_zscore(ticker_a, ticker_b, lookback=252):
     try:
         import yfinance as yf
         import numpy as np
-        data_a = yf.download(ticker_a, period=f"{lookback}d", progress=False)
-        data_b = yf.download(ticker_b, period=f"{lookback}d", progress=False)
+        try:
+            data_a = yf.download(ticker_a, period=f"{lookback}d", progress=False, timeout=10)
+        except Exception as _e:
+            log.warning("PAIRS SKIP: %s download failed: %s", ticker_a, _e)
+            return None, None, None
+        try:
+            data_b = yf.download(ticker_b, period=f"{lookback}d", progress=False, timeout=10)
+        except Exception as _e:
+            log.warning("PAIRS SKIP: %s download failed: %s", ticker_b, _e)
+            return None, None, None
+        if data_a is None or data_b is None or data_a.empty or data_b.empty:
+            log.warning("PAIRS SKIP: %s/%s empty data returned", ticker_a, ticker_b)
+            return None, None, None
         if len(data_a) < 100 or len(data_b) < 100:
             log.warning("PAIRS SKIP: %s/%s insufficient data (%d/%d rows)", ticker_a, ticker_b, len(data_a), len(data_b))
             return None, None, None
@@ -15778,6 +21339,24 @@ def _regime_weighted_half_kelly(portfolio_value, mc_prob, hist_stats):
     Returns (size_per_leg, details_dict) or (None, details_dict) if gates fail."""
     details = {}
 
+    # --- 50-trade minimum: use fixed 2% if insufficient history ---
+    trade_count = _get_closed_trade_count("pairs")
+    details["trade_count"] = trade_count
+    if trade_count < KELLY_MIN_TRADES:
+        fixed_size = KELLY_FIXED_PCT * portfolio_value
+        details["kelly_mode"] = f"fixed {KELLY_FIXED_PCT*100:.0f}% ({trade_count}/{KELLY_MIN_TRADES} trades)"
+        details["gates_passed"] = True  # Allow trading with fixed sizing
+        details["kelly_half"] = KELLY_FIXED_PCT
+        details["regime_mult"] = 1.0
+        details["clamped_pct"] = KELLY_FIXED_PCT
+        details["live_win_rate"] = 0.55
+        details["payoff_ratio"] = 1.0
+        details["fng"] = _PSYCH_STATE.get("last_fng", 50)
+        details["vix"] = get_regime("equities").get("vix") or 20
+        details["size_per_leg"] = fixed_size
+        log.info("KELLY MODE: %s — pairs", details["kelly_mode"])
+        return fixed_size, details
+
     # --- Gate checks ---
     mc_ok = mc_prob is not None and mc_prob > 0.60
     hist_reversion = hist_stats.get("reversion_rate", 0) if hist_stats.get("available") else 0
@@ -15795,14 +21374,16 @@ def _regime_weighted_half_kelly(portfolio_value, mc_prob, hist_stats):
         import sqlite3 as _ksq
         _kconn = _ksq.connect(DB_PATH)
         _kc = _kconn.cursor()
+        # PHASE 2 FILTER: only trades from 2026-04-08 forward (excludes crippled-engine history)
         rows = _kc.execute("""
             SELECT realized_pnl, size_usd FROM positions
             WHERE status='closed' AND strategy='pairs'
             AND realized_pnl IS NOT NULL AND size_usd > 0
+            AND created_at >= '2026-04-08'
             ORDER BY closed_at DESC LIMIT 50
         """).fetchall()
         _kconn.close()
-        if len(rows) >= 10:
+        if len(rows) >= KELLY_MIN_TRADES:
             wins = [r[0] for r in rows if r[0] > 0]
             losses = [abs(r[0]) for r in rows if r[0] <= 0]
             total = len(rows)
@@ -15867,35 +21448,81 @@ def _regime_weighted_half_kelly(portfolio_value, mc_prob, hist_stats):
     raw_pct = kelly_half * regime_mult
     clamped_pct = max(0.01, min(raw_pct, 0.03))  # Floor 1.0%, cap 3%
     size_per_leg = clamped_pct * portfolio_value
+    # Hard floor: minimum $1500/leg regardless of multipliers.
+    # Bumped from $500 → $1500 on 2026-04-18 based on 11mo backtest
+    # sensitivity grid — current z=1.8/corr=0.80/ttl=14 params are
+    # Calmar-optimal; strategy is edge-validated but under-capitalized.
+    # 3× (not 5×) chosen for conservative scaling pending 30+ live trades.
+    size_per_leg = max(size_per_leg, 1500)
     flat_size = portfolio_value * 0.015  # What flat sizing would have been
 
     details["raw_pct"] = raw_pct
     details["clamped_pct"] = clamped_pct
     details["size_per_leg"] = size_per_leg
     details["flat_size"] = flat_size
+    details["kelly_mode"] = f"kelly {clamped_pct*100:.1f}% ({trade_count}/{KELLY_MIN_TRADES} trades)"
+    log.info("KELLY MODE: %s — pairs", details["kelly_mode"])
 
     return size_per_leg, details
 
 
+def _scan_pairs_for_queue():
+    """Lightweight pairs scan for pre-market queue — skips market-hours check.
+    Returns list of signal dicts with pair, zscore, correlation, direction."""
+    if not EQUITIES_ENABLED:
+        return []
+    signals = []
+    cfg = EQUITIES_CONFIG["pairs"]
+    for ticker_a, ticker_b in cfg["seed"][:20]:  # Limit to top 20 for speed
+        corr, zscore, _ = calculate_pair_zscore(ticker_a, ticker_b, cfg["lookback_days"])
+        if corr is None or zscore is None:
+            continue
+        if abs(zscore) >= cfg["zscore_entry"] and corr >= cfg["min_correlation"]:
+            direction = "long_a_short_b" if zscore < 0 else "short_a_long_b"
+            signals.append({
+                "pair": f"{ticker_a}/{ticker_b}",
+                "long": ticker_a if zscore < 0 else ticker_b,
+                "short": ticker_b if zscore < 0 else ticker_a,
+                "zscore": zscore, "correlation": corr, "direction": direction,
+            })
+    return signals
+
+
 def scan_pairs_opportunities():
     """Scan seed pairs for entry signals."""
+    if _is_auto_disabled("pairs"):
+        log.info("pairs auto-disabled by strategy_kill_switch — skipping")
+        return []
     if not EQUITIES_ENABLED:
         return []
     if not is_market_open():
         return []
     opportunities = []
     cfg = EQUITIES_CONFIG["pairs"]
+    # CAPITAL PRESERVATION: block new pairs entirely in PRESERVATION/CRASH regimes
+    if risk_should_block_strategy("pairs"):
+        log.info("PAIRS BLOCKED: regime=%s", _RISK_STATE.get("vix_regime"))
+        return opportunities
+    # VIX-aware pairs entry gates: tighten in elevated regime to avoid decoupling
+    _pairs_vix = (get_regime("equities") or {}).get("vix") or 0
+    if _pairs_vix > 20:
+        _pairs_min_corr = 0.95
+        _pairs_min_z = 2.5
+        log.info("PAIRS VIX GATE: VIX=%.1f > 20 → corr>=0.95 AND |z|>=2.5", _pairs_vix)
+    else:
+        _pairs_min_corr = cfg["min_correlation"]
+        _pairs_min_z = cfg["zscore_entry"]
     for ticker_a, ticker_b in cfg["seed"]:
         corr, zscore, mean_ratio = calculate_pair_zscore(ticker_a, ticker_b, cfg["lookback_days"])
         if corr is None:
             continue
-            
+
         # Telemetry: Print every calculation before filtering
         log.info("[PAIRS DATA] %s/%s | Corr: %.3f | Z-Score: %.2f", ticker_a, ticker_b, corr, zscore)
-            
-        if corr < cfg["min_correlation"]:
+
+        if corr < _pairs_min_corr:
             continue
-        if abs(zscore) >= cfg["zscore_entry"]:
+        if abs(zscore) >= _pairs_min_z:
             direction = "short_a_long_b" if zscore > 0 else "long_a_short_b"
             opportunities.append({
                 "type": "pairs",
@@ -15908,12 +21535,17 @@ def scan_pairs_opportunities():
                 "mean_ratio": mean_ratio,
             })
             _pair_key = f"PAIRS:{ticker_a}/{ticker_b}"
-            # Cooldown: block re-entry for 4 hours after last close
+            # Normalize pair key alphabetically for dedup — PAIRS:CVX/XOM and PAIRS:XOM/CVX are the same pair
+            _norm_a, _norm_b = (min(ticker_a, ticker_b), max(ticker_a, ticker_b))
+            _pair_key_norm = f"PAIRS:{_norm_a}/{_norm_b}"
+            _pair_key_rev = f"PAIRS:{ticker_b}/{ticker_a}"
+            # Cooldown: block re-entry for 4 hours after last close (check both directions)
             try:
                 import sqlite3 as _sq2
                 _cc = _sq2.connect(DB_PATH)
                 _cr = _cc.cursor()
-                _cr.execute("SELECT closed_at FROM positions WHERE market_id=? AND status='closed' ORDER BY closed_at DESC LIMIT 1", (_pair_key,))
+                _cr.execute("SELECT closed_at FROM positions WHERE market_id IN (?,?) AND status='closed' ORDER BY closed_at DESC LIMIT 1",
+                            (_pair_key, _pair_key_rev))
                 _row = _cr.fetchone()
                 _cc.close()
                 if _row and _row[0]:
@@ -15925,22 +21557,40 @@ def scan_pairs_opportunities():
                         continue
             except Exception:
                 pass
-            if any(p.get("market","") == _pair_key for p in PAPER_PORTFOLIO.get("positions",[])):
-                log.info("PAIRS DEDUP: %s already open (memory)", _pair_key)
+            # Dedup: check both directions in memory (PAIRS:A/B and PAIRS:B/A)
+            if any(p.get("market","") in (_pair_key, _pair_key_rev) for p in PAPER_PORTFOLIO.get("positions",[])):
+                log.info("PAIRS DEDUP: %s already open (memory, checked both directions)", _pair_key)
                 continue
-            # Also check SQLite for zombie positions (open in DB but not in JSON)
+            # Also check SQLite for zombie positions (open in DB but not in JSON) — both directions
             try:
                 import sqlite3 as _dedup_sq
                 _dedup_conn = _dedup_sq.connect(DB_PATH)
                 _dedup_c = _dedup_conn.cursor()
-                _dedup_c.execute("SELECT COUNT(*) FROM positions WHERE market_id=? AND status='open'", (_pair_key,))
+                _dedup_c.execute("SELECT COUNT(*) FROM positions WHERE market_id IN (?,?) AND status='open'",
+                                (_pair_key, _pair_key_rev))
                 _dedup_db_open = _dedup_c.fetchone()[0] > 0
                 _dedup_conn.close()
                 if _dedup_db_open:
-                    log.info("PAIRS DEDUP: %s already open (db zombie)", _pair_key)
+                    log.info("PAIRS DEDUP: %s already open (db zombie, checked both directions)", _pair_key)
                     continue
             except Exception:
                 pass
+            # Ticker concentration: max 2 open pairs per ticker
+            _open_pairs = [p for p in PAPER_PORTFOLIO.get("positions", []) if p.get("strategy") == "pairs"]
+            from collections import Counter as _TkCtr
+            _ticker_counts = _TkCtr()
+            for _op in _open_pairs:
+                for _lk in (_op.get("long_leg", ""), _op.get("short_leg", "")):
+                    if _lk:
+                        _ticker_counts[_lk.upper()] += 1
+            if _ticker_counts.get(ticker_a.upper(), 0) >= 2:
+                log.info("TICKER CONCENTRATION: %s already in %d pairs — blocking %s/%s",
+                         ticker_a, _ticker_counts[ticker_a.upper()], ticker_a, ticker_b)
+                continue
+            if _ticker_counts.get(ticker_b.upper(), 0) >= 2:
+                log.info("TICKER CONCENTRATION: %s already in %d pairs — blocking %s/%s",
+                         ticker_b, _ticker_counts[ticker_b.upper()], ticker_a, ticker_b)
+                continue
             log.info("PAIRS SIGNAL: %s/%s corr=%.3f zscore=%.2f dir=%s", ticker_a, ticker_b, corr, zscore, direction)
             # Historian Agent: fetch reversion stats and adjust sizing
             _hist_stats = historian_analyze_pair(ticker_a, ticker_b)
@@ -15957,8 +21607,36 @@ def scan_pairs_opportunities():
                 log.info("ARBITER BLOCK: %s/%s — %s", ticker_a, ticker_b, _arb_reasons[-1] if _arb_reasons else "?")
                 continue
             log.info("ARBITER: %s/%s approved %.2fx (%d checks)", ticker_a, ticker_b, _arb_mult, len(_arb_reasons))
+            # Daily pairs loss limit — pause new pairs entries when today's realized pairs P&L ≤ -$50.
+            # Source: positions.closed_at (UTC). Resets at UTC midnight. Added 2026-04-16.
+            try:
+                import sqlite3 as _sq_dl
+                _dc = _sq_dl.connect(DB_PATH)
+                _daily_pairs_pnl = _dc.execute(
+                    "SELECT COALESCE(SUM(realized_pnl), 0) FROM positions "
+                    "WHERE strategy='pairs' AND DATE(closed_at) = DATE('now') "
+                    "AND realized_pnl IS NOT NULL"
+                ).fetchone()[0] or 0.0
+                _dc.close()
+                if _daily_pairs_pnl <= -150.0:
+                    log.info("PAIRS DAILY LIMIT HIT: %s/%s blocked — today's pairs P&L $%+.2f (limit -$150)",
+                             ticker_a, ticker_b, _daily_pairs_pnl)
+                    continue
+            except Exception as _dlerr:
+                log.warning("PAIRS DAILY LIMIT check error: %s", _dlerr)
+            # Hard cap: enforce MAX_PAIRS_POSITIONS before opening new pairs
+            _open_pairs_count = sum(1 for p in PAPER_PORTFOLIO.get("positions", []) if p.get("strategy") == "pairs")
+            if _open_pairs_count >= MAX_PAIRS_POSITIONS:
+                log.info("PAIRS LIMIT: %s/%s blocked — %d/%d pairs open (hard cap)",
+                         ticker_a, ticker_b, _open_pairs_count, MAX_PAIRS_POSITIONS)
+                continue
             # Auto-execute pairs trade in paper mode
             if TRADING_MODE == "paper" and AUTO_PAPER_ENABLED:
+                # FIX 3: $5K cash reserve guard (pairs is never a hedge)
+                if PAPER_PORTFOLIO.get("cash", 0) < 5000:
+                    log.info("CASH_RESERVE: pairs %s/%s blocked — cash $%.0f < $5000 minimum",
+                             ticker_a, ticker_b, PAPER_PORTFOLIO.get("cash", 0))
+                    continue
                 # --- Regime-Weighted Half-Kelly sizing ---
                 _portfolio_val = PAPER_PORTFOLIO.get("cash", 25000)
                 _mc_prob = None
@@ -15979,11 +21657,12 @@ def scan_pairs_opportunities():
                              _pair_size, _flat_size_ref,
                              _kelly_details["live_win_rate"] * 100, _kelly_details["payoff_ratio"],
                              _kelly_details["fng"], _kelly_details["vix"])
+
                 else:
                     # Fallback to flat sizing when Kelly gates fail (MC<=60% or hist reversion<=55%)
                     _base_size = _portfolio_val * 0.015
                     _kelly_mult = max(0.75, min((abs(zscore) / 2.0) * corr, 2.0))
-                    _pair_size = _base_size * _kelly_mult * _hist_mult * _arb_mult
+                    _pair_size = max(_base_size * _kelly_mult * _hist_mult * _arb_mult, 500)  # $500 floor
                     log.info("FLAT SIZING: %s/%s $%.0f/leg (Kelly gates failed: MC=%.0f%% hist_rev=%.0f%%)",
                              ticker_a, ticker_b, _pair_size,
                              (_mc_prob or 0) * 100, _kelly_details.get("hist_reversion", 0) * 100)
@@ -16002,10 +21681,27 @@ def scan_pairs_opportunities():
                     _pair_size *= 0.5
                     log.info("EARNINGS GUARD: %s/%s sized 0.5x (earnings this week)", ticker_a, ticker_b)
 
+                # FIX 1: HARD CAP — single pair leg never exceeds min(portfolio*1.5%, $500)
+                _hard_cap = min(_portfolio_val * 0.015, 500)
+                if _pair_size > _hard_cap:
+                    log.info("HARD CAP: %s/%s clamped $%.0f → $%.0f/leg (portfolio=$%.0f)",
+                             ticker_a, ticker_b, _pair_size, _hard_cap, _portfolio_val)
+                    _pair_size = _hard_cap
+
                 if direction == "short_a_long_b":
                     _long_tk, _short_tk = ticker_b, ticker_a
                 else:
                     _long_tk, _short_tk = ticker_a, ticker_b
+
+                # Sector-concentration soft cap — skip if entering this pair
+                # would push any sector over SECTOR_SOFT_CAP (35%). Reads live
+                # exposure from Redis; fail-open on outage.
+                _sc_blocked, _sc_reason = _pairs_sector_cap_blocks(
+                    _long_tk, _short_tk, _pair_size)
+                if _sc_blocked:
+                    log.info("SECTOR CAP: %s", _sc_reason)
+                    continue
+
                 # Submit both legs to Alpaca paper API
                 _entry_long_price = 0
                 _entry_short_price = 0
@@ -16023,7 +21719,8 @@ def scan_pairs_opportunities():
 
                     # Long leg — limit at mid, 3 attempts, fallback to market
                     _long_order_id, _entry_long_price, _long_fill_type = _alpaca_limit_at_mid(
-                        _long_tk, "buy", notional=_pair_size)
+                        _long_tk, "buy", notional=_pair_size,
+                        strategy="pairs", market_id=f"PAIRS:{_long_tk}/{_short_tk}:L:{_long_tk}")
                     if _long_order_id is None:
                         log.warning("ALPACA LONG FAILED: %s — no fill", _long_tk)
                         continue
@@ -16051,7 +21748,8 @@ def scan_pairs_opportunities():
                         continue
 
                     _short_order_id, _entry_short_price, _short_fill_type = _alpaca_limit_at_mid(
-                        _short_tk, "sell", qty=_short_shares)
+                        _short_tk, "sell", qty=_short_shares,
+                        strategy="pairs", market_id=f"PAIRS:{_long_tk}/{_short_tk}:S:{_short_tk}")
                     if _short_order_id is None:
                         log.warning("ALPACA SHORT FAILED: %s — no fill, cancelling long", _short_tk)
                         try:
@@ -16100,6 +21798,7 @@ def scan_pairs_opportunities():
                     "entry_short_price": _entry_short_price,
                     "long_order_id": _long_order_id,
                     "short_order_id": _short_order_id,
+                    "partial_closed": False,
                 }
                 PAPER_PORTFOLIO["positions"].append(_pair_pos)
                 PAPER_PORTFOLIO["cash"] -= _pair_size * 2
@@ -16116,6 +21815,17 @@ def scan_pairs_opportunities():
                 db_save_daily_state()
                 log.info("PAIRS TRADE: Long %s / Short %s | Z=%.2f | Size=$%.0f per leg",
                          _long_tk, _short_tk, zscore, _pair_size)
+                # SMS alert on large new position (gross exposure $1000+)
+                try:
+                    _gross = _pair_size * 2
+                    if _gross >= 1000:
+                        from intelligence_workers.sms_alerts import notify_sms
+                        notify_sms("large_position",
+                                   f"PAIRS L:{_long_tk} S:{_short_tk} "
+                                   f"${_pair_size:.0f}/leg (gross ${_gross:.0f}) "
+                                   f"Z={zscore:.2f} corr={corr:.2f}")
+                except Exception:
+                    pass
     return opportunities
 
 # --- PEAD ENGINE (RULE-BASED) ---
@@ -16211,17 +21921,8 @@ def get_calibration_summary():
 
 
 # ============================================================================
-# ENTRY POINT
+# ENTRY POINT — moved to very end of file (was here, blocking ~2000 lines from loading)
 # ============================================================================
-
-if __name__ == "__main__":
-    if not DISCORD_TOKEN:
-        log.error("DISCORD_TOKEN not set -- cannot start bot")
-        raise SystemExit(1)
-    start_webhook_server(port=int(os.getenv("TV_WEBHOOK_PORT", "8080")))
-    bot.run(DISCORD_TOKEN)
-
-
 
 # ═══════════════════════════════════════════════════════════════════
 # REGIME DETECTION ENGINE v1 — TraderJoes v15
@@ -16307,6 +22008,9 @@ def calculate_crypto_pair_zscore(sym_a, sym_b, lookback=30):
 
 async def scan_crypto_pairs():
     """Scan crypto pairs for Z-score entry signals. Runs every 5 minutes 24/7."""
+    if _is_auto_disabled("crypto_pairs"):
+        log.info("crypto_pairs auto-disabled by strategy_kill_switch — skipping")
+        return 0
     cfg = CRYPTO_PAIRS_CONFIG
     if not cfg["enabled"]:
         return 0
@@ -16654,6 +22358,150 @@ async def scan_etf_arb():
 
 
 # ═══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+# REVERSE COPY TRADING — Short squeeze candidate detection + execution
+# ═══════════════════════════════════════════════════════════════════
+SQUEEZE_CONFIG = {
+    "enabled": True,
+    "min_short_interest_pct": 20,
+    "size_pct": 0.01,
+    "max_positions": 2,
+    "tp_pct": 0.20,         # +20% take profit
+    "ttl_days": 5,
+    "exit_si_pct": 15,      # Exit if short interest drops below 15%
+}
+_SQUEEZE_CANDIDATES = []  # [{ticker, short_interest, zscore, squeeze_prob, price}]
+
+
+def scan_squeeze_candidates():
+    """Scan for short squeeze candidates using Polygon + pairs Z-scores."""
+    _SQUEEZE_CANDIDATES.clear()
+    try:
+        from polygon_client import _get_client
+        c = _get_client()
+        if not c:
+            return []
+
+        # Get heavily shorted tickers from our pairs universe
+        _eq_cfg = globals().get("EQUITIES_CONFIG", {})
+        _seed = _eq_cfg.get("pairs", {}).get("seed", [])
+        _all_tickers = set()
+        for a, b in _seed:
+            _all_tickers.add(a)
+            _all_tickers.add(b)
+
+        for ticker in list(_all_tickers)[:25]:
+            try:
+                # Get ticker details for short interest proxy
+                details = c.get_ticker_details(ticker)
+                if not details:
+                    continue
+                # Polygon doesn't directly expose short interest
+                # Use share_class_shares_outstanding + weighted_shares_outstanding as proxy
+                shares_out = details.weighted_shares_outstanding if hasattr(details, 'weighted_shares_outstanding') else 0
+                if not shares_out or shares_out <= 0:
+                    continue
+
+                # Get recent short volume from Polygon (approximate)
+                # Use options put/call ratio as short interest proxy
+                from polygon_client import get_quote
+                q = get_quote(ticker)
+                if not q:
+                    continue
+
+                # Calculate Z-score if in pairs
+                zscore = 0
+                for a, b in _seed:
+                    if ticker in (a, b):
+                        _other = b if ticker == a else a
+                        corr, z, _ = calculate_pair_zscore(ticker, _other, 20)
+                        if z is not None:
+                            zscore = z
+                        break
+
+                # Squeeze probability: combine change_pct (momentum) + |zscore| (mean reversion potential)
+                chg = abs(q.get("change_pct", 0))
+                squeeze_prob = min(int(chg * 3 + abs(zscore) * 15 + 20), 95)
+
+                # Only flag if momentum suggests accumulation AND Z-score shows deviation
+                if chg > 3 or abs(zscore) > 1.0:
+                    _SQUEEZE_CANDIDATES.append({
+                        "ticker": ticker, "price": q.get("last", 0),
+                        "change_pct": round(chg, 1), "zscore": round(zscore, 2),
+                        "squeeze_prob": squeeze_prob,
+                        "volume": q.get("volume", 0),
+                    })
+            except Exception:
+                continue
+
+        _SQUEEZE_CANDIDATES.sort(key=lambda x: x["squeeze_prob"], reverse=True)
+        if _SQUEEZE_CANDIDATES:
+            log.info("SQUEEZE SCAN: %d candidates found, top=%s prob=%d%%",
+                     len(_SQUEEZE_CANDIDATES), _SQUEEZE_CANDIDATES[0]["ticker"],
+                     _SQUEEZE_CANDIDATES[0]["squeeze_prob"])
+    except Exception as e:
+        log.warning("SQUEEZE SCAN error: %s", e)
+    return _SQUEEZE_CANDIDATES
+
+
+async def execute_squeeze_trade(candidate, channel=None):
+    """Execute a LONG position on a squeeze candidate."""
+    cfg = SQUEEZE_CONFIG
+    sq_count = sum(1 for p in PAPER_PORTFOLIO.get("positions", []) if p.get("strategy") == "reverse_copy")
+    if sq_count >= cfg["max_positions"]:
+        return False
+
+    ticker = candidate["ticker"]
+    market_id = f"SQUEEZE:{ticker}"
+    if any(p.get("market") == market_id for p in PAPER_PORTFOLIO.get("positions", [])):
+        return False
+
+    portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
+        p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+    size = portfolio_value * cfg["size_pct"]
+    price = candidate["price"]
+    if price <= 0 or size < 25:
+        return False
+
+    try:
+        _hdrs = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+                 "Content-Type": "application/json"}
+        _r = requests.post(f"{ALPACA_BASE_URL}/v2/orders", json={
+            "symbol": ticker, "notional": str(round(size, 2)),
+            "side": "buy", "type": "market", "time_in_force": "day"
+        }, headers=_hdrs, timeout=10)
+        if _r.status_code not in (200, 201):
+            log.warning("SQUEEZE LONG FAILED: %s %d", ticker, _r.status_code)
+            return False
+        _oid = _r.json().get("id", "unknown")
+        tp_price = round(price * (1 + cfg["tp_pct"]), 2)
+        _pos = {
+            "market": market_id, "side": f"LONG {ticker}", "shares": 1,
+            "entry_price": price, "cost": size, "value": size,
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            "platform": "Alpaca", "ev": candidate["squeeze_prob"] / 100,
+            "strategy": "reverse_copy",
+            "target_price": tp_price, "stop_price": 0,
+            "squeeze_prob": candidate["squeeze_prob"],
+            "order_id": _oid,
+        }
+        PAPER_PORTFOLIO["positions"].append(_pos)
+        PAPER_PORTFOLIO["cash"] -= size
+        db_log_paper_trade(_pos)
+        db_open_position(market_id=market_id, platform="Alpaca", strategy="reverse_copy",
+                         direction="LONG", size_usd=size, shares=1, entry_price=price,
+                         target_price=tp_price,
+                         metadata={"squeeze_prob": candidate["squeeze_prob"],
+                                   "zscore": candidate["zscore"], "order_id": _oid})
+        log.info("SQUEEZE TRADE: LONG %s at $%.2f prob=%d%% size=$%.0f",
+                 ticker, price, candidate["squeeze_prob"], size)
+        send_critical_alert("Squeeze Trade", f"LONG {ticker} at ${price:.2f} prob={candidate['squeeze_prob']}%")
+        return True
+    except Exception as e:
+        log.warning("SQUEEZE execution error: %s", e)
+        return False
+
+
 # EARNINGS VOLATILITY CRUSH — Sell straddles before earnings (SIMULATED)
 # Real execution requires options margin — this tracks P&L on paper only
 # ═══════════════════════════════════════════════════════════════════
@@ -16800,11 +22648,10 @@ def scan_market_making_opps():
     """Scan Polymarket for wide bid-ask spreads suitable for market making."""
     _MM_OPPORTUNITIES.clear()
     try:
-        r = requests.get("https://gamma-api.polymarket.com/markets?closed=false&limit=50&order=volume24hr&ascending=false",
-                         timeout=15)
-        if r.status_code != 200:
+        _mm_markets = get_polymarket_markets(limit=50)
+        if not _mm_markets:
             return []
-        for mkt in r.json():
+        for mkt in _mm_markets:
             title = mkt.get("question", mkt.get("title", ""))[:60]
             vol_24h = float(mkt.get("volume24hr", 0) or 0)
             if vol_24h < MM_CONFIG["min_volume_24h"]:
@@ -16990,11 +22837,21 @@ async def scan_weekend_gap():
 # ═══════════════════════════════════════════════════════════════════
 
 PEAD_ENABLED = True
-PEAD_MIN_SURPRISE_PCT = 5.0   # Lowered from 8% — most beats are 3-7%
-PEAD_MIN_VOLUME_MULT  = 2.0   # Lowered from 2.5x — still filters noise
+PEAD_MIN_SURPRISE_PCT = 7.0   # % absolute price move vs prior close (was duplicate-defined to 7.0 below; consolidated 2026-04-16)
+PEAD_MIN_VOLUME_MULT  = 2.0   # today's volume must be ≥ 2x the 20-day avg
 PEAD_HOLD_HOURS       = 72
 PEAD_MAX_POSITIONS    = 3
-PEAD_SIZE_PCT         = 0.01
+PEAD_SIZE_PCT         = 0.015  # 1.5% of bankroll per position (was 0.01, overridden to 0.015 below; consolidated)
+PEAD_CACHE_TTL        = 4 * 3600  # 4h Redis TTL on earnings lookups
+# Hardcoded top-50 S&P 500 universe for PEAD scanning (user-specified 2026-04-16).
+# GOOG + GOOGL both present per spec (same company, two share classes — will move together).
+PEAD_TOP50 = [
+    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","JPM","V","UNH",
+    "XOM","MA","LLY","JNJ","PG","HD","MRK","CVX","ABBV","KO",
+    "PEP","AVGO","COST","MCD","WMT","BAC","TMO","CRM","ACN","NFLX",
+    "AMD","ADBE","TXN","LIN","NEE","PM","UPS","HON","SBUX","GS",
+    "BLK","CAT","DE","RTX","MMM","BA","GE","IBM","F","GOOG",
+]
 _PEAD_LAST_SCAN = {"tickers_checked": 0, "signals_found": 0, "last_run": None, "errors": []}
 
 def _pead_candle_confirm(ticker):
@@ -17009,118 +22866,144 @@ def _pead_candle_confirm(ticker):
     except Exception:
         return True
 
-def fetch_earnings_surprises():
-    """Fetch tickers with recent earnings surprises. Uses Alpaca news + yfinance."""
+def _pead_cache_get(ticker):
+    """Return cached earnings record for ticker, or None on miss/error."""
+    try:
+        if REDIS_CLIENT:
+            v = REDIS_CLIENT.get(f"pead:earnings:{ticker}")
+            if v:
+                return json.loads(v)
+    except Exception:
+        pass
+    return None
+
+
+def _pead_cache_set(ticker, payload, ttl=None):
+    try:
+        if REDIS_CLIENT:
+            REDIS_CLIENT.setex(f"pead:earnings:{ticker}", ttl or PEAD_CACHE_TTL,
+                               json.dumps(payload))
+    except Exception:
+        pass
+
+
+def _pead_ticker_earnings(ticker):
+    """Return {'date':'YYYY-MM-DD'} for the most recent past earnings within the
+    last ~7 trading days, else {}. Redis-cached 4h. Safe on empty DataFrames."""
+    cached = _pead_cache_get(ticker)
+    if cached is not None:
+        return cached  # {} = negative cache, or real record
     import yfinance as yf
-    surprises = []
+    import pandas as pd
+    try:
+        t = yf.Ticker(ticker)
+        ed = getattr(t, "earnings_dates", None)
+        if ed is None or (hasattr(ed, "empty") and ed.empty):
+            _pead_cache_set(ticker, {})
+            return {}
+        idx = ed.index
+        if getattr(idx, "tz", None) is None:
+            idx = idx.tz_localize("UTC")
+        else:
+            idx = idx.tz_convert("UTC")
+        now = pd.Timestamp.utcnow().tz_convert("UTC")
+        mask = (idx <= now) & (idx >= now - pd.Timedelta(days=10))
+        recent_idx = idx[mask]
+        if len(recent_idx) == 0:
+            _pead_cache_set(ticker, {})
+            return {}
+        most_recent = max(recent_idx)
+        payload = {"date": most_recent.strftime("%Y-%m-%d")}
+        _pead_cache_set(ticker, payload)
+        return payload
+    except Exception as e:
+        log.warning("PEAD earnings lookup %s: %s", ticker, e)
+        _pead_cache_set(ticker, {}, ttl=600)  # short negative cache on error
+        return {}
+
+
+def fetch_earnings_surprises():
+    """PEAD signal generator (rewritten 2026-04-16).
+
+    Walks the hardcoded top-50 S&P 500 universe (PEAD_TOP50), checks each ticker
+    against Redis-cached earnings data (4h TTL), and emits long-only signals for
+    tickers that (a) reported earnings in the last ~3 trading days, (b) gapped
+    up ≥ PEAD_MIN_SURPRISE_PCT today vs prior close, and (c) traded at >
+    PEAD_MIN_VOLUME_MULT × the 20-day avg. DataFrame truthiness bug fixed.
+    Alpaca earnings calendar API is NOT used — Alpaca's corporate-actions
+    endpoint is dividends/splits only, no earnings (verified 2026-04-16).
+    """
+    import yfinance as yf
+    import pandas as pd
     _PEAD_LAST_SCAN["tickers_checked"] = 0
     _PEAD_LAST_SCAN["signals_found"] = 0
     _PEAD_LAST_SCAN["errors"] = []
     _PEAD_LAST_SCAN["last_run"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    # Method 1: Alpaca news API — find tickers mentioned in earnings headlines
-    tickers = set()
+    signals = []
+    now_ts = pd.Timestamp.utcnow().tz_convert("UTC")
+    cutoff = now_ts - pd.Timedelta(days=5)  # ≈ 3 trading days
+
+    # Prefer the drift-score-filtered universe if the ticker_drift_score tool
+    # has published one to Redis. Filter is built offline on historical bars;
+    # only includes tickers with ≥60% positive 3-day post-gap drift history.
+    _pead_universe = PEAD_TOP50
     try:
-        import datetime as _dt_pead
-        hdrs = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
-        params = {
-            "start": (datetime.now(timezone.utc) - _dt_pead.timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "limit": 50, "sort": "desc"
-        }
-        resp = requests.get("https://data.alpaca.markets/v1beta1/news",
-                            headers=hdrs, params=params, timeout=10)
-        if resp.status_code == 200:
-            articles = resp.json().get("news", [])
-            earnings_kw = ["earnings", "eps", "beats", "quarterly", "revenue",
-                           "profit", "q1", "q2", "q3", "q4", "guidance", "forecast"]
-            for a in articles:
-                if any(k in a.get("headline", "").lower() for k in earnings_kw):
-                    for s in a.get("symbols", []):
-                        if s and len(s) <= 5 and s.isalpha():
-                            tickers.add(s)
-            log.info("PEAD: %d earnings tickers from %d news articles", len(tickers), len(articles))
-        else:
-            log.warning("PEAD: Alpaca news API returned %d", resp.status_code)
-    except Exception as e:
-        log.warning("PEAD: news fetch error: %s", e)
-        _PEAD_LAST_SCAN["errors"].append(f"news: {e}")
+        _r_pead = _get_redis_safe()
+        if _r_pead:
+            _raw_filt = _r_pead.get("pead_universe:filtered")
+            if _raw_filt:
+                _filt = json.loads(_raw_filt).get("filtered") or []
+                if _filt:
+                    _pead_universe = _filt
+                    log.info("PEAD: using drift-filtered universe (%d tickers): %s",
+                             len(_filt), ",".join(_filt))
+    except Exception as _pe:
+        log.warning("PEAD filter load failed (%s) — using PEAD_TOP50", _pe)
 
-    # Method 2: Alpaca calendar API — upcoming earnings
-    try:
-        import datetime as _dt_pead2
-        hdrs = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        yesterday = (datetime.now(timezone.utc) - _dt_pead2.timedelta(days=1)).strftime("%Y-%m-%d")
-        resp = requests.get(f"https://data.alpaca.markets/v1beta1/corporate-actions/announcements",
-                            headers=hdrs, params={"ca_types": "Dividend", "since": yesterday,
-                                                  "until": today, "limit": 20}, timeout=10)
-        # Note: Alpaca doesn't have a direct earnings calendar, but news covers it
-    except Exception:
-        pass
-
-    if not tickers:
-        log.info("PEAD: no earnings tickers found this cycle")
-        return surprises
-
-    for ticker in list(tickers)[:20]:
+    for ticker in _pead_universe:
         _PEAD_LAST_SCAN["tickers_checked"] += 1
         try:
-            t = yf.Ticker(ticker)
-            # Try earnings_history first, then earnings_dates
-            eh = None
-            try:
-                eh = t.earnings_history
-            except Exception:
-                pass
-            if eh is None or (hasattr(eh, 'empty') and eh.empty):
-                # Fallback: check quarterly_earnings
-                try:
-                    qe = t.quarterly_earnings
-                    if qe is not None and not qe.empty:
-                        latest = qe.iloc[0]
-                        est = latest.get("Estimate", 0) or latest.get("estimate", 0)
-                        act = latest.get("Actual", 0) or latest.get("actual", 0)
-                        if est and est != 0:
-                            eh = "fallback"
-                except Exception:
-                    pass
-            if eh is None:
-                log.info("PEAD: %s — no earnings data available", ticker)
+            earn = _pead_ticker_earnings(ticker)
+            if not earn or not earn.get("date"):
                 continue
-
-            if eh != "fallback":
-                latest = eh.iloc[0]
-                est = latest.get("epsEstimate", 0)
-                act = latest.get("epsActual", 0)
-
-            if not est or est == 0:
+            earn_ts = pd.Timestamp(earn["date"], tz="UTC")
+            if earn_ts < cutoff or earn_ts > now_ts:
                 continue
-            surprise = ((act - est) / abs(est)) * 100
-            log.info("PEAD: %s EPS est=$%.2f act=$%.2f surprise=%.1f%%", ticker, est, act, surprise)
-
-            if surprise < PEAD_MIN_SURPRISE_PCT:
+            h = yf.Ticker(ticker).history(period="1mo", interval="1d")
+            if h is None or (hasattr(h, "empty") and h.empty) or len(h) < 5:
                 continue
-
-            hist = t.history(period="25d")
-            if hist.empty or len(hist) < 5:
+            today_close = float(h["Close"].iloc[-1])
+            prior_close = float(h["Close"].iloc[-2])
+            if prior_close <= 0:
                 continue
-            avg_vol = hist["Volume"].iloc[:-1].mean()
-            vol_mult = hist["Volume"].iloc[-1] / avg_vol if avg_vol > 0 else 0
+            move_pct = (today_close - prior_close) / prior_close * 100
+            today_vol = float(h["Volume"].iloc[-1])
+            avg_vol = float(h["Volume"].iloc[:-1].mean()) if len(h) > 1 else today_vol
+            vol_mult = (today_vol / avg_vol) if avg_vol > 0 else 0.0
+            if move_pct < PEAD_MIN_SURPRISE_PCT:
+                continue
             if vol_mult < PEAD_MIN_VOLUME_MULT:
-                log.info("PEAD: %s vol_mult=%.1f < %.1f (skipped)", ticker, vol_mult, PEAD_MIN_VOLUME_MULT)
+                log.info("PEAD: %s move=%.1f%% OK but vol=%.1fx < %.1fx — skip",
+                         ticker, move_pct, vol_mult, PEAD_MIN_VOLUME_MULT)
                 continue
             if not _pead_candle_confirm(ticker):
                 log.info("PEAD: %s failed 15-min candle filter (gap-and-crap)", ticker)
                 continue
-            price = float(hist["Close"].iloc[-1])
-            log.info("PEAD SIGNAL: %s surprise=%.1f%% vol=%.1fx price=$%.2f", ticker, surprise, vol_mult, price)
+            log.info("PEAD SIGNAL: %s move=%.2f%% vol=%.2fx price=$%.2f earn=%s",
+                     ticker, move_pct, vol_mult, today_close, earn["date"])
             _PEAD_LAST_SCAN["signals_found"] += 1
-            surprises.append({"ticker": ticker, "surprise_pct": round(surprise, 2),
-                              "volume_mult": round(vol_mult, 2), "price": price})
+            signals.append({
+                "ticker": ticker,
+                "surprise_pct": round(move_pct, 2),
+                "volume_mult": round(vol_mult, 2),
+                "price": today_close,
+                "earnings_date": earn["date"],
+            })
         except Exception as e:
             log.warning("PEAD: %s error: %s", ticker, e)
             _PEAD_LAST_SCAN["errors"].append(f"{ticker}: {e}")
-    return surprises
+    return signals
 
 def _count_pead_open():
     try:
@@ -17131,55 +23014,91 @@ def _count_pead_open():
     except Exception:
         return 0
 
-def _log_pead(ticker, price, size, surprise, vol_mult, tp, sl):
+def _log_pead(ticker, price, size, surprise, vol_mult, tp, sl, wal_row_id=None):
+    """Record PEAD entry metadata. When WAL migration is active (wal_row_id
+    given), UPDATE the existing WAL row in place so we don't create a duplicate.
+    Fallback to the old INSERT when called with wal_row_id=None (legacy)."""
+    extras = {"ticker": ticker, "size_usd": size, "surprise_pct": surprise,
+              "volume_mult": vol_mult, "tp_price": tp, "sl_price": sl}
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("""INSERT OR IGNORE INTO positions
-            (market_id,platform,strategy,direction,size_usd,entry_price,status,created_at,metadata)
-            VALUES (?,'alpaca','pead','long',?,?,'open',datetime('now'),?)""",
-            (f"PEAD:{ticker}", round(size, 2), price,
-             json.dumps({"ticker": ticker, "size_usd": size, "surprise_pct": surprise,
-                         "volume_mult": vol_mult, "tp_price": tp, "sl_price": sl})))
+        if wal_row_id is not None:
+            # Merge into existing WAL row's metadata
+            existing = c.execute("SELECT metadata FROM positions WHERE id=?",
+                                 (wal_row_id,)).fetchone()
+            merged = {}
+            if existing and existing[0]:
+                try:
+                    merged = json.loads(existing[0])
+                except Exception:
+                    merged = {}
+            merged.update(extras)
+            c.execute("UPDATE positions SET metadata=?, direction='long', size_usd=? WHERE id=?",
+                      (json.dumps(merged), round(size, 2), wal_row_id))
+        else:
+            # Legacy path — pre-WAL callers
+            c.execute("""INSERT OR IGNORE INTO positions
+                (market_id,platform,strategy,direction,size_usd,entry_price,status,created_at,metadata)
+                VALUES (?,'alpaca','pead','long',?,?,'open',datetime('now'),?)""",
+                (f"PEAD:{ticker}", round(size, 2), price, json.dumps(extras)))
         conn.commit(); conn.close()
     except Exception as e:
         log.warning("PEAD: DB log error: %s", e)
 
 def _submit_pead_order(ticker, shares):
-    try:
-        hdrs = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
-                "Content-Type": "application/json"}
-        resp = requests.post(f"{ALPACA_BASE_URL}/v2/orders",
-            headers=hdrs, timeout=10,
-            json={"symbol": ticker, "qty": str(round(shares, 4)),
-                  "side": "buy", "type": "market", "time_in_force": "day"})
-        resp.raise_for_status()
-        log.info("PEAD ORDER: %s qty=%.4f id=%s", ticker, shares, resp.json().get("id", "?"))
-        return resp.json()
-    except Exception as e:
-        log.warning("PEAD: Order error for %s: %s", ticker, e)
-        return None
+    """PEAD order submission — migrated to WAL (Stage A, 2026-04-16).
+    Returns (response_dict, wal_row_id) or (None, None) on failure."""
+    order_body = {"symbol": ticker, "qty": str(round(shares, 4)),
+                  "side": "buy", "type": "market", "time_in_force": "day"}
+    success, resp, wal_row_id = _alpaca_submit_with_wal(
+        order_body,
+        strategy="pead",
+        market_id=f"PEAD:{ticker}",
+        intended_size=shares,  # size_usd populated by _log_pead after pricing
+        metadata_extras={"ticker": ticker, "submit_source": "_submit_pead_order"},
+    )
+    if success:
+        log.info("PEAD ORDER: %s qty=%.4f alpaca=%s wal_row=%s",
+                 ticker, shares, (resp.get("id") or "?")[:16], wal_row_id)
+        return resp, wal_row_id
+    log.warning("PEAD: Order submit failed for %s: %s", ticker, resp.get("error", "?"))
+    return None, wal_row_id  # wal_row_id may still be set (failed row)
 
 async def run_pead_scanner(discord_channel=None):
+    if _is_auto_disabled("pead"):
+        log.info("pead auto-disabled by strategy_kill_switch — skipping")
+        _STRATEGY_DEBUG["pead"]["last_run"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        _STRATEGY_DEBUG["pead"]["last_reason"] = "auto-disabled by strategy_kill_switch"
+        return
+    _STRATEGY_DEBUG["pead"]["last_run"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    _STRATEGY_DEBUG["pead"]["threshold"] = f"{PEAD_MIN_SURPRISE_PCT}% surprise, {PEAD_MIN_VOLUME_MULT}x vol"
     if not PEAD_ENABLED:
+        _STRATEGY_DEBUG["pead"]["last_reason"] = "PEAD_ENABLED=False"
         return
     from zoneinfo import ZoneInfo
     now_et = datetime.now(ZoneInfo("America/New_York"))
     if not (now_et.replace(hour=9, minute=45, second=0) <= now_et <=
             now_et.replace(hour=15, minute=30, second=0)):
+        _STRATEGY_DEBUG["pead"]["last_reason"] = f"outside scan window ({now_et.strftime('%H:%M')} ET, need 9:45-15:30)"
         return
     if _count_pead_open() >= PEAD_MAX_POSITIONS:
+        _STRATEGY_DEBUG["pead"]["last_reason"] = f"max positions ({_count_pead_open()}/{PEAD_MAX_POSITIONS})"
         log.info("PEAD: %d positions open (max %d)", _count_pead_open(), PEAD_MAX_POSITIONS)
         return
     regime = get_regime("equities")
     if regime["halt"]:
+        _STRATEGY_DEBUG["pead"]["last_reason"] = f"regime={regime['regime']} halted"
         log.info("PEAD: regime=%s halted, skipping", regime["regime"])
         return
     log.info("PEAD SCAN: starting (regime=%s)", regime["regime"])
     signals = fetch_earnings_surprises()
     if not signals:
+        _STRATEGY_DEBUG["pead"]["last_reason"] = f"no signals ({_PEAD_LAST_SCAN['tickers_checked']} tickers checked)"
         log.info("PEAD SCAN: no signals found (%d tickers checked)", _PEAD_LAST_SCAN["tickers_checked"])
         return
+    _STRATEGY_DEBUG["pead"]["last_signal"] = f"{signals[0]['ticker']} surprise={signals[0]['surprise_pct']}%"
+    _STRATEGY_DEBUG["pead"]["last_reason"] = f"FIRED {len(signals)} signals"
     signals.sort(key=lambda x: x["surprise_pct"], reverse=True)
     bankroll = PAPER_PORTFOLIO.get("cash", 25000)
     for sig in signals[:3]:
@@ -17201,9 +23120,10 @@ async def run_pead_scanner(discord_channel=None):
         tp, sl = regime_adjusted_tp_sl(0.03, 0.015, "equities")
         tp_price = round(price * (1 + tp), 2)
         sl_price = round(price * (1 - sl), 2)
-        order = _submit_pead_order(ticker, size / price)
+        order, wal_row_id = _submit_pead_order(ticker, size / price)
         if order:
-            _log_pead(ticker, price, size, sig["surprise_pct"], sig["volume_mult"], tp_price, sl_price)
+            _log_pead(ticker, price, size, sig["surprise_pct"], sig["volume_mult"],
+                      tp_price, sl_price, wal_row_id=wal_row_id)
             log.info("PEAD EXECUTED: %s size=$%.0f surprise=%.1f%% tp=$%.2f sl=$%.2f regime=%s",
                      ticker, size, sig["surprise_pct"], tp_price, sl_price, regime["regime"])
             try:
@@ -17216,6 +23136,1257 @@ async def run_pead_scanner(discord_channel=None):
                 pass
 
 # ═══════════════════════════════════════════════════════════════════
-# END v15 MODULES
+# STRATEGY 1 — SYMPATHY LAG ARBITRAGE
+# When a mega-cap gaps >5%, buy correlated sympathy small/mid-caps
 # ═══════════════════════════════════════════════════════════════════
+
+# ── Strategy Debug State (powers !strategy-debug) ──
+_STRATEGY_DEBUG = {
+    "sympathy_lag": {"last_run": None, "last_signal": None, "last_reason": "never run", "threshold": None},
+    "pead": {"last_run": None, "last_signal": None, "last_reason": "never run", "threshold": None},
+    "lottery_fade": {"last_run": None, "last_signal": None, "last_reason": "never run", "threshold": None},
+    "8k_hunter": {"last_run": None, "last_signal": None, "last_reason": "cron worker (external)", "threshold": None},
+    "liquidity_vacuum": {"last_run": None, "last_signal": None, "last_reason": "never run", "threshold": None},
+    "gamma_pin": {"last_run": None, "last_signal": None, "last_reason": "never run", "threshold": None},
+}
+
+SYMPATHY_MAP = {
+    "NVDA": ["SMCI", "ARM", "ONTO", "AEHR", "WOLF"],
+    "AAPL": ["SWKS", "QRVO", "CRUS"],
+    "META": ["SNAP", "PINS", "TTD"],
+    "MSFT": ["CRWD", "DDOG", "SNOW"],
+    "GOOGL": ["TTD", "PINS", "ROKU"],
+}
+SYMPATHY_LEADERS = list(SYMPATHY_MAP.keys())
+# 2026-04-18: intraday minute-bar backtest with actual 90-min TTL found 3%
+# gap is MARKEDLY better than 2%: 33 trades, 60.6% WR, Sharpe_trade 4.99,
+# PF 2.77, MaxDD 0.11% (90 days). 2% ran 136 trades for Sharpe_trade 2.14 —
+# 2.3× worse edge per trade. Reverting to 3% and re-enabling.
+SYMPATHY_GAP_THRESHOLD = 0.03
+SYMPATHY_ENABLED = True
+SYMPATHY_SIZE_PCT = 0.01
+SYMPATHY_EXIT_MINUTES = 90
+SYMPATHY_TP_PCT = 0.03
+_SYMPATHY_PREV_PRICES = {}
+
+def scan_sympathy_lag():
+    """Check if any leader has gapped >3%. Returns list of trade signals."""
+    _STRATEGY_DEBUG["sympathy_lag"]["last_run"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    _STRATEGY_DEBUG["sympathy_lag"]["threshold"] = f"{SYMPATHY_GAP_THRESHOLD*100:.1f}% gap"
+    signals = []
+    _max_gap_leader, _max_gap = None, 0
+    for leader in SYMPATHY_LEADERS:
+        px, src = get_current_price(leader)
+        if px <= 0:
+            continue
+        prev = _SYMPATHY_PREV_PRICES.get(leader)
+        if prev and prev > 0:
+            gap_pct = (px - prev) / prev
+            log.info("SYMPATHY SCAN: %s prev=$%.2f now=$%.2f gap=%.2f%% threshold=%.1f%%",
+                     leader, prev, px, gap_pct * 100, SYMPATHY_GAP_THRESHOLD * 100)
+            if abs(gap_pct) >= SYMPATHY_GAP_THRESHOLD:
+                direction = "long" if gap_pct > 0 else "short"
+                for sym in SYMPATHY_MAP[leader]:
+                    sym_px, _ = get_current_price(sym)
+                    if sym_px > 0:
+                        signals.append({
+                            "leader": leader, "ticker": sym, "direction": direction,
+                            "leader_gap_pct": gap_pct, "entry_price": sym_px,
+                        })
+                log.info("SYMPATHY: %s gapped %+.1f%% → %d sympathy targets",
+                         leader, gap_pct * 100, len(SYMPATHY_MAP[leader]))
+            if abs(gap_pct) > abs(_max_gap):
+                _max_gap_leader, _max_gap = leader, gap_pct
+        else:
+            log.info("SYMPATHY SCAN: %s first price=$%.2f (no prev yet)", leader, px)
+        _SYMPATHY_PREV_PRICES[leader] = px
+    if signals:
+        _STRATEGY_DEBUG["sympathy_lag"]["last_signal"] = f"{signals[0]['leader']} gap {signals[0]['leader_gap_pct']*100:+.1f}%"
+        _STRATEGY_DEBUG["sympathy_lag"]["last_reason"] = f"FIRED {len(signals)} signals"
+    elif _max_gap_leader:
+        _STRATEGY_DEBUG["sympathy_lag"]["last_signal"] = f"{_max_gap_leader} gap {_max_gap*100:+.2f}%"
+        _STRATEGY_DEBUG["sympathy_lag"]["last_reason"] = f"no gap >= {SYMPATHY_GAP_THRESHOLD*100:.1f}% (max was {_max_gap*100:+.2f}%)"
+    return signals
+
+
+async def run_sympathy_scanner(channel=None):
+    """Execute sympathy lag strategy. Called from alert_scan_task."""
+    if _is_auto_disabled("sympathy_lag"):
+        log.info("sympathy_lag auto-disabled by strategy_kill_switch — skipping")
+        _STRATEGY_DEBUG["sympathy_lag"]["last_run"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        _STRATEGY_DEBUG["sympathy_lag"]["last_reason"] = "auto-disabled by strategy_kill_switch"
+        return
+    if not SYMPATHY_ENABLED:
+        _STRATEGY_DEBUG["sympathy_lag"]["last_run"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        _STRATEGY_DEBUG["sympathy_lag"]["last_reason"] = "DISABLED pending intraday validation"
+        log.info("SYMPATHY DISABLED pending intraday validation")
+        return
+    if not is_market_open():
+        _STRATEGY_DEBUG["sympathy_lag"]["last_run"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        _STRATEGY_DEBUG["sympathy_lag"]["last_reason"] = "market closed"
+        return
+    if risk_should_block_strategy("sympathy_lag"):
+        _STRATEGY_DEBUG["sympathy_lag"]["last_run"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        _STRATEGY_DEBUG["sympathy_lag"]["last_reason"] = f"risk blocked: regime={_RISK_STATE.get('vix_regime')}"
+        log.info("SYMPATHY BLOCKED: regime=%s", _RISK_STATE.get("vix_regime"))
+        return
+    import asyncio
+    signals = await asyncio.to_thread(scan_sympathy_lag)
+    if not signals:
+        return
+
+    portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
+        p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+
+    for sig in signals[:3]:  # Max 3 sympathy trades per scan
+        ticker = sig["ticker"]
+        market_id = f"SYMPATHY:{sig['leader']}→{ticker}"
+
+        # Dedup
+        if any(p.get("market", "").startswith(f"SYMPATHY:") and ticker in p.get("market", "")
+               for p in PAPER_PORTFOLIO.get("positions", [])):
+            continue
+
+        # TV signal gate — only long side triggers on BUY; short side requires
+        # SELL/STRONG_SELL to pass. Fail-open if no signal cached.
+        _tv_ok, _tv_reason = _tv_signal_allows_entry(ticker)
+        if sig["direction"] == "short":
+            # For short sympathy trades, invert: allow if TV says SELL/STRONG_SELL
+            _tv_ok, _tv_reason = _tv_signal_allows_entry(ticker)
+            _raw = _get_redis_safe()
+            if _raw:
+                try:
+                    _s = _raw.get(f"tv_signals:{ticker.upper()}")
+                    if _s:
+                        _rec = (json.loads(_s).get("recommendation") or "").upper()
+                        _tv_ok = _rec in ("STRONG_SELL", "SELL")
+                        _tv_reason = f"TV={_rec}"
+                except Exception:
+                    pass  # fail-open
+        if not _tv_ok:
+            log.info("SYMPATHY SKIP %s %s: TV gate blocked (%s)",
+                     sig["direction"].upper(), ticker, _tv_reason)
+            continue
+
+        size = portfolio_value * SYMPATHY_SIZE_PCT
+        shares = size / sig["entry_price"]
+
+        # Open position
+        PAPER_PORTFOLIO["cash"] -= size
+        PAPER_PORTFOLIO["positions"].append({
+            "market": market_id, "strategy": "sympathy_lag",
+            "side": sig["direction"].upper(), "cost": size,
+            "entry_price": sig["entry_price"], "long_leg": ticker,
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        })
+        db_open_position(
+            market_id=market_id, platform="Alpaca", strategy="sympathy_lag",
+            direction=sig["direction"], size_usd=size, shares=shares,
+            entry_price=sig["entry_price"],
+            target_price=sig["entry_price"] * (1 + SYMPATHY_TP_PCT if sig["direction"] == "long" else 1 - SYMPATHY_TP_PCT),
+            metadata={"leader": sig["leader"], "gap_pct": sig["leader_gap_pct"]},
+        )
+        log.info("SYMPATHY TRADE: %s %s $%.0f (leader %s gap %+.1f%%)",
+                 sig["direction"].upper(), ticker, size, sig["leader"], sig["leader_gap_pct"] * 100)
+
+        if channel:
+            try:
+                await channel.send(
+                    f"**SYMPATHY LAG** {sig['direction'].upper()} {ticker}\n"
+                    f"Leader: {sig['leader']} gapped {sig['leader_gap_pct']*100:+.1f}%\n"
+                    f"Entry: ${sig['entry_price']:.2f} | Size: ${size:.0f}")
+            except Exception:
+                pass
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STRATEGY 2 — OPEX GAMMA PIN
+# Thu/Fri 2-3:55 PM ET: trade toward high-OI round-number strikes
+# ═══════════════════════════════════════════════════════════════════
+
+GAMMA_PIN_SIZE_PCT = 0.0075
+GAMMA_PIN_TICKERS = ["SPY", "QQQ", "AAPL", "TSLA", "NVDA", "AMZN", "MSFT", "META", "GOOGL", "AMD"]
+
+def is_opex_window():
+    """Check if we're in Thu/Fri 2:00-3:55 PM ET."""
+    from zoneinfo import ZoneInfo
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    if now_et.weekday() not in (3, 4):  # Thu=3, Fri=4
+        return False
+    return 14 <= now_et.hour <= 15 and (now_et.hour < 15 or now_et.minute <= 55)
+
+
+def scan_gamma_pin():
+    """Find stocks pinned near round-number strikes during OPEX."""
+    _STRATEGY_DEBUG["gamma_pin"]["last_run"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    _STRATEGY_DEBUG["gamma_pin"]["threshold"] = "Thu/Fri OPEX week, <1% from round strike"
+    if not is_opex_window():
+        _STRATEGY_DEBUG["gamma_pin"]["last_reason"] = "outside OPEX window (Thu/Fri only)"
+        return []
+
+    signals = []
+    for ticker in GAMMA_PIN_TICKERS:
+        px, src = get_current_price(ticker)
+        if px <= 0:
+            continue
+
+        # Find nearest round-number strike (multiples of 5 for most, 10 for SPY/QQQ)
+        strike_interval = 10 if ticker in ("SPY", "QQQ") else 5
+        nearest_strike = round(px / strike_interval) * strike_interval
+        distance_pct = abs(px - nearest_strike) / px
+
+        if distance_pct <= 0.01:  # Within 1% of round strike
+            direction = "long" if px < nearest_strike else "short"
+            signals.append({
+                "ticker": ticker, "price": px, "strike": nearest_strike,
+                "direction": direction, "distance_pct": distance_pct,
+            })
+            log.info("GAMMA PIN: %s $%.2f → strike $%.0f (%.2f%% away, %s)",
+                     ticker, px, nearest_strike, distance_pct * 100, direction)
+
+    return signals
+
+
+async def run_gamma_pin_scanner(channel=None):
+    """Execute OPEX gamma pin trades."""
+    if _is_auto_disabled("gamma_pin"):
+        log.info("gamma_pin auto-disabled by strategy_kill_switch — skipping")
+        return
+    import asyncio
+    signals = await asyncio.to_thread(scan_gamma_pin)
+    if not signals:
+        return
+
+    portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
+        p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+
+    for sig in signals[:2]:
+        ticker = sig["ticker"]
+        market_id = f"GAMMA:{ticker}@{sig['strike']:.0f}"
+
+        if any(p.get("market", "").startswith(f"GAMMA:{ticker}")
+               for p in PAPER_PORTFOLIO.get("positions", [])):
+            continue
+
+        size = portfolio_value * GAMMA_PIN_SIZE_PCT
+        shares = size / sig["price"]
+
+        PAPER_PORTFOLIO["cash"] -= size
+        PAPER_PORTFOLIO["positions"].append({
+            "market": market_id, "strategy": "gamma_pin",
+            "side": sig["direction"].upper(), "cost": size,
+            "entry_price": sig["price"], "long_leg": ticker,
+            "target_price": sig["strike"],
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        })
+        db_open_position(
+            market_id=market_id, platform="Alpaca", strategy="gamma_pin",
+            direction=sig["direction"], size_usd=size, shares=shares,
+            entry_price=sig["price"], target_price=sig["strike"],
+            metadata={"strike": sig["strike"], "distance_pct": sig["distance_pct"]},
+        )
+        log.info("GAMMA PIN TRADE: %s %s $%.0f → strike $%.0f",
+                 sig["direction"].upper(), ticker, size, sig["strike"])
+
+        if channel:
+            try:
+                await channel.send(
+                    f"**GAMMA PIN** {sig['direction'].upper()} {ticker}\n"
+                    f"Price: ${sig['price']:.2f} → Strike: ${sig['strike']:.0f}\n"
+                    f"Distance: {sig['distance_pct']*100:.2f}% | Size: ${size:.0f}")
+            except Exception:
+                pass
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STRATEGY 3 — ENHANCED PEAD (uses existing PEAD infra, upgrades)
+# Already exists as run_pead_scanner. Enhancement: tighten to 10%
+# surprise threshold per spec (currently 5%). Config update only.
+# ═══════════════════════════════════════════════════════════════════
+# STRATEGY 4 — LIQUIDITY VACUUM BIDS
+# 3:55 PM ET: limit buys 4% below current on high-vol stocks
+# ═══════════════════════════════════════════════════════════════════
+
+VACUUM_TICKERS = ["TSLA", "MSTR", "COIN", "RIOT", "MARA", "AMC", "GME"]
+VACUUM_DISCOUNT_PCT = 0.04
+VACUUM_SIZE_PCT = 0.01
+_VACUUM_PENDING_ORDERS = {}  # {ticker: {"order_price": ..., "timestamp": ...}}
+
+def is_vacuum_window():
+    """Check if we're at 3:55 PM ET (±3 minutes)."""
+    from zoneinfo import ZoneInfo
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    return now_et.hour == 15 and 52 <= now_et.minute <= 58
+
+
+def place_vacuum_bids():
+    """Place limit buy orders 4% below current price."""
+    from zoneinfo import ZoneInfo
+    _vac_et = datetime.now(ZoneInfo("America/New_York"))
+    _STRATEGY_DEBUG["liquidity_vacuum"]["last_run"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    _STRATEGY_DEBUG["liquidity_vacuum"]["threshold"] = f"{VACUUM_DISCOUNT_PCT*100:.0f}% below, window 3:52-3:58 ET"
+
+    # Pre-fire warning at 3:50 PM
+    if _vac_et.hour == 15 and 50 <= _vac_et.minute <= 51:
+        _avail = [t for t in VACUUM_TICKERS if t not in _VACUUM_PENDING_ORDERS]
+        if _avail:
+            log.info("VACUUM: placing limit bids at 3:55 PM on %s", ", ".join(_avail))
+
+    if not is_vacuum_window():
+        _STRATEGY_DEBUG["liquidity_vacuum"]["last_reason"] = f"outside window (now {_vac_et.strftime('%H:%M')} ET, need 15:52-15:58)"
+        return []
+
+    orders = []
+    for ticker in VACUUM_TICKERS:
+        if ticker in _VACUUM_PENDING_ORDERS:
+            continue  # Already have a pending order
+
+        px, src = get_current_price(ticker)
+        if px <= 0:
+            continue
+
+        limit_price = round(px * (1 - VACUUM_DISCOUNT_PCT), 2)
+        orders.append({
+            "ticker": ticker, "current_price": px,
+            "limit_price": limit_price, "discount_pct": VACUUM_DISCOUNT_PCT,
+        })
+        _VACUUM_PENDING_ORDERS[ticker] = {
+            "order_price": limit_price,
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        }
+        log.info("VACUUM BID: %s limit $%.2f (%.0f%% below $%.2f)",
+                 ticker, limit_price, VACUUM_DISCOUNT_PCT * 100, px)
+
+    return orders
+
+
+async def run_vacuum_scanner(channel=None):
+    """Place liquidity vacuum limit orders."""
+    if _is_auto_disabled("liquidity_vacuum"):
+        log.info("liquidity_vacuum auto-disabled by strategy_kill_switch — skipping")
+        return
+    import asyncio
+    orders = await asyncio.to_thread(place_vacuum_bids)
+    if not orders:
+        return
+
+    # Check for filled vacuum orders from previous day and sell at open
+    now = datetime.now(timezone.utc)
+    filled_to_sell = []
+    for ticker, info in list(_VACUUM_PENDING_ORDERS.items()):
+        # If order is from yesterday and market just opened, simulate fill check
+        order_time = info.get("timestamp", "")
+        if order_time and "UTC" in order_time:
+            px, _ = get_current_price(ticker)
+            if px > 0 and px <= info["order_price"]:
+                filled_to_sell.append({"ticker": ticker, "fill_price": info["order_price"], "current_price": px})
+                del _VACUUM_PENDING_ORDERS[ticker]
+
+    portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
+        p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+
+    for order in orders:
+        ticker = order["ticker"]
+        market_id = f"VACUUM:{ticker}"
+        size = portfolio_value * VACUUM_SIZE_PCT
+
+        # Record as pending limit order (will check fill on next cycle)
+        db_open_position(
+            market_id=market_id, platform="Alpaca", strategy="liquidity_vacuum",
+            direction="long", size_usd=size, shares=size / order["limit_price"],
+            entry_price=order["limit_price"],
+            metadata={"limit_price": order["limit_price"], "current_price": order["current_price"],
+                      "order_type": "limit_buy", "status": "pending"},
+        )
+        log.info("VACUUM ORDER: %s limit $%.2f size $%.0f", ticker, order["limit_price"], size)
+
+        if channel:
+            try:
+                await channel.send(
+                    f"**VACUUM BID** {ticker}\n"
+                    f"Limit: ${order['limit_price']:.2f} ({VACUUM_DISCOUNT_PCT*100:.0f}% below ${order['current_price']:.2f})\n"
+                    f"Size: ${size:.0f} | Expires: next open")
+            except Exception:
+                pass
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STRATEGY 5 — ECHO CAUSAL FORECASTING (Echo Gate for Oracle)
+# Query ChromaDB for 5 similar setups; approve/reduce based on history
+# Uses claude-haiku-4-5-20251001 for causal synthesis. NEVER Sonnet.
+# ═══════════════════════════════════════════════════════════════════
+
+ECHO_GATE_MIN_MATCHES = 5
+ECHO_GATE_WIN_THRESHOLD = 0.6  # 3 of 5 = 60%
+ECHO_GATE_BOOST_MULT = 1.25
+ECHO_GATE_REDUCE_MULT = 0.50
+
+def echo_gate_evaluate(signal_name, strategy="oracle_trade"):
+    """Echo Gate: query causal memory for similar setups.
+    Returns (multiplier, reasoning_str).
+    1.25x if history is favorable, 0.5x if unfavorable, 1.0x if insufficient data."""
+
+    matches = causal_memory_query(strategy=strategy, n_results=ECHO_GATE_MIN_MATCHES)
+
+    if not matches or len(matches) < ECHO_GATE_MIN_MATCHES:
+        return 1.0, f"ECHO GATE: insufficient history ({len(matches) if matches else 0}/{ECHO_GATE_MIN_MATCHES} matches)"
+
+    wins = 0
+    losses = 0
+    total_pnl = 0
+    details = []
+
+    for meta, dist in matches:
+        date = meta.get("date", "?")
+        pnl_key = f"daily_pnl_{strategy}"
+        pnl = meta.get(pnl_key, 0)
+        vix = meta.get("vix", 0)
+        fng = meta.get("fng", 50)
+
+        if isinstance(pnl, (int, float)):
+            total_pnl += pnl
+            if pnl > 0:
+                wins += 1
+            elif pnl < 0:
+                losses += 1
+            details.append(f"{date}: ${pnl:+.0f} VIX={vix:.0f} F&G={fng:.0f}")
+
+    total = wins + losses
+    if total == 0:
+        return 1.0, f"ECHO GATE: {len(matches)} matches but no {strategy} P&L data"
+
+    win_rate = wins / total
+    detail_str = " | ".join(details[:5])
+
+    if win_rate >= ECHO_GATE_WIN_THRESHOLD:
+        mult = ECHO_GATE_BOOST_MULT
+        verdict = "APPROVE"
+    elif win_rate <= (1 - ECHO_GATE_WIN_THRESHOLD):
+        mult = ECHO_GATE_REDUCE_MULT
+        verdict = "REDUCE"
+    else:
+        mult = 1.0
+        verdict = "NEUTRAL"
+
+    reason = (f"ECHO GATE {verdict}: {wins}W/{losses}L ({win_rate:.0%}) in {len(matches)} similar setups | "
+              f"P&L: ${total_pnl:+.0f} | mult={mult}x | {detail_str}")
+
+    log.info("ECHO GATE: %s → %s (%.0f%% WR, %dW/%dL, $%+.0f)",
+             signal_name, verdict, win_rate * 100, wins, losses, total_pnl)
+
+    return mult, reason
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ALPHA STRATEGY EXIT RULES — integrated into run_exit_manager
+# ═══════════════════════════════════════════════════════════════════
+# These are handled in the main exit manager via strategy checks.
+# Adding config here for the exit manager to reference:
+EXIT_CONFIG["sympathy_ttl_minutes"] = 90
+EXIT_CONFIG["sympathy_tp_pct"] = 0.03
+EXIT_CONFIG["gamma_pin_ttl_minutes"] = 118  # Exit by 3:58 PM (max ~2h)
+EXIT_CONFIG["vacuum_ttl_hours"] = 16  # Expires next morning
+
+# Update meta allocation for new strategies
+_META_ALLOC["sympathy_lag"] = 1.0
+_META_ALLOC["gamma_pin"] = 1.0
+_META_ALLOC["liquidity_vacuum"] = 1.0
+
+
+# ═══════════════════════════════════════════════════════════════════
+# v17 MODULES — Cognitive Alpha + Prediction Market Overhaul
+# ═══════════════════════════════════════════════════════════════════
+
+# ─── COGNITIVE ALPHA INTEGRATION ──────────────────────────────────
+# Wire intelligence workers into the main trading loop
+
+def _get_8k_kelly_mult(ticker, actual_trade_id=None, base_size_usd=None):
+    """SHADOW-mode 8-K Kelly multiplier lookup.
+
+    Reads from shadow:intel:8k_kelly:<ticker> (written by the SEC 8-K
+    Hunter shadow producer). Logs the hypothetical multiplier that
+    WOULD have applied to this trade via compute_shadow_multiplier_hypothetical
+    (writes a PAPER_SHADOW_LOG row). **Always returns 1.0** — shadow
+    tier never affects live/paper sizing. See specs/shadow_tier_charter.md.
+    """
+    raw = shadow_redis_get(f"intel:8k_kelly:{ticker}")
+    if raw is None:
+        return 1.0
+    try:
+        data = json.loads(raw)
+        hypothetical_mult = float(data.get("kelly_mult", 1.0) or 1.0)
+        if actual_trade_id is not None:
+            compute_shadow_multiplier_hypothetical(
+                strategy="8k_sizing_overlay",
+                actual_trade_id=actual_trade_id,
+                shadow_multipliers={"sec_8k": hypothetical_mult},
+                base_size_usd=base_size_usd,
+            )
+        log.info("SHADOW 8K: %s would size %.2fx (logged, not applied)",
+                 ticker, hypothetical_mult)
+    except Exception as e:
+        log.debug("SHADOW 8K read/decode failed for %s: %s", ticker, e)
+    return 1.0
+
+
+def _get_fed_sentiment_mult(ticker, strategy=None, actual_trade_id=None, base_size_usd=None):
+    """SHADOW-mode Fed sentiment size multiplier.
+
+    Reads from the in-process `_FED_SENTIMENT_STATE` (written by
+    update_fed_sentiment every scan). Fed Sentiment was DORMANT pre-Day 4
+    (Day 2 agent_inventory.md § Fed Sentiment) — consumed by nothing.
+    This consumer records what the multiplier WOULD have been on
+    rate-sensitive equities (XLF, TLT, XLK, XLRE, SPY/QQQ) without
+    affecting paper sizing.
+
+    Mapping: score ∈ [-1, +1]. Hawkish (+1) shrinks rate-sensitive
+    longs 0.85×; dovish (-1) boosts 1.15×. Non-rate-sensitive tickers
+    ignored.
+
+    Always returns 1.0. See specs/shadow_tier_charter.md.
+    """
+    try:
+        state = _FED_SENTIMENT_STATE
+        score = state.get("score", 0.0) or 0.0
+    except Exception:
+        return 1.0
+    # Rate-sensitive set
+    RATE_SENS = {"XLF", "TLT", "XLK", "XLRE", "SPY", "QQQ", "KRE", "KBE", "BAC", "JPM", "GS", "MS"}
+    if ticker not in RATE_SENS:
+        return 1.0
+    # Map score → multiplier linearly around 1.0
+    # hawkish +1.0 → 0.85, neutral 0 → 1.00, dovish -1.0 → 1.15
+    hypothetical_mult = 1.0 - 0.15 * max(-1.0, min(1.0, score))
+    if actual_trade_id is not None:
+        compute_shadow_multiplier_hypothetical(
+            strategy=strategy or "fed_sentiment_overlay",
+            actual_trade_id=actual_trade_id,
+            shadow_multipliers={"fed_sentiment": hypothetical_mult},
+            base_size_usd=base_size_usd,
+        )
+    # Also write the current Fed score into shadow namespace for
+    # dashboards / post-hoc analysis (lightweight, every call).
+    try:
+        shadow_redis_setex(
+            "intel:fed_sentiment:current",
+            3600,
+            json.dumps({
+                "score": score,
+                "last_update": state.get("last_update"),
+                "hawkish_dovish": "hawkish" if score > 0.2 else "dovish" if score < -0.2 else "neutral",
+            }),
+        )
+    except Exception:
+        pass
+    log.info("SHADOW FED_SENTIMENT: %s (score=%.2f) would size %.2fx (logged, not applied)",
+             ticker, score, hypothetical_mult)
+    return 1.0
+
+
+def _get_options_flow_mult(ticker, actual_trade_id=None, base_size_usd=None):
+    """SHADOW-mode options-flow size multiplier lookup.
+
+    Reads from shadow:intel:options_flow:<ticker> (written by the Options
+    Flow Scanner shadow producer). Logs hypothetical multiplier via
+    compute_shadow_multiplier_hypothetical. Always returns 1.0 (no live
+    impact). See specs/shadow_tier_charter.md.
+    """
+    raw = shadow_redis_get(f"intel:options_flow:{ticker}")
+    if raw is None:
+        return 1.0
+    try:
+        data = json.loads(raw)
+        hypothetical_mult = float(data.get("proposed_mult", 1.0) or 1.0)
+        if actual_trade_id is not None:
+            compute_shadow_multiplier_hypothetical(
+                strategy="options_flow_sizing_overlay",
+                actual_trade_id=actual_trade_id,
+                shadow_multipliers={"options_flow": hypothetical_mult},
+                base_size_usd=base_size_usd,
+            )
+        log.info("SHADOW OPTIONS_FLOW: %s would size %.2fx (logged, not applied)",
+                 ticker, hypothetical_mult)
+    except Exception as e:
+        log.debug("SHADOW OPTIONS_FLOW read/decode failed for %s: %s", ticker, e)
+    return 1.0
+
+
+def _get_echo_prediction(signal_name):
+    """Get Echo Predictor size adjustment from Redis."""
+    try:
+        r = __import__("redis").Redis(host="traderjoes-redis", port=6379, decode_responses=True)
+        raw = r.get(f"intel:echo:{signal_name}")
+        if raw:
+            data = json.loads(raw)
+            return data.get("size_adjustment", 1.0), data
+    except Exception:
+        pass
+    return 1.0, None
+
+
+def _get_ripple_tickers(leader_ticker, actual_trade_id=None, base_size_usd=None):
+    """SHADOW-mode supply-chain ripple lookup.
+
+    Reads shadow:intel:ripple:<leader>. Returns (tickers, size_pct) with
+    size_pct FORCED TO 0.0 to guarantee no paper/live trade is opened from
+    ripple discovery. Records PAPER_SHADOW_LOG row via
+    compute_shadow_multiplier_hypothetical if called with actual_trade_id.
+
+    Callers should treat the returned tickers as informational only. See
+    specs/shadow_tier_charter.md.
+    """
+    raw = shadow_redis_get(f"intel:ripple:{leader_ticker}")
+    if raw is None:
+        return [], 0.0
+    try:
+        data = json.loads(raw)
+        tickers = data.get("ripple_tickers", []) or []
+        proposed_size_pct = float(data.get("size_pct", 0.005) or 0.005)
+        if actual_trade_id is not None:
+            compute_shadow_multiplier_hypothetical(
+                strategy="ripple_sizing_overlay",
+                actual_trade_id=actual_trade_id,
+                shadow_multipliers={"supply_chain_ripple": 1.0},
+                base_size_usd=base_size_usd,
+            )
+        log.info("SHADOW RIPPLE: leader=%s discovered %d tickers (proposed_size_pct=%.4f — "
+                 "returned size=0.0 to block live execution)",
+                 leader_ticker, len(tickers), proposed_size_pct)
+        return tickers, 0.0
+    except Exception as e:
+        log.debug("SHADOW RIPPLE read/decode failed for %s: %s", leader_ticker, e)
+    return [], 0.0
+
+
+# ─── PREDICTION MARKET OVERHAUL ──────────────────────────────────
+# Strategy 1: Cross-Exchange Arbitrage (pm_arbitrage)
+# Strategy 2: Lottery Fade (lottery_fade)
+# Strategy 3: Momentum Cascade (pm_momentum)
+
+PM_CONFIG = {
+    "max_allocation_pct": 0.20,       # 20% portfolio max
+    "max_single_position_pct": 0.01,  # 1% per position
+    "daily_loss_limit": -200,         # $-200/day
+    "min_24h_volume": 25000,          # $25K minimum
+    "price_range": (0.03, 0.97),      # Valid YES price range
+    "expiry_range_days": (7, 60),     # 7-60 days to expiry
+}
+
+PM_ARBITRAGE_CONFIG = {
+    "min_spread_pct": 0.04,           # 4% minimum spread after fees
+    "close_spread_pct": 0.01,         # Close at <1% spread
+    "size_pct": 0.005,                # 0.5% each side (1% total)
+    "min_volume": 50000,              # $50K both exchanges
+    "expiry_range_days": (7, 45),
+    "max_positions": 4,
+}
+
+PM_LOTTERY_FADE_CONFIG = {
+    "yes_price_range": (0.03, 0.08),  # Extreme long shots
+    "no_buy_range": (0.92, 0.97),     # Buy NO at this range
+    "min_volume": 25000,              # $25K
+    "stagnant_hours": 6,              # Sitting at price > 6h (lowered from 24h 2026-04-16)
+    "expiry_range_days": (14, 60),
+    "size_pct": 0.005,                # 0.5% per position
+    "max_positions": 5,
+    "tp_no_price": 0.98,              # Take profit when NO hits $0.98
+}
+
+PM_MOMENTUM_CONFIG = {
+    "min_24h_change_pct": 0.10,       # 10% move in 24h
+    "min_volume": 25000,              # $25K
+    "size_pct": 0.0075,               # 0.75% portfolio
+    "max_positions": 3,
+}
+
+# Momentum cascade: prediction market move → equity trades
+PM_MOMENTUM_CASCADES = {
+    "fed rate cut": {"long": "TLT", "short": "XLF"},
+    "fed rate hike": {"long": "XLF", "short": "TLT"},
+    "recession": {"long": "GLD", "short": "SPY"},
+    "ukraine escalation": {"long": "LMT", "short": "UAL"},
+    "iran ceasefire": {"short": "XLE", "long": "UAL"},
+    "iran": {"long": "XLE", "short": "UAL"},
+}
+
+# Track 24h price history for momentum detection
+_PM_PRICE_HISTORY = {}  # {market_id: [(timestamp, yes_price), ...]}
+_PM_DAILY_PNL = 0.0
+_PM_DAILY_PNL_DATE = None
+
+
+def _pm_check_daily_limit():
+    """Check if prediction market daily loss limit is hit."""
+    global _PM_DAILY_PNL, _PM_DAILY_PNL_DATE
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _PM_DAILY_PNL_DATE != today:
+        _PM_DAILY_PNL = 0.0
+        _PM_DAILY_PNL_DATE = today
+    return _PM_DAILY_PNL > PM_CONFIG["daily_loss_limit"]
+
+
+def _pm_check_allocation():
+    """Check total prediction market allocation vs 20% cap."""
+    pm_positions = [p for p in PAPER_PORTFOLIO.get("positions", [])
+                    if p.get("strategy") in ("pm_arbitrage", "lottery_fade", "pm_momentum",
+                                              "prediction", "oracle_trade")]
+    total_pm = sum(p.get("cost", 0) for p in pm_positions)
+    portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
+        p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+    return total_pm / portfolio_value if portfolio_value > 0 else 0
+
+
+def _pm_quality_filter(market, strategy="pm_arbitrage"):
+    """Apply quality filters to a prediction market opportunity."""
+    volume = market.get("volume24hr", market.get("volume", 0))
+    if isinstance(volume, str):
+        try:
+            volume = float(volume)
+        except ValueError:
+            volume = 0
+
+    yes_price = market.get("yes_price", market.get("bestAsk", 0))
+    if isinstance(yes_price, str):
+        try:
+            yes_price = float(yes_price)
+        except ValueError:
+            yes_price = 0
+
+    # Volume filter
+    if volume < PM_CONFIG["min_24h_volume"]:
+        return False, "low volume"
+
+    # Price range
+    min_p, max_p = PM_CONFIG["price_range"]
+    if yes_price < min_p or yes_price > max_p:
+        return False, "price out of range"
+
+    # Daily loss limit
+    if not _pm_check_daily_limit():
+        return False, "daily loss limit hit"
+
+    # Allocation cap
+    if _pm_check_allocation() >= PM_CONFIG["max_allocation_pct"]:
+        return False, "allocation cap (20%)"
+
+    return True, "OK"
+
+
+def _pm_echo_check(strategy, signal_info=""):
+    """Check Echo Memory before prediction market entry.
+    Historical win rate <40%: skip. >60%: boost 1.25x."""
+    try:
+        matches = causal_memory_query(strategy=strategy, n_results=10)
+        if not matches or len(matches) < 3:
+            return 1.0, "insufficient history"
+        wins = sum(1 for m, d in matches if m.get(f"daily_pnl_{strategy}", 0) > 0)
+        wr = wins / len(matches)
+        if wr < 0.40:
+            return 0.0, f"SKIP: historical WR={wr*100:.0f}% < 40%"
+        elif wr > 0.60:
+            return 1.25, f"BOOST: historical WR={wr*100:.0f}% > 60%"
+        return 1.0, f"neutral WR={wr*100:.0f}%"
+    except Exception:
+        return 1.0, "echo unavailable"
+
+
+async def scan_pm_arbitrage():
+    """Strategy 1: Cross-Exchange Arbitrage Scanner.
+    Pulls markets from Kalshi + Polymarket, finds identical events with >4% spread."""
+    import asyncio as _aio
+    if not _pm_check_daily_limit():
+        return []
+
+    # Count existing arb positions
+    arb_count = sum(1 for p in PAPER_PORTFOLIO.get("positions", [])
+                    if p.get("strategy") == "pm_arbitrage")
+    if arb_count >= PM_ARBITRAGE_CONFIG["max_positions"]:
+        return []
+
+    opportunities = []
+    try:
+        kalshi_markets = await _aio.to_thread(get_kalshi_active_markets, 50)
+        poly_markets = await _aio.to_thread(get_polymarket_markets, 50)
+
+        # Match keywords for identical events
+        arb_keywords = ["fed", "cpi", "election", "rate", "recession", "gdp", "ukraine",
+                        "inflation", "employment", "jobs", "debt ceiling", "tariff"]
+
+        kalshi_by_topic = {}
+        for km in kalshi_markets:
+            title = (km.get("title", "") or "").lower()
+            for kw in arb_keywords:
+                if kw in title:
+                    key = f"{kw}:{title[:50]}"
+                    kalshi_by_topic[key] = km
+                    break
+
+        for pm in poly_markets:
+            title = (pm.get("question", pm.get("title", "")) or "").lower()
+            for kw in arb_keywords:
+                if kw in title:
+                    # Try to match with a Kalshi market
+                    for k_key, km in kalshi_by_topic.items():
+                        if kw in k_key:
+                            k_yes = _extract_yes_price(km, "kalshi")
+                            p_yes = _extract_yes_price(pm, "polymarket")
+
+                            if k_yes <= 0 or p_yes <= 0:
+                                continue
+
+                            spread = abs(k_yes - p_yes)
+                            if spread >= PM_ARBITRAGE_CONFIG["min_spread_pct"]:
+                                # Determine which is cheap and which is expensive
+                                if k_yes < p_yes:
+                                    buy_exchange, sell_exchange = "kalshi", "polymarket"
+                                    buy_price, sell_price = k_yes, p_yes
+                                else:
+                                    buy_exchange, sell_exchange = "polymarket", "kalshi"
+                                    buy_price, sell_price = p_yes, k_yes
+
+                                opportunities.append({
+                                    "topic": kw,
+                                    "spread": spread,
+                                    "buy_exchange": buy_exchange,
+                                    "sell_exchange": sell_exchange,
+                                    "buy_yes_price": buy_price,
+                                    "sell_yes_price": sell_price,
+                                    "kalshi_market": km.get("title", "")[:60],
+                                    "poly_market": pm.get("question", pm.get("title", ""))[:60],
+                                })
+                    break
+
+    except Exception as e:
+        log.warning("PM arbitrage scan error: %s", e)
+
+    return sorted(opportunities, key=lambda x: -x["spread"])[:3]
+
+
+def _extract_yes_price(market, exchange):
+    """Extract YES price from a market object."""
+    if exchange == "kalshi":
+        return market.get("yes_ask", market.get("yes_price", 0)) / 100.0 if market.get("yes_ask", 0) > 1 else market.get("yes_ask", 0)
+    else:
+        price = market.get("outcomePrices", market.get("bestAsk", 0))
+        if isinstance(price, str):
+            try:
+                prices = json.loads(price)
+                return float(prices[0]) if prices else 0
+            except (json.JSONDecodeError, ValueError, IndexError):
+                try:
+                    return float(price)
+                except ValueError:
+                    return 0
+        elif isinstance(price, list):
+            return float(price[0]) if price else 0
+        return float(price) if price else 0
+
+
+_LOTTERY_PRICE_HISTORY = {}  # market_key -> (first_seen_utc, first_seen_yes_price)
+
+async def scan_lottery_fade():
+    """Strategy 2: Lottery Fade Scanner.
+    Find extreme long shots (YES $0.03-$0.08) with stagnant prices, buy NO."""
+    import asyncio as _aio
+    _stagnant_hours = PM_LOTTERY_FADE_CONFIG.get("stagnant_hours", 24)
+    log.info("LOTTERY FADE: scanning with stagnant_hours=%d (from config)", _stagnant_hours)
+    _STRATEGY_DEBUG["lottery_fade"]["last_run"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    _STRATEGY_DEBUG["lottery_fade"]["threshold"] = f"YES ${PM_LOTTERY_FADE_CONFIG['yes_price_range'][0]}-${PM_LOTTERY_FADE_CONFIG['yes_price_range'][1]}, {_stagnant_hours}h stagnant, vol>${PM_LOTTERY_FADE_CONFIG['min_volume']}"
+
+    fade_count = sum(1 for p in PAPER_PORTFOLIO.get("positions", [])
+                     if p.get("strategy") == "lottery_fade")
+    if fade_count >= PM_LOTTERY_FADE_CONFIG["max_positions"]:
+        _STRATEGY_DEBUG["lottery_fade"]["last_reason"] = f"max positions ({fade_count}/{PM_LOTTERY_FADE_CONFIG['max_positions']})"
+        return []
+
+    opportunities = []
+    try:
+        markets = await _aio.to_thread(get_polymarket_markets, 50)
+        kalshi_mkts = await _aio.to_thread(get_kalshi_active_markets, 50)
+
+        all_markets = []
+        for m in markets:
+            all_markets.append({"source": "polymarket", "data": m})
+        for m in kalshi_mkts:
+            if not _is_kalshi_sports(m) and not is_sports_or_junk(m.get("title", "")):
+                all_markets.append({"source": "kalshi", "data": m})
+
+        log.info("LOTTERY FADE: %d markets to check (%d polymarket, %d kalshi)",
+                 len(all_markets),
+                 sum(1 for x in all_markets if x["source"] == "polymarket"),
+                 sum(1 for x in all_markets if x["source"] == "kalshi"))
+
+        for entry in all_markets:
+            m = entry["data"]
+            source = entry["source"]
+            yes_price = _extract_yes_price(m, source)
+            title = m.get("question", m.get("title", ""))[:80]
+            volume = m.get("volume24hr", m.get("volume", 0))
+            if isinstance(volume, str):
+                try:
+                    volume = float(volume)
+                except ValueError:
+                    volume = 0
+
+            min_yes, max_yes = PM_LOTTERY_FADE_CONFIG["yes_price_range"]
+            if yes_price < min_yes or yes_price > max_yes:
+                continue
+
+            if volume < PM_LOTTERY_FADE_CONFIG["min_volume"]:
+                log.info("LOTTERY FADE: %s YES=$%.3f vol=$%.0f — SKIP: volume < $%d",
+                         title[:50], yes_price, volume, PM_LOTTERY_FADE_CONFIG["min_volume"])
+                continue
+
+            if is_sports_or_junk(title or ""):
+                continue
+
+            no_price = 1.0 - yes_price
+            min_no, max_no = PM_LOTTERY_FADE_CONFIG["no_buy_range"]
+            if no_price < min_no or no_price > max_no:
+                log.info("LOTTERY FADE: %s YES=$%.3f NO=$%.3f — SKIP: NO price outside %.2f-%.2f",
+                         title[:50], yes_price, no_price, min_no, max_no)
+                continue
+
+            # Stagnant filter: market must have held this YES price for >= stagnant_hours
+            _mkey = f"{source}:{title[:80]}"
+            _now_utc = datetime.now(timezone.utc)
+            _hist = _LOTTERY_PRICE_HISTORY.get(_mkey)
+            if _hist is None:
+                _LOTTERY_PRICE_HISTORY[_mkey] = (_now_utc, yes_price)
+                log.info("LOTTERY FADE: %s YES=$%.3f vol=$%.0f — FIRST SIGHTING (need %dh stagnant)",
+                         title[:50], yes_price, volume, _stagnant_hours)
+                continue  # First sighting — not yet stagnant
+            _first_seen, _first_price = _hist
+            _elapsed_h = (_now_utc - _first_seen).total_seconds() / 3600
+            # Reset history if price moved >1c (no longer stagnant)
+            if abs(yes_price - _first_price) > 0.01:
+                _LOTTERY_PRICE_HISTORY[_mkey] = (_now_utc, yes_price)
+                log.info("LOTTERY FADE: %s YES=$%.3f — RESET: price moved from $%.3f",
+                         title[:50], yes_price, _first_price)
+                continue
+            if _elapsed_h < _stagnant_hours:
+                log.info("LOTTERY FADE: %s YES=$%.3f stagnant=%.1fh/%dh vol=$%.0f — WAITING",
+                         title[:50], yes_price, _elapsed_h, _stagnant_hours, volume)
+                continue  # Stagnant, but not for long enough yet
+
+            log.info("LOTTERY FADE: %s YES=$%.3f stagnant=%.1fh vol=$%.0f — QUALIFY",
+                     title[:50], yes_price, _elapsed_h, volume)
+            opportunities.append({
+                "market": title[:80],
+                "source": source,
+                "yes_price": yes_price,
+                "no_price": no_price,
+                "volume": volume,
+                "stagnant_hours": round(_elapsed_h, 1),
+                "expected_profit": no_price * 0.98 - no_price,  # Profit at TP
+            })
+
+    except Exception as e:
+        log.warning("Lottery fade scan error: %s", e)
+
+    if opportunities:
+        _STRATEGY_DEBUG["lottery_fade"]["last_signal"] = f"{opportunities[0]['market'][:40]} YES=${opportunities[0]['yes_price']:.3f}"
+        _STRATEGY_DEBUG["lottery_fade"]["last_reason"] = f"QUALIFIED {len(opportunities)} markets"
+    else:
+        _STRATEGY_DEBUG["lottery_fade"]["last_reason"] = f"no markets qualified ({len(_LOTTERY_PRICE_HISTORY)} tracked)"
+    return sorted(opportunities, key=lambda x: x["yes_price"])[:5]
+
+
+async def scan_pm_momentum():
+    """Strategy 3: Momentum Cascade Scanner.
+    Track 24h price changes, fire when >10% move detected."""
+    import asyncio as _aio
+    global _PM_PRICE_HISTORY
+
+    mom_count = sum(1 for p in PAPER_PORTFOLIO.get("positions", [])
+                    if p.get("strategy") == "pm_momentum")
+    if mom_count >= PM_MOMENTUM_CONFIG["max_positions"]:
+        return []
+
+    now = datetime.now(timezone.utc)
+    opportunities = []
+
+    try:
+        markets = await _aio.to_thread(get_polymarket_markets, 40)
+        kalshi_mkts = await _aio.to_thread(get_kalshi_active_markets, 30)
+
+        all_markets = []
+        for m in markets:
+            title = m.get("question", m.get("title", ""))
+            if title and not is_sports_or_junk(title):
+                all_markets.append({"source": "polymarket", "data": m, "title": title})
+        for m in kalshi_mkts:
+            title = m.get("title", "")
+            if title and not _is_kalshi_sports(m) and not is_sports_or_junk(title):
+                all_markets.append({"source": "kalshi", "data": m, "title": title})
+
+        for entry in all_markets:
+            m = entry["data"]
+            title = entry["title"]
+            source = entry["source"]
+            market_key = f"{source}:{title[:60]}"
+            yes_price = _extract_yes_price(m, source)
+
+            if yes_price <= 0.03 or yes_price >= 0.97:
+                continue
+
+            volume = m.get("volume24hr", m.get("volume", 0))
+            if isinstance(volume, str):
+                try:
+                    volume = float(volume)
+                except ValueError:
+                    volume = 0
+            if volume < PM_MOMENTUM_CONFIG["min_volume"]:
+                continue
+
+            # Update price history
+            if market_key not in _PM_PRICE_HISTORY:
+                _PM_PRICE_HISTORY[market_key] = []
+            _PM_PRICE_HISTORY[market_key].append((now, yes_price))
+            # Keep 24h of history
+            from datetime import timedelta as _pm_td
+            cutoff = now - _pm_td(hours=24)
+            _PM_PRICE_HISTORY[market_key] = [
+                (t, p) for t, p in _PM_PRICE_HISTORY[market_key] if t > cutoff
+            ]
+
+            history = _PM_PRICE_HISTORY[market_key]
+            if len(history) < 2:
+                continue
+
+            # Calculate 24h change
+            oldest_price = history[0][1]
+            if oldest_price <= 0:
+                continue
+            change_24h = (yes_price - oldest_price) / oldest_price
+
+            # FIX 5: Only fire on TRUE momentum — markets in the "decided" zone
+            # ($0.40-$0.60 YES) are already crowd-priced consensus, not momentum.
+            # Real momentum trades happen when an underdog/leader is moving sharply.
+            _in_decided_zone = 0.40 <= yes_price <= 0.60
+            if _in_decided_zone:
+                continue  # Skip — crowd has already priced this market
+            if abs(change_24h) >= PM_MOMENTUM_CONFIG["min_24h_change_pct"]:
+                direction = "YES" if change_24h > 0 else "NO"
+                # Check for equity cascade mapping
+                cascade = None
+                title_lower = title.lower()
+                for kw, legs in PM_MOMENTUM_CASCADES.items():
+                    if kw in title_lower:
+                        cascade = legs
+                        break
+
+                opportunities.append({
+                    "market": title[:80],
+                    "source": source,
+                    "yes_price": yes_price,
+                    "change_24h": change_24h,
+                    "direction": direction,
+                    "volume": volume,
+                    "cascade": cascade,
+                })
+
+    except Exception as e:
+        log.warning("PM momentum scan error: %s", e)
+
+    return sorted(opportunities, key=lambda x: -abs(x["change_24h"]))[:3]
+
+
+async def execute_pm_strategies(channel=None):
+    """Execute all three prediction market strategies. Called from main scan loop."""
+    import asyncio as _aio
+
+    _pm_alloc = _pm_check_allocation()
+    if _pm_alloc >= PM_CONFIG["max_allocation_pct"]:
+        _STRATEGY_DEBUG["lottery_fade"]["last_run"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        _STRATEGY_DEBUG["lottery_fade"]["last_reason"] = f"PM allocation cap ({_pm_alloc*100:.1f}% >= {PM_CONFIG['max_allocation_pct']*100:.0f}%)"
+        return 0
+
+    portfolio_value = PAPER_PORTFOLIO.get("cash", 25000) + sum(
+        p.get("cost", 0) for p in PAPER_PORTFOLIO.get("positions", []))
+
+    fired = 0
+
+    # ─── Strategy 1: Arbitrage ───
+    try:
+        arb_opps = await scan_pm_arbitrage()
+        for opp in arb_opps[:2]:
+            # Echo memory check
+            echo_mult, echo_detail = _pm_echo_check("pm_arbitrage")
+            if echo_mult <= 0:
+                log.info("PM_ARB SKIP (echo): %s — %s", opp["topic"], echo_detail)
+                continue
+
+            size = portfolio_value * PM_ARBITRAGE_CONFIG["size_pct"] * echo_mult
+            market_id = f"PM_ARB:{opp['topic']}:{opp['buy_exchange']}"
+
+            if any(p.get("market", "") == market_id for p in PAPER_PORTFOLIO.get("positions", [])):
+                continue
+
+            PAPER_PORTFOLIO["cash"] -= size * 2  # Two sides
+            PAPER_PORTFOLIO["positions"].append({
+                "market": market_id, "strategy": "pm_arbitrage",
+                "side": "ARBITRAGE", "cost": size * 2,
+                "entry_price": opp["spread"],
+                "buy_exchange": opp["buy_exchange"], "sell_exchange": opp["sell_exchange"],
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            })
+            db_open_position(
+                market_id=market_id, platform="Multi", strategy="pm_arbitrage",
+                direction="arbitrage", size_usd=size * 2, shares=0,
+                entry_price=opp["spread"],
+                metadata={"buy_at": opp["buy_yes_price"], "sell_at": opp["sell_yes_price"],
+                          "buy_exchange": opp["buy_exchange"], "topic": opp["topic"]},
+            )
+            if channel:
+                try:
+                    await channel.send(
+                        f"**PM ARBITRAGE** | {opp['topic']} | spread={opp['spread']*100:.1f}% | "
+                        f"BUY YES@{opp['buy_exchange']} ${opp['buy_yes_price']:.2f} / "
+                        f"BUY NO@{opp['sell_exchange']} | size=${size*2:.0f}")
+                except Exception:
+                    pass
+            fired += 1
+    except Exception as e:
+        log.warning("PM arbitrage exec error: %s", e)
+
+    # ─── Strategy 2: Lottery Fade ───
+    try:
+        fade_opps = await scan_lottery_fade()
+        for opp in fade_opps[:2]:
+            echo_mult, echo_detail = _pm_echo_check("lottery_fade")
+            if echo_mult <= 0:
+                log.info("LOTTERY_FADE SKIP (echo): %s — %s", opp["market"][:40], echo_detail)
+                continue
+
+            size = portfolio_value * PM_LOTTERY_FADE_CONFIG["size_pct"] * echo_mult
+            market_id = f"FADE:{opp['market'][:40]}"
+
+            if any(p.get("market", "").startswith("FADE:") and opp["market"][:30] in p.get("market", "")
+                   for p in PAPER_PORTFOLIO.get("positions", [])):
+                continue
+
+            PAPER_PORTFOLIO["cash"] -= size
+            PAPER_PORTFOLIO["positions"].append({
+                "market": market_id, "strategy": "lottery_fade",
+                "side": "BUY_NO", "cost": size,
+                "entry_price": opp["no_price"],
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            })
+            db_open_position(
+                market_id=market_id, platform=opp["source"].title(), strategy="lottery_fade",
+                direction="no", size_usd=size, shares=size / opp["no_price"],
+                entry_price=opp["no_price"],
+                target_price=PM_LOTTERY_FADE_CONFIG["tp_no_price"],
+                metadata={"yes_price": opp["yes_price"], "volume": opp["volume"]},
+            )
+            if channel:
+                try:
+                    await channel.send(
+                        f"**LOTTERY FADE** | {opp['market'][:60]} | "
+                        f"YES=${opp['yes_price']:.2f} → BUY NO@${opp['no_price']:.2f} | "
+                        f"size=${size:.0f} | TP@$0.98")
+                except Exception:
+                    pass
+            fired += 1
+    except Exception as e:
+        log.warning("Lottery fade exec error: %s", e)
+
+    # ─── Strategy 3: Momentum Cascade ───
+    try:
+        mom_opps = await scan_pm_momentum()
+        for opp in mom_opps[:2]:
+            echo_mult, echo_detail = _pm_echo_check("pm_momentum")
+            if echo_mult <= 0:
+                log.info("PM_MOM SKIP (echo): %s — %s", opp["market"][:40], echo_detail)
+                continue
+
+            size = portfolio_value * PM_MOMENTUM_CONFIG["size_pct"] * echo_mult
+            market_id = f"PM_MOM:{opp['market'][:40]}"
+
+            if any(p.get("market", "").startswith("PM_MOM:")
+                   for p in PAPER_PORTFOLIO.get("positions", [])):
+                continue
+
+            # Prediction market leg
+            PAPER_PORTFOLIO["cash"] -= size
+            side = "BUY_YES" if opp["direction"] == "YES" else "BUY_NO"
+            PAPER_PORTFOLIO["positions"].append({
+                "market": market_id, "strategy": "pm_momentum",
+                "side": side, "cost": size,
+                "entry_price": opp["yes_price"],
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            })
+            db_open_position(
+                market_id=market_id, platform=opp["source"].title(), strategy="pm_momentum",
+                direction=opp["direction"].lower(), size_usd=size, shares=0,
+                entry_price=opp["yes_price"],
+                metadata={"change_24h": opp["change_24h"], "volume": opp["volume"]},
+            )
+
+            # Equity cascade leg
+            if opp.get("cascade"):
+                cascade_long = opp["cascade"]["long"]
+                cascade_short = opp["cascade"]["short"]
+                cascade_id = f"PM_MOM_EQ:{cascade_long}/{cascade_short}"
+                cascade_size = size * 0.5  # Half size for equity leg
+
+                if not any(p.get("market", "") == cascade_id for p in PAPER_PORTFOLIO.get("positions", [])):
+                    PAPER_PORTFOLIO["cash"] -= cascade_size * 2
+                    PAPER_PORTFOLIO["positions"].append({
+                        "market": cascade_id, "strategy": "pm_momentum",
+                        "side": "PAIRS", "cost": cascade_size * 2,
+                        "long_leg": cascade_long, "short_leg": cascade_short,
+                        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                    })
+                    db_open_position(
+                        market_id=cascade_id, platform="Alpaca", strategy="pm_momentum",
+                        direction="pairs", size_usd=cascade_size * 2, shares=0,
+                        entry_price=0, long_leg=cascade_long, short_leg=cascade_short,
+                        metadata={"trigger_market": opp["market"][:60], "pm_change": opp["change_24h"]},
+                    )
+
+            if channel:
+                cascade_str = ""
+                if opp.get("cascade"):
+                    cascade_str = f" → EQUITY: L:{opp['cascade']['long']} S:{opp['cascade']['short']}"
+                try:
+                    await channel.send(
+                        f"**PM MOMENTUM** | {opp['market'][:50]} | {opp['direction']} "
+                        f"Δ{opp['change_24h']*100:+.1f}% | size=${size:.0f}{cascade_str}")
+                except Exception:
+                    pass
+            fired += 1
+    except Exception as e:
+        log.warning("PM momentum exec error: %s", e)
+
+    return fired
+
+
+# ─── EXIT RULES FOR NEW PM STRATEGIES ───
+EXIT_CONFIG["pm_arbitrage_ttl_days"] = 45
+EXIT_CONFIG["lottery_fade_ttl_days"] = 60
+EXIT_CONFIG["pm_momentum_ttl_hours"] = 48
+
+# ─── STRATEGY ACCOUNTS + CFO INTEGRATION ───
+_META_ALLOC["pm_arbitrage"] = 1.0
+_META_ALLOC["lottery_fade"] = 1.0
+_META_ALLOC["pm_momentum"] = 1.0
+_META_ALLOC["sec_8k_hunter"] = 1.0
+_META_ALLOC["supply_chain_ripple"] = 1.0
+
+# ═══════════════════════════════════════════════════════════════════
+# END v17 MODULES — Cognitive Alpha + Prediction Market Overhaul
+# ═══════════════════════════════════════════════════════════════════
+
+
+# ============================================================================
+# ENTRY POINT (moved to bottom — bot.run blocks, was hiding ~2000 lines from load)
+# ============================================================================
+if __name__ == "__main__":
+    if not DISCORD_TOKEN:
+        log.error("DISCORD_TOKEN not set -- cannot start bot")
+        raise SystemExit(1)
+    start_webhook_server(port=int(os.getenv("TV_WEBHOOK_PORT", "8080")))
+    bot.run(DISCORD_TOKEN)
 

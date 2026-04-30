@@ -1,381 +1,2168 @@
 <!DOCTYPE html>
+<!-- Dashboard v3.0 — 2026-04-05 War Room: CFO + Alpha + Regime + Intel -->
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>TraderJoes War Room</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>TraderJoes Terminal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: 'Courier New', monospace; background: #0a0e17; color: #c8d6e5; font-size: 13px; }
-.war-room { display: grid; grid-template-rows: auto auto 1fr auto; min-height: 100vh; gap: 1px; background: #1a1f2e; }
-.top-bar { display: flex; justify-content: space-around; align-items: center; padding: 10px 20px; background: #0d1117; border-bottom: 1px solid #21262d; flex-wrap: wrap; gap: 8px; }
-.metric { text-align: center; }
-.metric-label { font-size: 10px; color: #6b7280; text-transform: uppercase; letter-spacing: 1px; }
-.metric-value { font-size: 18px; font-weight: bold; }
-.metric-value.green { color: #22c55e; }
-.metric-value.red { color: #ef4444; }
-.metric-value.amber { color: #f59e0b; }
-.metric-value.blue { color: #3b82f6; }
-.charts-row { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 1px; }
-.main-panels { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1px; overflow: hidden; }
-.panel { background: #0d1117; padding: 12px; overflow-y: auto; }
-.panel-title { font-size: 11px; color: #58a6ff; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #21262d; padding-bottom: 6px; margin-bottom: 8px; }
-.pos-row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #161b22; font-size: 12px; }
-.pos-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.pos-cost { width: 60px; text-align: right; color: #8b949e; }
-.signal-row { margin-bottom: 10px; }
-.signal-name { font-size: 11px; color: #8b949e; margin-bottom: 3px; display: flex; justify-content: space-between; }
-.signal-bar-bg { height: 8px; background: #21262d; border-radius: 4px; overflow: hidden; }
-.signal-bar { height: 100%; border-radius: 4px; transition: width 0.5s ease; }
-.signal-bar.hot { background: linear-gradient(90deg, #f59e0b, #ef4444); }
-.signal-bar.warm { background: linear-gradient(90deg, #22c55e, #f59e0b); }
-.signal-bar.cool { background: #3b82f6; }
-.event-row { padding: 4px 0; border-bottom: 1px solid #161b22; font-size: 11px; }
-.event-agent { color: #58a6ff; font-weight: bold; }
-.event-time { color: #484f58; font-size: 10px; }
-.bottom-bar { background: #0d1117; padding: 8px 20px; border-top: 1px solid #21262d; overflow: hidden; }
-.headline-scroll { display: flex; gap: 40px; animation: scroll 60s linear infinite; white-space: nowrap; }
-.headline { font-size: 11px; color: #8b949e; }
-.headline .theme { color: #f59e0b; font-weight: bold; }
-@keyframes scroll { from { transform: translateX(0); } to { transform: translateX(-50%); } }
-.loading { color: #484f58; text-align: center; padding: 20px; }
-.tag { font-size: 9px; padding: 1px 4px; border-radius: 2px; margin-left: 4px; }
-.tag-pairs { background: #1f3a5f; color: #58a6ff; }
-.tag-crypto { background: #3a1f5f; color: #a855f7; }
-.tag-pred { background: #1f5f3a; color: #22c55e; }
-.tag-oracle { background: #5f3a1f; color: #f59e0b; }
-.tag-hedge { background: #5f1f1f; color: #ef4444; }
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --bg: #0a0e1a;
+  --panel: rgba(13, 17, 30, 0.85);
+  --panel-border: rgba(255,255,255,0.06);
+  --text: #e2e8f0;
+  --text-dim: #6b7280;
+  --text-muted: #3b4252;
+  --blue: #00d4ff;
+  --green: #00ff88;
+  --red: #ff3366;
+  --gold: #ffd700;
+  --purple: #a855f7;
+  --amber: #f59e0b;
+  --glow-blue: 0 0 8px rgba(0,212,255,0.3);
+  --glow-green: 0 0 8px rgba(0,255,136,0.3);
+  --glow-red: 0 0 8px rgba(255,51,102,0.3);
+  --glow-gold: 0 0 8px rgba(255,215,0,0.3);
+  --grid-line: rgba(255,255,255,0.04);
+  --tick-color: #6b7280;
+  --topbar-h: 56px;
+  --ticker-h: 30px;
+}
+
+html, body { height: 100%; overflow: hidden; }
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.14); }
+
+/* ===== TOP BAR ===== */
+.topbar {
+  height: var(--topbar-h);
+  background: var(--panel);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--panel-border);
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+  gap: 8px;
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 100;
+}
+.topbar-brand {
+  font-size: 16px;
+  font-weight: 800;
+  color: var(--gold);
+  letter-spacing: 2px;
+  text-shadow: var(--glow-gold);
+  margin-right: 4px;
+  white-space: nowrap;
+}
+.topbar-brand-sub {
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--text-dim);
+  letter-spacing: 1.5px;
+  margin-left: 6px;
+}
+.topbar-center { display: flex; align-items: center; gap: 6px; flex: 1; justify-content: center; flex-wrap: nowrap; overflow-x: auto; }
+.topbar-right { display: flex; align-items: center; gap: 12px; margin-left: auto; white-space: nowrap; }
+.topbar-clock {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.topbar-pos {
+  font-size: 11px;
+  color: var(--text-dim);
+  background: rgba(255,255,255,0.04);
+  padding: 3px 10px;
+  border-radius: 6px;
+  font-weight: 600;
+}
+
+/* Badges / Pills */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  transition: all 0.2s ease;
+  backdrop-filter: blur(4px);
+}
+.badge-label {
+  font-size: 9px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  opacity: 0.6;
+}
+.badge-blue { background: rgba(0,212,255,0.1); color: var(--blue); text-shadow: var(--glow-blue); }
+.badge-green { background: rgba(0,255,136,0.1); color: var(--green); }
+.badge-red { background: rgba(255,51,102,0.1); color: var(--red); }
+.badge-amber { background: rgba(245,158,11,0.1); color: var(--amber); }
+.badge-purple { background: rgba(168,85,247,0.1); color: var(--purple); }
+.badge-neutral { background: rgba(255,255,255,0.04); color: var(--text); }
+.badge-gold { background: rgba(255,215,0,0.08); color: var(--gold); }
+
+/* ===== MAIN GRID ===== */
+.main {
+  position: fixed;
+  top: var(--topbar-h);
+  left: 0; right: 0;
+  bottom: var(--ticker-h);
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 1px;
+  padding: 1px;
+  background: rgba(255,255,255,0.02);
+}
+.col {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-height: 0;
+  min-width: 0;
+}
+
+/* Panels */
+.panel {
+  background: var(--panel);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--panel-border);
+  border-radius: 2px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  transition: all 0.2s ease;
+  overflow: hidden;
+}
+.panel:hover { filter: brightness(1.04); }
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+  flex-shrink: 0;
+}
+.panel-title {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1.8px;
+  color: var(--blue);
+}
+.panel-subtitle {
+  font-size: 9px;
+  color: var(--text-dim);
+}
+.panel-body {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+/* Chart wrapper */
+.chart-wrap { position: relative; flex: 1; min-height: 0; }
+.chart-wrap canvas { width: 100% !important; height: 100% !important; }
+
+/* Timeframe pills */
+.tf-pills { display: flex; gap: 4px; }
+.tf-pill {
+  background: rgba(255,255,255,0.04);
+  border: 1px solid transparent;
+  color: var(--text-dim);
+  font-family: 'Inter', sans-serif;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  letter-spacing: 0.5px;
+}
+.tf-pill:hover { background: rgba(0,212,255,0.08); color: var(--text); }
+.tf-pill.active {
+  background: rgba(0,212,255,0.15);
+  color: var(--blue);
+  border-color: rgba(0,212,255,0.3);
+  text-shadow: var(--glow-blue);
+}
+
+/* Hero numbers */
+.hero-row { display: flex; gap: 2px; }
+.hero-item {
+  flex: 1;
+  text-align: center;
+  padding: 8px 4px;
+  background: rgba(255,255,255,0.02);
+  border-radius: 4px;
+}
+.hero-label { font-size: 9px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 2px; }
+.hero-value { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+/* Position cards */
+.pos-item {
+  padding: 8px 10px;
+  border-radius: 6px;
+  margin-bottom: 3px;
+  background: rgba(255,255,255,0.015);
+  border: 1px solid transparent;
+  transition: all 0.2s ease;
+}
+.pos-item:hover { background: rgba(255,255,255,0.03); border-color: var(--panel-border); }
+.pos-top-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+.pos-market { font-weight: 700; font-size: 12px; color: var(--text); }
+.pos-strat-tag {
+  font-size: 8px; padding: 2px 7px; border-radius: 4px;
+  font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px;
+}
+.tag-pairs { background: rgba(0,212,255,0.12); color: var(--blue); }
+.tag-crypto { background: rgba(168,85,247,0.12); color: var(--purple); }
+.tag-prediction { background: rgba(0,255,136,0.12); color: var(--green); }
+.tag-oracle { background: rgba(255,215,0,0.12); color: var(--gold); }
+.tag-hedge { background: rgba(255,51,102,0.12); color: var(--red); }
+.tag-cascade { background: rgba(0,212,255,0.08); color: #06b6d4; }
+.tag-default { background: rgba(255,255,255,0.06); color: var(--text-dim); }
+
+.pos-pnl-bar-track {
+  height: 4px;
+  background: rgba(255,255,255,0.04);
+  border-radius: 2px;
+  position: relative;
+  overflow: hidden;
+  margin: 4px 0;
+}
+.pos-pnl-bar-fill {
+  position: absolute;
+  top: 0; height: 100%;
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+.pos-bottom-row { display: flex; justify-content: space-between; font-size: 10px; color: var(--text-dim); }
+.pos-pnl-val { font-weight: 700; font-variant-numeric: tabular-nums; }
+
+/* Strategy bars */
+.strat-bar-item { margin-bottom: 6px; }
+.strat-bar-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 3px; }
+.strat-bar-name { font-size: 10px; font-weight: 600; color: var(--text); }
+.strat-bar-wr { font-size: 9px; font-weight: 600; }
+.strat-bar-track {
+  height: 6px; background: rgba(255,255,255,0.04); border-radius: 3px;
+  position: relative; overflow: visible;
+}
+.strat-bar-fill {
+  position: absolute; top: 0; height: 100%; border-radius: 3px;
+  transition: width 0.3s ease;
+}
+.strat-bar-value {
+  font-size: 9px; font-weight: 600; margin-top: 2px;
+  font-variant-numeric: tabular-nums;
+}
+
 /* Launch criteria */
-.launch-panel { background: #0d1117; padding: 12px; }
-.criteria-row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid #161b22; }
-.criteria-label { font-size: 11px; color: #8b949e; }
-.criteria-value { font-size: 13px; font-weight: bold; }
-.criteria-bar { height: 6px; background: #21262d; border-radius: 3px; flex: 1; margin: 0 10px; }
-.criteria-fill { height: 100%; border-radius: 3px; transition: width 0.5s; }
-.criteria-fill.good { background: #22c55e; }
-.criteria-fill.warn { background: #f59e0b; }
-.criteria-fill.bad { background: #ef4444; }
-/* Chart containers */
-.chart-container { background: #0d1117; padding: 12px; min-height: 200px; }
-canvas { max-height: 180px; }
-/* Mobile nav */
-.mobile-nav { display: none; position: fixed; bottom: 0; left: 0; right: 0; background: #0d1117; border-top: 1px solid #21262d; padding: 8px 0; z-index: 100; }
+.launch-item { margin-bottom: 8px; }
+.launch-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+.launch-label { font-size: 10px; font-weight: 600; color: var(--text); }
+.launch-vals { font-size: 10px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.launch-track { height: 6px; background: rgba(255,255,255,0.06); border-radius: 3px; overflow: hidden; }
+.launch-fill { height: 100%; border-radius: 3px; transition: width 0.4s ease; }
+
+/* Oracle signals */
+.signal-item {
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.03);
+}
+.signal-item:last-child { border-bottom: none; }
+.signal-name { font-size: 11px; font-weight: 700; color: var(--text); margin-bottom: 3px; }
+.signal-legs { font-size: 9px; color: var(--text-dim); margin-bottom: 4px; }
+.signal-bar-track {
+  height: 5px; background: rgba(255,255,255,0.04); border-radius: 3px;
+  overflow: hidden; position: relative;
+}
+.signal-bar-fill {
+  height: 100%; border-radius: 3px;
+  transition: width 0.3s ease;
+}
+.signal-bar-fill.near-threshold {
+  box-shadow: 0 0 8px rgba(0,212,255,0.5);
+}
+.signal-meta { display: flex; justify-content: space-between; margin-top: 3px; font-size: 9px; color: var(--text-dim); }
+
+/* Intelligence feed */
+.intel-item { padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.02); font-size: 11px; }
+.intel-item:last-child { border-bottom: none; }
+.intel-time { font-size: 9px; color: var(--text-muted); margin-right: 6px; font-variant-numeric: tabular-nums; }
+.intel-agent { font-weight: 700; color: var(--blue); margin-right: 6px; font-size: 10px; }
+.intel-msg { color: var(--text-dim); }
+.intel-trade { color: var(--green); }
+.intel-alert { color: var(--amber); }
+.intel-error { color: var(--red); }
+
+/* Donut gauge */
+.gauge-wrap { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 8px; flex: 1; }
+.gauge-canvas-wrap { position: relative; width: 120px; height: 120px; }
+.gauge-center {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  text-align: center;
+}
+.gauge-pct { font-size: 26px; font-weight: 800; color: var(--text); text-shadow: var(--glow-blue); }
+.gauge-sub { font-size: 9px; color: var(--text-dim); margin-top: 4px; }
+.gauge-streak { font-size: 10px; font-weight: 600; margin-top: 6px; }
+
+/* Geo alert */
+.geo-alert {
+  background: rgba(255,51,102,0.1);
+  border: 1px solid rgba(255,51,102,0.2);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--red);
+  margin-bottom: 8px;
+}
+
+/* Bottom ticker */
+.ticker {
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  height: var(--ticker-h);
+  background: var(--panel);
+  backdrop-filter: blur(12px);
+  border-top: 1px solid var(--panel-border);
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  z-index: 100;
+}
+.ticker-track {
+  display: flex;
+  gap: 60px;
+  white-space: nowrap;
+  animation: tickerScroll 120s linear infinite;
+}
+.ticker-item { font-size: 11px; color: var(--text-dim); }
+.ticker-theme { color: var(--gold); font-weight: 700; }
+@keyframes tickerScroll {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+
+/* Loading */
+.loading-text { color: var(--text-muted); text-align: center; padding: 20px; font-size: 11px; }
+
+/* ===== MOBILE ===== */
+.mobile-nav {
+  display: none;
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  background: var(--panel);
+  backdrop-filter: blur(12px);
+  border-top: 1px solid var(--panel-border);
+  z-index: 200;
+  padding: 6px 0 env(safe-area-inset-bottom, 4px);
+}
 .mobile-nav-inner { display: flex; justify-content: space-around; }
-.mobile-nav a { color: #58a6ff; text-decoration: none; font-size: 10px; text-align: center; padding: 4px 8px; }
-.mobile-nav a span { display: block; font-size: 16px; }
+.mobile-nav-btn {
+  background: none; border: none; color: var(--text-dim);
+  font-family: 'Inter', sans-serif; font-size: 11px;
+  padding: 6px 12px; cursor: pointer; text-align: center;
+  transition: color 0.2s ease; font-weight: 600;
+}
+.mobile-nav-btn.active { color: var(--blue); }
+.mobile-nav-btn span { display: block; font-size: 20px; margin-bottom: 3px; }
+
 @media (max-width: 768px) {
-  body { font-size: 14px; }
-  .war-room { padding-bottom: 60px; }
-  .top-bar { padding: 8px 10px; gap: 4px; }
-  .metric-value { font-size: 15px; }
-  .charts-row { grid-template-columns: 1fr; }
-  .main-panels { grid-template-columns: 1fr; }
-  .panel { max-height: 40vh; }
-  .bottom-bar { display: none; }
+  html, body { overflow-x: hidden; overflow-y: auto; }
+  body { font-size: 13px; padding-bottom: 72px; max-width: 100vw; line-height: 1.5; }
+
+  /* Topbar: sticky, compact */
+  .topbar {
+    position: sticky; top: 0; height: auto; min-height: 48px;
+    flex-wrap: wrap; padding: 8px 12px; gap: 4px;
+  }
+  .topbar-brand { font-size: 15px; letter-spacing: 1.5px; }
+  .topbar-brand-sub { font-size: 9px; }
+  .topbar-center { display: none; }
+  .topbar-right { gap: 8px; }
+  .topbar-clock { font-size: 12px; }
+  .topbar-pos { font-size: 11px; padding: 3px 10px; }
+
+  /* Main grid: single column, not fixed */
+  .main {
+    position: relative;
+    top: 0; bottom: auto;
+    grid-template-columns: 1fr;
+    height: auto;
+    min-height: 0;
+  }
+  .col { min-height: auto; }
+
+  /* Panels: no collapse, no clip */
+  .panel {
+    max-height: none !important;
+    padding: 10px;
+    overflow: visible !important;
+    flex: none !important;
+    height: auto !important;
+    min-height: 0;
+  }
+  .panel-title { font-size: 10px; letter-spacing: 1.4px; }
+  .panel-body {
+    overflow-y: visible !important;
+    min-height: auto !important;
+    max-height: none !important;
+    height: auto !important;
+  }
+
+  /* Ticker hidden, mobile nav shown */
+  .ticker { display: none; }
   .mobile-nav { display: block; }
+  .desktop-only { display: none !important; }
+
+  /* Hero stats: 2x2 grid */
+  .hero-row {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px;
+  }
+  .hero-item { padding: 10px 8px; border-radius: 6px; }
+  .hero-label { font-size: 9px; letter-spacing: 0.8px; }
+  .hero-value { font-size: 20px; }
+
+  /* Equity chart: FORCE visible height — this is the critical fix */
+  .chart-wrap {
+    min-height: 220px !important;
+    height: 220px !important;
+    position: relative;
+    width: 100%;
+  }
+  .chart-wrap canvas {
+    height: 220px !important;
+    width: 100% !important;
+    display: block !important;
+  }
+
+  /* Position cards */
+  .pos-item { padding: 10px 12px; margin-bottom: 6px; border-radius: 8px; }
+  .pos-market { font-size: 13px; word-break: break-word; }
+  .pos-strat-tag { font-size: 8px; padding: 2px 6px; }
+  .pos-bottom-row { font-size: 11px; flex-wrap: wrap; }
+  .pos-pnl-bar-track { margin: 5px 0; height: 5px; }
+
+  /* Oracle signals */
+  .signal-name { font-size: 12px; }
+  .signal-legs { font-size: 10px; word-break: break-word; }
+  .signal-meta { font-size: 10px; flex-wrap: wrap; gap: 4px; }
+  .signal-item { padding: 10px 0; }
+
+  /* Intel feed */
+  .intel-item { font-size: 12px; word-break: break-word; padding: 8px 0; }
+  .intel-time { font-size: 10px; }
+  .intel-agent { font-size: 11px; }
+
+  /* Strategy bars */
+  .strat-bar-name { font-size: 11px; }
+  .strat-bar-wr { font-size: 10px; }
+  .strat-bar-value { font-size: 10px; }
+
+  /* Launch criteria */
+  .launch-label { font-size: 11px; }
+  .launch-vals { font-size: 11px; }
+
+  /* Win rate gauge */
+  .gauge-canvas-wrap { width: 100px; height: 100px; }
+  .gauge-pct { font-size: 22px; }
+  .gauge-sub { font-size: 8px; }
+
+  /* Badges: prevent overflow */
+  .badge { padding: 3px 7px; font-size: 10px; max-width: 100%; }
+  .badge-label { font-size: 8px; }
+
+  /* Timeframe pills: scrollable row */
+  .tf-pills { flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .tf-pill { font-size: 9px; padding: 3px 8px; flex-shrink: 0; }
+
+  /* Daily PnL bar chart: force height */
+  .panel .chart-wrap {
+    min-height: 180px !important;
+    height: 180px !important;
+  }
+}
+
+/* ===== TIER UI (DASH-B) ===== */
+.tier-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.tier-row {
+  display: grid;
+  grid-template-columns: 90px 1fr 1fr 1fr 60px auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 4px;
+  background: rgba(255,255,255,0.015);
+  font-size: 11px;
+}
+.tier-row.muted { opacity: 0.48; }
+.tier-row.accent-paper { border-left: 3px solid var(--blue); }
+.tier-row.accent-shadow { border-left: 3px solid var(--purple); }
+.tier-row.accent-live { border-left: 3px solid var(--gold); }
+.tier-row.accent-hist { border-left: 3px solid var(--text-dim); }
+.tier-row.accent-trans { border-left: 3px solid var(--text-dim); }
+.tier-label {
+  font-size: 10px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 1.2px;
+}
+.tier-val { font-variant-numeric: tabular-nums; font-weight: 600; }
+.tier-val-label { font-size: 8px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.7px; }
+.tier-val-num { font-size: 12px; color: var(--text); }
+.tier-status-chip { font-size: 9px; color: var(--text-dim); text-align: right; }
+
+.tier-toggle-row { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 6px; }
+.tier-pill {
+  background: rgba(255,255,255,0.04);
+  border: 1px solid transparent;
+  color: var(--text-dim);
+  font-family: 'Inter', sans-serif;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  min-height: 28px;
+}
+.tier-pill:hover { background: rgba(0,212,255,0.08); color: var(--text); }
+.tier-pill.active {
+  background: rgba(0,212,255,0.15);
+  color: var(--blue);
+  border-color: rgba(0,212,255,0.3);
+  text-shadow: var(--glow-blue);
+}
+.tier-pill.active.shadow-active {
+  background: rgba(168,85,247,0.15);
+  color: var(--purple);
+  border-color: rgba(168,85,247,0.35);
+}
+
+.tier-banner {
+  font-size: 10px;
+  color: var(--text-dim);
+  padding: 6px 10px;
+  border-radius: 4px;
+  background: rgba(255,255,255,0.02);
+  border-left: 2px solid var(--blue);
+  margin-bottom: 6px;
+}
+.tier-banner.shadow { border-left-color: var(--purple); }
+.tier-banner.archive { border-left-color: var(--text-dim); }
+
+.shadow-strat-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 10px;
+}
+.shadow-strat-table th {
+  text-align: left; padding: 4px 6px;
+  color: var(--text-dim); font-weight: 600;
+  font-size: 9px; text-transform: uppercase; letter-spacing: 0.8px;
+  border-bottom: 1px solid var(--panel-border);
+}
+.shadow-strat-table td {
+  padding: 5px 6px;
+  border-bottom: 1px solid rgba(255,255,255,0.02);
+  font-variant-numeric: tabular-nums;
+}
+.shadow-strat-table tr:hover td { background: rgba(168,85,247,0.04); }
+.shadow-strat-status {
+  font-size: 8px; padding: 2px 6px; border-radius: 4px;
+  font-weight: 700; letter-spacing: 0.5px;
+}
+.shadow-strat-status.ACTIVE { background: rgba(0,255,136,0.1); color: var(--green); }
+.shadow-strat-status.PAUSED { background: rgba(245,158,11,0.1); color: var(--amber); }
+.shadow-strat-status.KILL_REVIEW { background: rgba(255,51,102,0.1); color: var(--red); }
+.shadow-strat-status.GRADUATION_READY { background: rgba(255,215,0,0.1); color: var(--gold); }
+
+@media (max-width: 768px) {
+  /* 44x44 min tap targets on mobile per WCAG */
+  .tier-pill { min-height: 44px; min-width: 44px; padding: 10px 14px; font-size: 12px; }
+  .tier-row {
+    grid-template-columns: 70px 1fr 1fr;
+    font-size: 10px;
+  }
+  .tier-row > :nth-child(5), .tier-row > :nth-child(6) { display: none; }
+  .shadow-strat-table { font-size: 9px; }
+  .shadow-strat-table th, .shadow-strat-table td { padding: 3px 4px; }
 }
 </style>
 </head>
 <body>
 <div id="root"></div>
 <script type="text/babel">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
 const API = window.location.origin;
 const REFRESH_MS = 15000;
 
+/* ===== HOOKS ===== */
 function useApi(endpoint) {
-  const [data, setData] = React.useState(null);
-  React.useEffect(() => {
-    const fetch_ = () => {
-      fetch(`${API}${endpoint}`)
-        .then(r => r.json())
-        .then(setData)
-        .catch(() => {});
+  const [data, setData] = useState(null);
+  const [connected, setConnected] = useState(false);
+  const epRef = useRef(endpoint);
+  epRef.current = endpoint;
+  useEffect(() => {
+    let active = true;
+    let slowIv = null;
+    let fastIv = null;
+    const load = () => {
+      fetch(`${API}${epRef.current}`, { cache: 'no-store' })
+        .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
+        .then(d => {
+          if (!active) return;
+          setData(d);
+          if (!connected) {
+            setConnected(true);
+            if (fastIv) { clearInterval(fastIv); fastIv = null; }
+            if (!slowIv) slowIv = setInterval(load, REFRESH_MS);
+          }
+        })
+        .catch(() => {
+          if (!active) return;
+          setConnected(false);
+          if (slowIv) { clearInterval(slowIv); slowIv = null; }
+          if (!fastIv) fastIv = setInterval(load, 5000);
+        });
     };
-    fetch_();
-    const iv = setInterval(fetch_, REFRESH_MS);
-    return () => clearInterval(iv);
+    load();
+    slowIv = setInterval(load, REFRESH_MS);
+    return () => {
+      active = false;
+      if (slowIv) clearInterval(slowIv);
+      if (fastIv) clearInterval(fastIv);
+    };
   }, [endpoint]);
   return data;
 }
 
-function fmt(n, d=0) { return n != null ? `$${Number(n).toLocaleString(undefined, {minimumFractionDigits:d,maximumFractionDigits:d})}` : '—'; }
-function pnlClass(n) { return n > 0 ? 'green' : n < 0 ? 'red' : ''; }
-function stratTag(s) {
-  const m = {pairs:'tag-pairs',crypto:'tag-crypto',prediction:'tag-pred',oracle_trade:'tag-oracle',crash_hedge_put:'tag-hedge',cascade_trade:'tag-oracle'};
-  return <span className={`tag ${m[s]||''}`}>{(s||'?').slice(0,8)}</span>;
+function useClock() {
+  const [now, setNow] = useState(new Date());
+  useEffect(() => {
+    const iv = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(iv);
+  }, []);
+  return now;
 }
 
-function TopBar({status}) {
-  if (!status) return <div className="top-bar"><div className="loading">Connecting...</div></div>;
+/* ===== UTILS ===== */
+function fmt(n, d = 0) {
+  if (n == null || isNaN(n)) return '---';
+  return '$' + Number(n).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
+}
+function pct(n, d = 2) {
+  if (n == null || isNaN(n)) return '---';
+  return (n >= 0 ? '+' : '') + Number(n).toFixed(d) + '%';
+}
+function pnlFmt(n, d = 2) {
+  if (n == null || isNaN(n)) return '---';
+  return (n >= 0 ? '+' : '') + fmt(n, d);
+}
+function pnlColor(n) { return n > 0 ? 'var(--green)' : n < 0 ? 'var(--red)' : 'var(--text-dim)'; }
+function pnlBadge(n) { return n > 0 ? 'badge-green' : n < 0 ? 'badge-red' : 'badge-neutral'; }
+
+function getStratTag(s) {
+  if (!s) return 'tag-default';
+  const l = s.toLowerCase();
+  if (l.includes('pair') || l.includes('zscore')) return 'tag-pairs';
+  if (l.includes('crypto')) return 'tag-crypto';
+  if (l.includes('pred') || l.includes('market')) return 'tag-prediction';
+  if (l.includes('oracle') || l.includes('signal')) return 'tag-oracle';
+  if (l.includes('hedge') || l.includes('crash') || l.includes('protect')) return 'tag-hedge';
+  if (l.includes('cascade')) return 'tag-cascade';
+  return 'tag-default';
+}
+
+function shortStrat(s) {
+  if (!s) return '---';
+  return s.replace(/_/g, ' ').replace(/strategy/gi, '').trim().slice(0, 14);
+}
+
+function chartDefaults() {
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: { duration: 300 },
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        backgroundColor: 'rgba(13,17,30,0.95)',
+        borderColor: 'rgba(255,255,255,0.1)',
+        borderWidth: 1,
+        titleColor: '#e2e8f0',
+        bodyColor: '#e2e8f0',
+        titleFont: { family: 'Inter, sans-serif', size: 11, weight: '600' },
+        bodyFont: { family: 'Inter, sans-serif', size: 11 },
+        padding: 10,
+        cornerRadius: 6,
+      }
+    },
+    scales: {
+      x: {
+        ticks: { color: '#6b7280', font: { size: 10, family: 'Inter, sans-serif' }, maxTicksLimit: 10 },
+        grid: { color: 'rgba(255,255,255,0.04)' },
+        border: { color: 'rgba(255,255,255,0.06)' }
+      },
+      y: {
+        ticks: { color: '#6b7280', font: { size: 10, family: 'Inter, sans-serif' } },
+        grid: { color: 'rgba(255,255,255,0.04)' },
+        border: { color: 'rgba(255,255,255,0.06)' }
+      }
+    }
+  };
+}
+
+function filterEquityCurve(data, tf) {
+  if (!data || !data.length) return [];
+  // Always drop pre-Apr-8 history (Phase 2 adjusted baseline)
+  data = data.filter(d => d.date >= '2026-04-08');
+  if (tf === 'all') return data;
+  const now = new Date();
+  let cutoff;
+  if (tf === '1w') { const d = new Date(now); d.setDate(d.getDate() - 7); cutoff = d.toISOString().slice(0, 10); }
+  else if (tf === '1m') { const d = new Date(now); d.setMonth(d.getMonth() - 1); cutoff = d.toISOString().slice(0, 10); }
+  else return data;
+  return data.filter(d => d.date >= cutoff);
+}
+
+function filterDailyPnls(dailyPnls, tf) {
+  if (!dailyPnls) return {};
+  if (tf === 'all') return dailyPnls;
+  const now = new Date();
+  let cutoff;
+  if (tf === 'today') cutoff = now.toISOString().slice(0, 10);
+  else if (tf === 'week') { const d = new Date(now); d.setDate(d.getDate() - 7); cutoff = d.toISOString().slice(0, 10); }
+  else if (tf === 'month') { const d = new Date(now); d.setMonth(d.getMonth() - 1); cutoff = d.toISOString().slice(0, 10); }
+  else return dailyPnls;
+  const out = {};
+  Object.keys(dailyPnls).forEach(date => { if (date >= cutoff) out[date] = dailyPnls[date]; });
+  return out;
+}
+
+/* ===== TOP BAR ===== */
+function TopBar({ status }) {
+  const clock = useClock();
+  const timeStr = clock.toLocaleTimeString('en-US', { hour12: false });
+
+  if (!status) {
+    return (
+      <div className="topbar">
+        <span className="topbar-brand">TRADERJOES<span className="topbar-brand-sub">TERMINAL</span></span>
+        <div className="topbar-center"><span className="badge badge-neutral">Connecting...</span></div>
+        <div className="topbar-right"><span className="topbar-clock">{timeStr}</span></div>
+      </div>
+    );
+  }
   const s = status;
-  const combined = s.realized_pnl || 0;
-  const ret = s.return_pct || 0;
+  const pnl = s.combined_pnl || s.realized_pnl || 0;
+  const ret = s.adjusted_return_pct || 0;
+  const vix = s.vix || 0;
+  const fng = s.fng_value || 0;
+  const vixBadge = vix > 30 ? 'badge-red' : vix > 20 ? 'badge-amber' : 'badge-green';
+  const regimeBadge = (s.regime || '').includes('extreme') ? 'badge-red' : (s.regime || '').includes('elevated') ? 'badge-amber' : 'badge-green';
+  const fngBadge = fng <= 25 ? 'badge-red' : fng <= 40 ? 'badge-amber' : fng >= 75 ? 'badge-green' : 'badge-neutral';
+
   return (
-    <div className="top-bar">
-      <div className="metric"><div className="metric-label">Cash</div><div className="metric-value">{fmt(s.cash)}</div></div>
-      <div className="metric"><div className="metric-label">Equity</div><div className="metric-value blue">{fmt(s.equity)}</div></div>
-      <div className="metric"><div className="metric-label">Combined P&L</div><div className={`metric-value ${pnlClass(combined)}`}>{fmt(combined,2)}</div></div>
-      <div className="metric"><div className="metric-label">Return</div><div className={`metric-value ${pnlClass(ret)}`}>{ret>=0?'+':''}{ret.toFixed(1)}%</div></div>
-      <div className="metric"><div className="metric-label">VIX</div><div className={`metric-value ${s.vix>25?'red':s.vix>18?'amber':'green'}`}>{s.vix?.toFixed(1)||'—'}</div></div>
-      <div className="metric"><div className="metric-label">Regime</div><div className={`metric-value ${s.regime==='extreme'?'red':s.regime==='elevated'?'amber':'green'}`}>{(s.regime||'?').toUpperCase()}</div></div>
-      <div className="metric"><div className="metric-label">F&G</div><div className={`metric-value ${s.fng_value<20?'red':s.fng_value>80?'red':s.fng_value<40?'amber':'green'}`}>{s.fng_value}/100</div></div>
-      <div className="metric"><div className="metric-label">Positions</div><div className="metric-value">{s.position_count}</div></div>
-      {s.contrarian_mode && <div className="metric"><div className="metric-value amber">CONTRARIAN</div></div>}
+    <>
+    <div className="topbar">
+      <span className="topbar-brand">TRADERJOES<span className="topbar-brand-sub">TERMINAL</span></span>
+      <div className="topbar-center">
+        <span className="badge badge-blue" style={{textShadow:'var(--glow-blue)'}}>
+          <span className="badge-label">Equity</span> {fmt(s.equity)}
+        </span>
+        <span className="badge badge-neutral">
+          <span className="badge-label">Cash</span> {fmt(s.cash)}
+        </span>
+        <span className={`badge ${pnlBadge(pnl)}`}>
+          <span className="badge-label">P/L</span> {pnlFmt(pnl, 2)}
+        </span>
+        <span className={`badge ${pnlBadge(ret)}`}>
+          <span className="badge-label">RETURN (ADJ)</span> {pct(ret)}
+        </span>
+        <span className={`badge ${vixBadge}`}>
+          <span className="badge-label">VIX</span> {vix.toFixed(1)}
+        </span>
+        <span className={`badge ${vix > 28 ? 'badge-red' : vix > 20 ? 'badge-amber' : 'badge-green'}`} style={{fontWeight:700, fontSize:10}}>
+          {vix > 28 ? 'RISK OFF' : vix > 20 ? 'ELEVATED' : 'RISK ON'}
+        </span>
+        <span className={`badge ${regimeBadge}`}>
+          <span className="badge-label">Regime</span> {(s.regime || '---').toUpperCase()}
+        </span>
+        {(() => {
+          const vr = s.vix_regime || 'RISK_ON';
+          const dot = vr === 'RISK_ON' ? '🟢' : vr === 'PRESERVATION' ? '🟡' : '🔴';
+          const lbl = vr === 'RISK_ON' ? 'RISK ON' : vr === 'PRESERVATION' ? 'PRESERVATION' : 'CRASH MODE';
+          const bcl = vr === 'RISK_ON' ? 'badge-green' : vr === 'PRESERVATION' ? 'badge-amber' : 'badge-red';
+          return <span className={`badge ${bcl}`} style={{fontWeight:700}}>{dot} {lbl}</span>;
+        })()}
+        <span className={`badge ${fngBadge}`}>
+          <span className="badge-label">F/G</span> {fng} {s.fng_label ? `(${s.fng_label})` : ''}
+        </span>
+        {s.contrarian_mode && <span className="badge badge-amber">CONTRARIAN</span>}
+        {s.caution_mode && <span className="badge badge-red">CAUTION</span>}
+      </div>
+      <div className="topbar-right">
+        <span className="topbar-clock">{timeStr}</span>
+        <span className="topbar-pos">{s.position_count || 0} POS</span>
+      </div>
     </div>
+    <div className="topbar" style={{borderTop:'1px solid var(--border)', padding:'4px 14px', fontSize:11, gap:14, justifyContent:'center'}}>
+      <span style={{color:'var(--text-dim)'}}>
+        Cash: <b style={{color:'var(--text)'}}>{fmt(s.cash)}</b>
+      </span>
+      <span style={{color:'var(--text-dim)'}}>|</span>
+      <span style={{color:'var(--text-dim)'}}>
+        Deployed: <b style={{color:'var(--blue)'}}>{fmt(s.deployed_capital || s.cost_basis || 0)}</b>
+      </span>
+      <span style={{color:'var(--text-dim)'}}>|</span>
+      <span style={{color:'var(--text-dim)'}}>
+        Unrealized: <b style={{color: (s.unrealized_pnl || 0) >= 0 ? 'var(--green)' : 'var(--red)'}}>{pnlFmt(s.unrealized_pnl || 0, 2)}</b>
+      </span>
+      <span style={{color:'var(--text-dim)'}}>|</span>
+      <span style={{color:'var(--text-dim)', fontSize:10}}>
+        Return % is on total equity (${(s.starting_capital || 25000).toLocaleString()} starting capital)
+      </span>
+    </div>
+    </>
   );
 }
 
-function EquityChart({charts}) {
-  const canvasRef = React.useRef(null);
-  const chartRef = React.useRef(null);
-  React.useEffect(() => {
-    if (!charts?.equity_curve?.length || !canvasRef.current) return;
+/* ===== EQUITY CURVE ===== */
+function EquityCurve({ charts, equityHistory }) {
+  const canvasRef = useRef(null);
+  const chartRef = useRef(null);
+  const [tf, setTf] = useState('all');
+  const [histData, setHistData] = useState({});
+
+  // Fetch equity-history for 1h and 24h
+  useEffect(() => {
+    if (tf !== '1h' && tf !== '24h') return;
+    let active = true;
+    const load = () => {
+      fetch(`${API}/api/equity-history?timeframe=${tf}`)
+        .then(r => r.json())
+        .then(d => { if (active) setHistData(prev => ({...prev, [tf]: d})); })
+        .catch(() => {});
+    };
+    load();
+    const iv = setInterval(load, REFRESH_MS);
+    return () => { active = false; clearInterval(iv); };
+  }, [tf]);
+
+  useEffect(() => {
+    if (!canvasRef.current) return;
     if (chartRef.current) chartRef.current.destroy();
+
+    let points = [];
+    let labels = [];
+
+    if (tf === '1h' || tf === '24h') {
+      const hd = histData[tf];
+      if (!hd?.points?.length) return;
+      points = hd.points.map(p => p.equity);
+      labels = hd.points.map(p => {
+        const d = new Date(p.timestamp);
+        return tf === '1h' ? d.toLocaleTimeString('en-US', {hour:'2-digit',minute:'2-digit',hour12:false}) : d.toLocaleTimeString('en-US', {hour:'2-digit',minute:'2-digit',hour12:false});
+      });
+    } else {
+      const curve = charts?.equity_curve;
+      if (!curve?.length) return;
+      const filtered = filterEquityCurve(curve, tf);
+      if (!filtered.length) return;
+      points = filtered.map(d => d.equity);
+      labels = filtered.map(d => (d.date || '').slice(5));
+    }
+
+    if (!points.length) return;
+
     const ctx = canvasRef.current.getContext('2d');
+    const gradient = ctx.createLinearGradient(0, 0, 0, canvasRef.current.parentElement.clientHeight);
+    gradient.addColorStop(0, 'rgba(0,212,255,0.18)');
+    gradient.addColorStop(1, 'rgba(0,212,255,0.0)');
+
+    const opts = chartDefaults();
+    opts.interaction = { intersect: false, mode: 'index' };
+    opts.plugins.tooltip.callbacks = { label: c => '$' + c.parsed.y.toLocaleString(undefined, {minimumFractionDigits:2,maximumFractionDigits:2}) };
+    opts.scales.y.ticks.callback = v => '$' + v.toLocaleString();
+    opts.scales.x.ticks.maxTicksLimit = 8;
+
     chartRef.current = new Chart(ctx, {
       type: 'line',
       data: {
-        labels: charts.equity_curve.map(d => d.date?.slice(5) || ''),
+        labels,
         datasets: [{
-          label: 'Equity',
-          data: charts.equity_curve.map(d => d.equity),
-          borderColor: '#58a6ff', backgroundColor: 'rgba(88,166,255,0.1)',
-          fill: true, tension: 0.3, pointRadius: 2,
+          data: points,
+          borderColor: '#00d4ff',
+          backgroundColor: gradient,
+          fill: true,
+          tension: 0.35,
+          pointRadius: points.length > 50 ? 0 : 2,
+          pointHoverRadius: 4,
+          borderWidth: 2,
         }]
       },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { display: false } },
-        scales: {
-          x: { ticks: { color: '#484f58', font: { size: 9 } }, grid: { color: '#161b22' } },
-          y: { ticks: { color: '#484f58', font: { size: 9 }, callback: v => '$'+v.toLocaleString() }, grid: { color: '#161b22' } }
-        }
-      }
+      options: opts
     });
-  }, [charts]);
+
+    return () => { if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; } };
+  }, [charts, tf, histData]);
+
+  const tfs = ['1h','24h','1w','1m','all'];
+  const tfLabels = { '1h':'1H', '24h':'24H', '1w':'1W', '1m':'1M', 'all':'ALL' };
+
   return (
-    <div className="chart-container">
-      <div className="panel-title">Equity Curve</div>
-      <canvas ref={canvasRef} height="170"></canvas>
+    <div className="panel" style={{flex:'6 1 0'}}>
+      <div className="panel-header">
+        <span className="panel-title">Equity Curve</span>
+        <div className="tf-pills">
+          {tfs.map(t => (
+            <button key={t} className={`tf-pill ${tf===t?'active':''}`} onClick={() => setTf(t)}>{tfLabels[t]}</button>
+          ))}
+        </div>
+      </div>
+      <div className="chart-wrap"><canvas ref={canvasRef} /></div>
     </div>
   );
 }
 
-function StrategyChart({charts}) {
-  const canvasRef = React.useRef(null);
-  const chartRef = React.useRef(null);
-  React.useEffect(() => {
-    if (!charts?.strategy_pnl?.length || !canvasRef.current) return;
-    if (chartRef.current) chartRef.current.destroy();
-    const colors = ['#58a6ff','#22c55e','#f59e0b','#a855f7','#ef4444','#06b6d4','#f97316'];
-    const ctx = canvasRef.current.getContext('2d');
-    chartRef.current = new Chart(ctx, {
-      type: 'doughnut',
-      data: {
-        labels: charts.strategy_pnl.map(s => s.strategy),
-        datasets: [{
-          data: charts.strategy_pnl.map(s => Math.abs(s.pnl)),
-          backgroundColor: colors,
-          borderColor: '#0d1117', borderWidth: 2,
-        }]
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        plugins: {
-          legend: { position: 'bottom', labels: { color: '#8b949e', font: { size: 9 }, boxWidth: 10 } }
-        }
-      }
-    });
-  }, [charts]);
+/* ===== OPEN POSITIONS ===== */
+function OpenPositions({ status, pnl }) {
+  const positions = status?.positions || [];
+  const openPnl = pnl?.open_positions || [];
+  const pnlMap = {};
+  openPnl.forEach(p => { pnlMap[p.market] = p; });
+
+  const maxAbsPnl = useMemo(() => {
+    let m = 1;
+    openPnl.forEach(p => { const a = Math.abs(p.unrealized_pnl || 0); if (a > m) m = a; });
+    return m;
+  }, [openPnl]);
+
   return (
-    <div className="chart-container">
-      <div className="panel-title">Strategy P&L</div>
-      <canvas ref={canvasRef} height="170"></canvas>
+    <div className="panel" style={{flex:'4 1 0'}}>
+      <div className="panel-header">
+        <span className="panel-title">Open Positions</span>
+        <span className="panel-subtitle">{positions.length} active</span>
+      </div>
+      <div className="panel-body">
+        {positions.length === 0 && <div className="loading-text">No open positions</div>}
+        {positions.map((p, i) => {
+          const pd = pnlMap[p.market] || {};
+          const uPnl = pd.unrealized_pnl || 0;
+          const pPct = pd.pnl_pct || 0;
+          const barPct = Math.min(Math.abs(uPnl) / maxAbsPnl * 50, 50);
+          const isGreen = uPnl >= 0;
+
+          return (
+            <div key={i} className="pos-item">
+              <div className="pos-top-row">
+                <span className="pos-market">{p.market}</span>
+                <span className={`pos-strat-tag ${getStratTag(p.strategy)}`}>{shortStrat(p.strategy)}</span>
+              </div>
+              <div className="pos-pnl-bar-track">
+                <div className="pos-pnl-bar-fill" style={{
+                  background: isGreen ? 'var(--green)' : 'var(--red)',
+                  width: barPct + '%',
+                  left: isGreen ? '50%' : (50 - barPct) + '%',
+                  opacity: 0.6 + Math.min(Math.abs(pPct) / 15, 0.4),
+                }} />
+              </div>
+              <div className="pos-bottom-row">
+                <span>Cost: {fmt(p.cost, 2)}</span>
+                <span className="pos-pnl-val" style={{color: pnlColor(uPnl)}}>
+                  {pnlFmt(uPnl, 2)} ({pct(pPct, 1)})
+                </span>
+              </div>
+              {p.echo && p.echo.mult !== undefined && (
+                <div style={{fontSize:9, color:'var(--text-dim)', marginTop:2}}
+                     title={p.echo.reason || ''}>
+                  <span style={{
+                    color: p.echo.mult >= 1.5 ? 'var(--green)' :
+                           p.echo.mult >= 1.0 ? 'var(--text-dim)' :
+                           p.echo.mult >= 0.75 ? 'var(--amber)' : 'var(--red)',
+                    fontWeight:600,
+                  }}>
+                    ECHO {p.echo.mult.toFixed(2)}x
+                  </span>
+                  <span style={{marginLeft:6}}>{(p.echo.reason || '').slice(0, 80)}</span>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
 
-function FrequencyChart({charts}) {
-  const canvasRef = React.useRef(null);
-  const chartRef = React.useRef(null);
-  React.useEffect(() => {
-    if (!charts?.trade_freq?.length || !canvasRef.current) return;
+/* ===== PNL SUMMARY ===== */
+function PnlSummary({ pnl, status, tier }) {
+  const loaded = status && typeof status.realized_pnl === 'number';
+  const todayR = pnl?.today_realized ?? 0;
+  // Unrealized is Alpaca API total — cannot be tier-filtered (Alpaca has no
+  // tier knowledge). Always labeled "(All Tiers)" regardless of selection.
+  const unrealized = loaded ? (status.unrealized_pnl ?? 0) : 0;
+  // Realized (Adj): for PAPER, Phase 2 adjusted (closed_at >= adj_start_date).
+  // For non-PAPER tiers, backend returns the full tier total in this field
+  // so labels stay accurate; there's no separate "adj" concept for archives.
+  const adjRealized = loaded ? (status.adjusted_realized_pnl ?? 0) : null;
+  const retPct = loaded ? status.adjusted_return_pct : null;  // null for tiers w/o baseline
+  const selTier = (status?.selected_tier || tier || 'PAPER');
+  const tierSuffix = ` (${selTier})`;
+  const adjLabel = selTier === 'PAPER' ? 'Realized (Adj)' : 'Realized';  // no "Adj" for archive tiers
+
+  return (
+    <div className="panel" style={{flex:'0 0 auto'}}>
+      <div className="hero-row">
+        <div className="hero-item">
+          <div className="hero-label">Today Realized{tierSuffix}</div>
+          <div className="hero-value" style={{color: pnlColor(todayR), textShadow: todayR > 0 ? 'var(--glow-green)' : todayR < 0 ? 'var(--glow-red)' : 'none'}}>
+            {pnlFmt(todayR, 2)}
+          </div>
+        </div>
+        <div className="hero-item" title="Alpaca API does not expose position tier; this is total live unrealized across all platform positions.">
+          <div className="hero-label">Unrealized (All Tiers)</div>
+          <div className="hero-value" style={{color: pnlColor(unrealized), textShadow: unrealized > 0 ? 'var(--glow-green)' : unrealized < 0 ? 'var(--glow-red)' : 'none'}}>
+            {pnlFmt(unrealized, 2)}
+          </div>
+        </div>
+        <div className="hero-item">
+          <div className="hero-label">{adjLabel}{tierSuffix}</div>
+          <div className="hero-value" style={{color: adjRealized == null ? 'var(--text-dim)' : pnlColor(adjRealized), textShadow: adjRealized > 0 ? 'var(--glow-green)' : adjRealized < 0 ? 'var(--glow-red)' : 'none'}}>
+            {adjRealized == null ? '---' : pnlFmt(adjRealized, 2)}
+          </div>
+        </div>
+        <div className="hero-item" title={selTier === 'TRANSITIONAL' ? 'TRANSITIONAL has no dedicated bankroll baseline — Return % not defined.' : undefined}>
+          <div className="hero-label">Return (Realized){tierSuffix}</div>
+          <div className="hero-value" style={{color: retPct == null ? 'var(--text-dim)' : pnlColor(retPct), textShadow: retPct > 0 ? 'var(--glow-green)' : retPct < 0 ? 'var(--glow-red)' : 'none'}}>
+            {retPct == null ? 'N/A' : pct(retPct)}
+          </div>
+        </div>
+      </div>
+      {loaded && (status.baseline != null) && (
+        <div style={{fontSize:9, color:'var(--text-muted)', marginTop:4, textAlign:'right'}}>
+          baseline for {selTier}: {fmt(status.baseline, 0)} · trades: {status.total_trades ?? 0} · open: {status.tier_open_positions ?? 0}
+        </div>
+      )}
+      {loaded && (typeof status.sim_pnl_30d === 'number' || typeof status.real_pnl_30d === 'number') && (
+        <div style={{fontSize:10, marginTop:6, padding:'4px 6px', borderTop:'1px solid var(--border)', display:'flex', justifyContent:'space-between', gap:8, flexWrap:'wrap'}}>
+          <span style={{color:'var(--text-dim)'}} title="Broker-fillable trades only (platform != 'Simulated', deleted_sim = 0). Headline P&L above already excludes sim.">
+            <b style={{color:'var(--text)'}}>Real (PAPER)</b>:&nbsp;
+            <span style={{color: pnlColor(status.real_pnl_30d ?? 0)}}>{pnlFmt(status.real_pnl_30d ?? 0, 2)}</span>
+            &nbsp;<span style={{fontSize:9}}>30d</span>
+            &nbsp;·&nbsp;<span style={{color: pnlColor(status.real_pnl_all ?? 0)}}>{pnlFmt(status.real_pnl_all ?? 0, 2)}</span>
+            &nbsp;<span style={{fontSize:9}}>all</span>
+            &nbsp;<span style={{fontSize:9, color:'var(--text-muted)'}}>(n={status.real_trades_30d ?? 0})</span>
+          </span>
+          <span style={{color:'var(--text-dim)'}} title="Synthetic research probes (vrp_income CSP sim). NOT realized return. Excluded from headline P&L.">
+            <b style={{color:'var(--amber)'}}>Sim (probe)</b>:&nbsp;
+            <span style={{color: pnlColor(status.sim_pnl_30d ?? 0)}}>{pnlFmt(status.sim_pnl_30d ?? 0, 2)}</span>
+            &nbsp;<span style={{fontSize:9}}>30d</span>
+            &nbsp;·&nbsp;<span style={{color: pnlColor(status.sim_pnl_all ?? 0)}}>{pnlFmt(status.sim_pnl_all ?? 0, 2)}</span>
+            &nbsp;<span style={{fontSize:9}}>all</span>
+            &nbsp;<span style={{fontSize:9, color:'var(--text-muted)'}}>(n={status.sim_trades_30d ?? 0})</span>
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ===== DAILY PNL BAR CHART ===== */
+function DailyPnlChart({ pnl }) {
+  const canvasRef = useRef(null);
+  const chartRef = useRef(null);
+  const [tf, setTf] = useState('all');
+
+  useEffect(() => {
+    if (!pnl?.daily_pnls || !canvasRef.current) return;
     if (chartRef.current) chartRef.current.destroy();
-    const ctx = canvasRef.current.getContext('2d');
-    chartRef.current = new Chart(ctx, {
+
+    const filtered = filterDailyPnls(pnl.daily_pnls, tf);
+    const allDates = Object.keys(filtered).sort();
+    const dates = tf === 'all' ? allDates.slice(-30) : allDates;
+    const values = dates.map(d => filtered[d] || 0);
+    const colors = values.map(v => v >= 0 ? 'rgba(0,255,136,0.7)' : 'rgba(255,51,102,0.7)');
+    const borderColors = values.map(v => v >= 0 ? '#00ff88' : '#ff3366');
+
+    const opts = chartDefaults();
+    opts.plugins.tooltip.callbacks = { label: c => (c.parsed.y >= 0 ? '+$' : '-$') + Math.abs(c.parsed.y).toFixed(2) };
+    opts.scales.y.ticks.callback = v => '$' + v;
+    opts.scales.x.ticks.maxRotation = 45;
+    opts.scales.x.ticks.maxTicksLimit = 15;
+
+    chartRef.current = new Chart(canvasRef.current, {
       type: 'bar',
       data: {
-        labels: charts.trade_freq.map(d => d.date?.slice(5) || ''),
+        labels: dates.map(d => d.slice(5)),
         datasets: [{
-          label: 'Trades',
-          data: charts.trade_freq.map(d => d.count),
-          backgroundColor: 'rgba(34,197,94,0.6)', borderColor: '#22c55e', borderWidth: 1,
+          data: values,
+          backgroundColor: colors,
+          borderColor: borderColors,
+          borderWidth: 1,
+          borderRadius: 3,
+        }]
+      },
+      options: opts,
+    });
+
+    return () => { if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; } };
+  }, [pnl, tf]);
+
+  const tfs = [
+    { key: 'today', label: 'TODAY' },
+    { key: 'week', label: 'WEEK' },
+    { key: 'month', label: 'MONTH' },
+    { key: 'all', label: 'ALL TIME' },
+  ];
+
+  return (
+    <div className="panel" style={{flex:'4 1 0'}}>
+      <div className="panel-header">
+        <span className="panel-title">Daily P/L</span>
+        <div className="tf-pills">
+          {tfs.map(t => (
+            <button key={t.key} className={`tf-pill ${tf===t.key?'active':''}`} onClick={() => setTf(t.key)}>{t.label}</button>
+          ))}
+        </div>
+      </div>
+      <div className="chart-wrap"><canvas ref={canvasRef} /></div>
+    </div>
+  );
+}
+
+/* ===== STRATEGY ATTRIBUTION ===== */
+function StrategyAttribution({ pnl }) {
+  if (!pnl?.strategy_stats) return <div className="panel" style={{flex:'3 1 0'}}><div className="panel-header"><span className="panel-title">Strategy Attribution</span></div><div className="loading-text">Loading...</div></div>;
+
+  const stats = pnl.strategy_stats;
+  const sorted = Object.entries(stats).sort((a, b) => Math.abs(b[1].total_pnl || 0) - Math.abs(a[1].total_pnl || 0));
+  const maxAbs = sorted.reduce((m, [, d]) => Math.max(m, Math.abs(d.total_pnl || 0)), 1);
+
+  return (
+    <div className="panel" style={{flex:'3 1 0'}}>
+      <div className="panel-header">
+        <span className="panel-title">Strategy Attribution</span>
+        <span className="panel-subtitle">{sorted.length} strategies</span>
+      </div>
+      <div className="panel-body">
+        {sorted.map(([name, d]) => {
+          const pnlVal = d.total_pnl || 0;
+          const barPct = Math.abs(pnlVal) / maxAbs * 100;
+          const isGreen = pnlVal >= 0;
+          const wr = d.win_rate || 0;
+          return (
+            <div key={name} className="strat-bar-item">
+              <div className="strat-bar-header">
+                <span className="strat-bar-name">{name.replace(/_/g, ' ')}</span>
+                <span className="strat-bar-wr" style={{color: wr >= 55 ? 'var(--green)' : wr >= 45 ? 'var(--amber)' : 'var(--red)'}}>{wr.toFixed(0)}% WR</span>
+              </div>
+              <div className="strat-bar-track">
+                {isGreen ? (
+                  <div className="strat-bar-fill" style={{left:'50%', width: barPct/2 + '%', background:'var(--green)', opacity:0.7}} />
+                ) : (
+                  <div className="strat-bar-fill" style={{right:'50%', width: barPct/2 + '%', background:'var(--red)', opacity:0.7}} />
+                )}
+              </div>
+              <div className="strat-bar-value" style={{color: pnlColor(pnlVal)}}>{pnlFmt(pnlVal, 2)} | {d.count || 0} trades</div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ===== LAUNCH CRITERIA ===== */
+function LaunchCriteria({ charts }) {
+  const lc = charts?.launch_criteria;
+  if (!lc) return null;
+
+  const items = [
+    { label: 'Clean Trades', val: lc.clean_trades, target: lc.clean_trades_target },
+    { label: 'Win Rate', val: lc.win_rate, target: lc.win_rate_target },
+    { label: 'Sharpe Ratio', val: lc.sharpe, target: lc.sharpe_target },
+    { label: 'Consec Days', val: lc.consec_days, target: lc.consec_days_target },
+  ];
+
+  return (
+    <div className="panel" style={{flex:'0 0 auto'}}>
+      <div className="panel-header">
+        <span className="panel-title">Launch Criteria</span>
+      </div>
+      <div className="panel-body">
+        {items.map((it, i) => {
+          const pctVal = it.target > 0 ? Math.min((it.val || 0) / it.target * 100, 100) : 0;
+          const color = pctVal >= 80 ? 'var(--green)' : pctVal >= 50 ? 'var(--amber)' : 'var(--red)';
+          return (
+            <div key={i} className="launch-item">
+              <div className="launch-header">
+                <span className="launch-label">{it.label}</span>
+                <span className="launch-vals">{it.val != null ? (typeof it.val === 'number' ? it.val.toFixed(1) : it.val) : '---'} / {it.target || '---'}</span>
+              </div>
+              <div className="launch-track">
+                <div className="launch-fill" style={{width: pctVal + '%', background: color}} />
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ===== ORACLE SIGNALS ===== */
+function OracleSignals({ oracle }) {
+  if (!oracle) return <div className="panel" style={{flex:'4 1 0'}}><div className="panel-header"><span className="panel-title">Oracle Signals</span></div><div className="loading-text">Loading...</div></div>;
+
+  const signals = oracle.signals || [];
+  const geo = oracle.geo_state;
+
+  return (
+    <div className="panel" style={{flex:'4 1 0'}}>
+      <div className="panel-header">
+        <span className="panel-title">Oracle Signals</span>
+        <span className="panel-subtitle">{signals.filter(s => s.active).length} active</span>
+      </div>
+      {geo?.active && (
+        <div className="geo-alert">GEO ALERT: {geo.theme || 'Active geopolitical risk detected'}</div>
+      )}
+      <div className="panel-body">
+        {signals.length === 0 && <div className="loading-text">No signals</div>}
+        {signals.map((sig, i) => {
+          const price = sig.yes_price || 0;
+          const thresh = sig.threshold || 1;
+          const pctToThresh = sig.pct_to_threshold || 0;
+          const barPct = Math.min(price / Math.max(thresh, 0.01) * 100, 100);
+          const nearThresh = barPct >= 90;
+          const barColor = sig.active ? (nearThresh ? 'var(--green)' : 'var(--blue)') : 'var(--text-muted)';
+
+          return (
+            <div key={i} className="signal-item">
+              <div style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+                <span className="signal-name">{sig.name}</span>
+                {sig.active ? <span style={{fontSize:8,color:'var(--green)',fontWeight:700}}>ACTIVE</span> : <span style={{fontSize:8,color:'var(--text-muted)'}}>INACTIVE</span>}
+              </div>
+              {(sig.long || sig.short) && (
+                <div className="signal-legs">
+                  {sig.long && <span>L: {sig.long}</span>}
+                  {sig.long && sig.short && <span> | </span>}
+                  {sig.short && <span>S: {sig.short}</span>}
+                </div>
+              )}
+              <div className="signal-bar-track">
+                <div className={`signal-bar-fill ${nearThresh ? 'near-threshold' : ''}`}
+                  style={{width: barPct + '%', background: barColor}} />
+              </div>
+              <div className="signal-meta">
+                <span>Price: {(price * 100).toFixed(0)}c</span>
+                <span>Thresh: {(thresh * 100).toFixed(0)}c</span>
+                <span style={{color: nearThresh ? 'var(--green)' : 'inherit'}}>{pctToThresh.toFixed(1)}% away</span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ===== INTELLIGENCE FEED ===== */
+function IntelFeed({ intel }) {
+  const events = intel?.events || [];
+
+  function msgClass(msg) {
+    if (!msg) return 'intel-msg';
+    const l = msg.toLowerCase();
+    if (l.includes('8-k') || l.includes('black swan')) return 'intel-alert';
+    if (l.includes('trade') || l.includes('bought') || l.includes('sold') || l.includes('executed') || l.includes('opened') || l.includes('closed')) return 'intel-trade';
+    if (l.includes('alert') || l.includes('warn') || l.includes('caution') || l.includes('ripple')) return 'intel-alert';
+    if (l.includes('error') || l.includes('fail')) return 'intel-error';
+    return 'intel-msg';
+  }
+
+  return (
+    <div className="panel" style={{flex:'3.5 1 0'}}>
+      <div className="panel-header">
+        <span className="panel-title">Intelligence Feed</span>
+        <span className="panel-subtitle">{events.length} events</span>
+      </div>
+      <div className="panel-body">
+        {events.length === 0 && <div className="loading-text">No intelligence data</div>}
+        {events.map((e, i) => {
+          const ts = e.timestamp ? new Date(e.timestamp).toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit', hour12:false}) : '';
+          return (
+            <div key={i} className="intel-item">
+              <span className="intel-time">{ts}</span>
+              <span className="intel-agent">{e.agent || '---'}</span>
+              <span className={msgClass(e.message)}>{e.message || ''}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ===== WIN RATE GAUGE ===== */
+function WinRateGauge({ pnl }) {
+  const canvasRef = useRef(null);
+  const chartRef = useRef(null);
+  const wr = pnl?.all_time_win_rate || 0;
+  const wins = pnl?.total_wins || 0;
+  const total = pnl?.total_trades || 0;
+  const losses = total - wins;
+  const streak = pnl?.streak || 0;
+
+  useEffect(() => {
+    if (!canvasRef.current) return;
+    if (chartRef.current) chartRef.current.destroy();
+
+    chartRef.current = new Chart(canvasRef.current, {
+      type: 'doughnut',
+      data: {
+        labels: ['Wins', 'Losses'],
+        datasets: [{
+          data: [wins || 1, losses || 1],
+          backgroundColor: ['rgba(0,255,136,0.7)', 'rgba(255,51,102,0.4)'],
+          borderColor: ['#00ff88', '#ff3366'],
+          borderWidth: 2,
+          cutout: '75%',
         }]
       },
       options: {
-        responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { display: false } },
-        scales: {
-          x: { ticks: { color: '#484f58', font: { size: 9 } }, grid: { display: false } },
-          y: { ticks: { color: '#484f58', font: { size: 9 }, stepSize: 1 }, grid: { color: '#161b22' } }
-        }
+        responsive: true,
+        maintainAspectRatio: true,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            backgroundColor: 'rgba(13,17,30,0.95)',
+            titleColor: '#e2e8f0',
+            bodyColor: '#e2e8f0',
+            bodyFont: { family: 'Inter, sans-serif', size: 11 },
+          }
+        },
       }
     });
-  }, [charts]);
-  return (
-    <div className="chart-container">
-      <div className="panel-title">Trade Frequency</div>
-      <canvas ref={canvasRef} height="170"></canvas>
-    </div>
-  );
-}
 
-function LaunchCriteria({charts}) {
-  const lc = charts?.launch_criteria || {};
-  const criteria = [
-    { label: 'Clean Trades', value: lc.clean_trades||0, target: lc.clean_trades_target||100, unit: '' },
-    { label: 'Win Rate', value: lc.win_rate||0, target: lc.win_rate_target||54, unit: '%' },
-    { label: 'Sharpe Ratio', value: lc.sharpe||0, target: lc.sharpe_target||1.5, unit: '' },
-    { label: 'Consec Days', value: lc.consec_days||0, target: lc.consec_days_target||10, unit: '' },
-  ];
+    return () => { if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; } };
+  }, [pnl]);
+
+  const wrColor = wr >= 55 ? 'var(--green)' : wr >= 45 ? 'var(--amber)' : 'var(--red)';
+
   return (
-    <div className="launch-panel">
-      <div className="panel-title">Launch Criteria Progress</div>
-      {criteria.map((c, i) => {
-        const pct = Math.min((c.value / c.target) * 100, 100);
-        const cls = pct >= 80 ? 'good' : pct >= 50 ? 'warn' : 'bad';
-        return (
-          <div key={i} className="criteria-row">
-            <span className="criteria-label" style={{width:90}}>{c.label}</span>
-            <div className="criteria-bar"><div className={`criteria-fill ${cls}`} style={{width:`${pct}%`}}/></div>
-            <span className="criteria-value" style={{width:70,textAlign:'right'}}>{c.value}{c.unit} / {c.target}{c.unit}</span>
+    <div className="panel" style={{flex:'2.5 1 0'}}>
+      <div className="panel-header">
+        <span className="panel-title">Win Rate</span>
+      </div>
+      <div className="gauge-wrap">
+        <div className="gauge-canvas-wrap">
+          <canvas ref={canvasRef} />
+          <div className="gauge-center">
+            <div className="gauge-pct" style={{color: wrColor}}>{wr.toFixed(1)}%</div>
           </div>
-        );
-      })}
-    </div>
-  );
-}
-
-function Positions({status}) {
-  if (!status?.positions) return <div className="panel"><div className="panel-title">Positions</div><div className="loading">Loading...</div></div>;
-  return (
-    <div className="panel">
-      <div className="panel-title">Open Positions ({status.positions.length})</div>
-      {status.positions.map((p, i) => (
-        <div key={i} className="pos-row">
-          <span className="pos-name">{p.market}{stratTag(p.strategy)}</span>
-          <span className="pos-cost">{fmt(p.cost)}</span>
         </div>
-      ))}
-      {status.positions.length === 0 && <div style={{color:'#22c55e',textAlign:'center',padding:20}}>Clean slate — Phase 2 ready</div>}
-    </div>
-  );
-}
-
-function OracleSignals({oracle}) {
-  if (!oracle?.signals) return <div className="panel"><div className="panel-title">Oracle Signals</div><div className="loading">Loading...</div></div>;
-  const geo = oracle.geo_state || {};
-  return (
-    <div className="panel">
-      <div className="panel-title">Oracle Signals {geo.active && <span style={{color:'#ef4444'}}> GEO: {geo.theme}</span>}</div>
-      {oracle.signals.map((s, i) => {
-        const pct = Math.min(s.pct_to_threshold, 100);
-        const cls = pct >= 90 ? 'hot' : pct >= 60 ? 'warm' : 'cool';
-        return (
-          <div key={i} className="signal-row">
-            <div className="signal-name">
-              <span>{s.name} {s.inverse && '\u2193'} {s.active && '\uD83D\uDD34'} {s.inverse && s.geo_ok === false && '\u26A0\uFE0Fgeo'}</span>
-              <span>{s.long}/{s.short} — ${s.yes_price.toFixed(2)} / {s.inverse ? '<' : ''}{s.threshold.toFixed(2)}</span>
-            </div>
-            <div className="signal-bar-bg"><div className={`signal-bar ${cls}`} style={{width: `${pct}%`}} /></div>
-          </div>
-        );
-      })}
-      {oracle.signals.length === 0 && <div style={{color:'#484f58'}}>No signals</div>}
-    </div>
-  );
-}
-
-function IntelFeed({intel}) {
-  if (!intel?.events) return <div className="panel"><div className="panel-title">Intelligence Feed</div><div className="loading">Loading...</div></div>;
-  return (
-    <div className="panel">
-      <div className="panel-title">Intelligence Feed</div>
-      {intel.events.slice(0,8).map((e, i) => (
-        <div key={i} className="event-row">
-          <span className="event-time">{e.timestamp?.slice(11,16)}</span>{' '}
-          <span className="event-agent">[{e.agent}]</span>{' '}
-          <span>{e.message}</span>
+        <div className="gauge-sub">{wins}W / {losses}L of {total} trades</div>
+        <div className="gauge-streak" style={{color: streak > 0 ? 'var(--green)' : streak < 0 ? 'var(--red)' : 'var(--text-dim)'}}>
+          Streak: {streak > 0 ? '+' : ''}{streak} day{Math.abs(streak) !== 1 ? 's' : ''}
         </div>
-      ))}
+      </div>
     </div>
   );
 }
 
-function Headlines({oracle}) {
-  if (!oracle?.headlines) return null;
+/* ===== HEADLINE TICKER ===== */
+function HeadlineTicker({ oracle }) {
+  if (!oracle?.headlines) return <div className="ticker" />;
   const all = [];
   Object.entries(oracle.headlines).forEach(([theme, hls]) => {
-    hls.forEach(h => all.push({theme, text: h}));
+    (hls || []).forEach(h => all.push({ theme, text: h }));
   });
-  if (all.length === 0) return null;
+  if (all.length === 0) return <div className="ticker" />;
   const doubled = [...all, ...all];
+
   return (
-    <div className="bottom-bar">
-      <div className="headline-scroll">
+    <div className="ticker">
+      <div className="ticker-track">
         {doubled.map((h, i) => (
-          <span key={i} className="headline"><span className="theme">[{h.theme}]</span> {h.text.slice(0,80)}</span>
+          <span key={i} className="ticker-item">
+            <span className="ticker-theme">[{h.theme}]</span> {h.text.slice(0, 120)}
+          </span>
         ))}
       </div>
     </div>
   );
 }
 
-function MobileNav() {
+/* ===== MOBILE NAV ===== */
+function MobileNav({ tab, setTab }) {
+  const tabs = [
+    { key: 'portfolio', label: 'Portfolio', icon: '$' },
+    { key: 'signals', label: 'Signals', icon: '>' },
+    { key: 'intel', label: 'Intel', icon: '!' },
+    { key: 'stats', label: 'Stats', icon: '#' },
+  ];
   return (
     <div className="mobile-nav">
       <div className="mobile-nav-inner">
-        <a href="#top"><span>$</span>Portfolio</a>
-        <a href="#charts"><span>~</span>Charts</a>
-        <a href="#signals"><span>!</span>Signals</a>
-        <a href="/api/status" target="_blank"><span>{'{}'}</span>API</a>
+        {tabs.map(t => (
+          <button key={t.key} className={`mobile-nav-btn ${tab===t.key?'active':''}`} onClick={() => setTab(t.key)}>
+            <span>{t.icon}</span>{t.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ===== CFO ALLOCATION DONUT ===== */
+function CfoAllocation() {
+  const [cfo, setCfo] = useState(null);
+  useEffect(() => {
+    const load = () => {
+      fetch(`${API}/api/status`)
+        .then(r => r.json())
+        .then(d => {
+          // CFO data may be embedded in status or fetched separately
+          // For now use strategy_stats as a proxy if no CFO endpoint
+          if (d.cfo_allocation) setCfo(d.cfo_allocation);
+        })
+        .catch(() => {});
+    };
+    load();
+    const iv = setInterval(load, 30000);
+    return () => clearInterval(iv);
+  }, []);
+
+  const canvasRef = useRef(null);
+  const chartRef = useRef(null);
+
+  useEffect(() => {
+    if (!canvasRef.current) return;
+    if (chartRef.current) chartRef.current.destroy();
+
+    const allocs = cfo?.strategy_allocations || {
+      pairs: 0.25, crypto: 0.15, oracle_trade: 0.10,
+      crash_hedge_put: 0.15, pead: 0.10, prediction: 0.05,
+      sympathy_lag: 0.05, gamma_pin: 0.05, cash: 0.10,
+    };
+
+    const labels = Object.keys(allocs).map(k => k.replace(/_/g, ' '));
+    const data = Object.values(allocs).map(v => (v * 100).toFixed(1));
+    const colors = Object.keys(allocs).map(k => {
+      const m = {pairs:'#00d4ff', crypto:'#ffd700', oracle_trade:'#3b82f6',
+        crash_hedge_put:'#ff3366', prediction:'#a855f7', pead:'#22c55e',
+        sympathy_lag:'#06b6d4', gamma_pin:'#f59e0b', liquidity_vacuum:'#8b5cf6',
+        funding_arb:'#14b8a6', cash:'#4b5563', cash_reserve:'#4b5563'};
+      return m[k] || '#6b7280';
+    });
+
+    chartRef.current = new Chart(canvasRef.current, {
+      type: 'doughnut',
+      data: { labels, datasets: [{ data, backgroundColor: colors, borderWidth: 0 }] },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        cutout: '65%',
+        plugins: {
+          legend: { display: false },
+          tooltip: { callbacks: { label: c => c.label + ': ' + c.parsed + '%' } },
+        },
+      },
+    });
+    return () => { if (chartRef.current) chartRef.current.destroy(); };
+  }, [cfo]);
+
+  const regime = cfo?.regime || 'normal';
+  const regimeColor = regime === 'risk_off' ? 'var(--red)' : regime === 'elevated' ? 'var(--amber)' : 'var(--green)';
+
+  return (
+    <div className="panel" style={{flex:'2 1 0'}}>
+      <div className="panel-header">
+        <span className="panel-title">CFO Allocation</span>
+        <span className="panel-subtitle" style={{color: regimeColor}}>{(regime || 'init...').toUpperCase()}</span>
+      </div>
+      <div style={{position:'relative', height:130, display:'flex', justifyContent:'center'}}>
+        <canvas ref={canvasRef} style={{maxHeight:130}} />
+      </div>
+      {cfo?.recommended_actions && cfo.recommended_actions.length > 0 && (
+        <div style={{fontSize:9, color:'var(--text-dim)', marginTop:6}}>
+          {cfo.recommended_actions.slice(0,2).map((a,i) => <div key={i}>→ {a.slice(0,50)}</div>)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+/* ===== ALPHA STRATEGY STATUS TABLE ===== */
+/* ===== FACTOR EXPOSURE — beta/sector/L-S/correlation ===== */
+function FactorExposure() {
+  const [exp, setExp] = useState(null);
+  useEffect(() => {
+    const load = () => fetch(`${API}/api/exposure`).then(r=>r.json())
+      .then(d => setExp(d)).catch(() => {});
+    load();
+    const iv = setInterval(load, 60000);
+    return () => clearInterval(iv);
+  }, []);
+
+  if (!exp || exp.note) {
+    return (
+      <div className="panel" style={{flex:'0 0 auto'}}>
+        <div className="panel-header"><span className="panel-title">Factor Exposure</span></div>
+        <div style={{fontSize:10, color:'var(--text-dim)'}}>
+          {exp?.note || 'loading…'}
+        </div>
+      </div>
+    );
+  }
+
+  const beta = exp.beta_to_spy ?? 0;
+  const betaColor = Math.abs(beta) > 0.5 ? 'var(--red)' :
+                    Math.abs(beta) > 0.3 ? 'var(--amber)' : 'var(--green)';
+  const lsRatio = exp.long_short_ratio;
+  const sectors = exp.sector_pct || {};
+  const sorted = Object.entries(sectors).sort((a,b) => b[1] - a[1]);
+  const corr = exp.correlation_matrix || {};
+  const corrKeys = Object.keys(corr);
+
+  function corrColor(v) {
+    if (v === null || v === undefined) return 'var(--bg)';
+    const a = Math.abs(v);
+    if (v > 0) return `rgba(255, 51, 102, ${a*0.6+0.2})`;   // red-ish for positive
+    return `rgba(0, 212, 255, ${a*0.6+0.2})`;                // cyan for negative
+  }
+  function sectorColor(pct) {
+    return pct > 0.40 ? 'var(--red)' : pct > 0.30 ? 'var(--amber)' : 'var(--green)';
+  }
+
+  return (
+    <div className="panel" style={{flex:'0 0 auto'}}>
+      <div className="panel-header">
+        <span className="panel-title">Factor Exposure</span>
+        <span style={{fontSize:9, color:'var(--text-dim)'}}>
+          {exp.built_at ? new Date(exp.built_at).toLocaleTimeString() : ''}
+        </span>
+      </div>
+      {/* Top line: Beta gauge + L/S + $ totals */}
+      <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:8, fontSize:10, marginBottom:6}}>
+        <div>
+          <div style={{color:'var(--text-dim)'}}>β to SPY</div>
+          <div style={{fontSize:18, fontWeight:700, color: betaColor}}>{beta >= 0 ? '+' : ''}{beta.toFixed(3)}</div>
+        </div>
+        <div>
+          <div style={{color:'var(--text-dim)'}}>Long / Short</div>
+          <div style={{fontSize:13, fontWeight:700, color:'var(--text)'}}>
+            ${(exp.gross_long_usd||0).toLocaleString()} / ${(exp.gross_short_usd||0).toLocaleString()}
+          </div>
+          <div style={{fontSize:9, color:'var(--text-dim)'}}>
+            ratio {lsRatio ? lsRatio.toFixed(2) : '∞'} · net ${(exp.net_usd||0).toLocaleString()}
+          </div>
+        </div>
+      </div>
+
+      {/* Sector bars */}
+      <div style={{fontSize:10, marginBottom:6}}>
+        <div style={{color:'var(--text-dim)', marginBottom:3}}>Sector exposure</div>
+        {sorted.map(([s, pct]) => (
+          <div key={s} style={{display:'grid', gridTemplateColumns:'100px 1fr 40px', gap:4, marginBottom:1}}>
+            <span style={{color:'var(--text)', fontSize:9}}>{s}</span>
+            <div style={{background:'#222', height:8, borderRadius:2, overflow:'hidden'}}>
+              <div style={{width:`${Math.min(pct*100, 100)}%`, height:'100%', background: sectorColor(pct)}}></div>
+            </div>
+            <span style={{fontSize:9, textAlign:'right', color: sectorColor(pct)}}>{(pct*100).toFixed(1)}%</span>
+          </div>
+        ))}
+      </div>
+
+      {/* Correlation matrix */}
+      {corrKeys.length >= 2 && (
+        <div style={{fontSize:9, marginTop:6}}>
+          <div style={{color:'var(--text-dim)', marginBottom:3}}>Correlation (60d)</div>
+          <div style={{display:'grid',
+                       gridTemplateColumns:`50px repeat(${corrKeys.length}, 1fr)`,
+                       gap:1}}>
+            <span></span>
+            {corrKeys.map(k => <span key={k} style={{color:'var(--text-dim)', textAlign:'center', fontSize:8}}>{k}</span>)}
+            {corrKeys.map(row => (
+              <React.Fragment key={row}>
+                <span style={{color:'var(--text-dim)', fontSize:8}}>{row}</span>
+                {corrKeys.map(col => {
+                  const v = corr[row]?.[col];
+                  return (
+                    <span key={col} style={{
+                      background: corrColor(v),
+                      color: '#fff', textAlign:'center', fontSize:8,
+                      padding:'2px 0', borderRadius:1,
+                    }}>
+                      {v !== undefined && v !== null ? v.toFixed(2) : ''}
+                    </span>
+                  );
+                })}
+              </React.Fragment>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {exp.alerts && exp.alerts.length > 0 && (
+        <div style={{fontSize:9, color:'var(--red)', marginTop:6}}>
+          {exp.alerts.map((a,i) => <div key={i}>⚠️ {a}</div>)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+/* ===== STRATEGY HEALTH — backtest verdicts + live P&L per strategy ===== */
+function StrategyHealth({ status }) {
+  const ss = status?.strategy_status || {};
+  const order = [
+    'oracle_futures','pairs','sector_rotation','pead',
+    'crash_hedge','sympathy_lag','lottery_fade','vrp_income',
+  ];
+  const pretty = {
+    oracle_futures: 'Oracle Futures', pairs: 'Pairs',
+    sector_rotation: 'Sector Rotation', pead: 'PEAD',
+    crash_hedge: 'Crash Hedge', sympathy_lag: 'Sympathy Lag',
+    lottery_fade: 'Lottery Fade', vrp_income: 'VRP Income',
+  };
+  const icon = {
+    oracle_futures:'🛢️', pairs:'⚖️', sector_rotation:'🔄', pead:'📊',
+    crash_hedge:'🛡️', sympathy_lag:'⚡', lottery_fade:'🎰', vrp_income:'💎',
+  };
+  function dotColor(sh, stat) {
+    if (stat === 'DISABLED') return 'var(--red)';
+    if (sh === null || sh === undefined) return 'var(--text-dim)';
+    if (sh >= 0.5) return 'var(--green)';
+    if (sh >= 0) return 'var(--amber)';
+    return 'var(--red)';
+  }
+  const rows = order.map(k => {
+    const v = ss[k] || {};
+    const sh = v.sharpe;
+    const pnl7 = v.live_pnl_7d || 0;
+    const pnl30 = v.live_pnl_30d || 0;
+    const t7 = v.live_trades_7d || 0;
+    const t30 = v.live_trades_30d || 0;
+    const tAll = v.live_trades_all || 0;
+    const simPnl30 = v.sim_pnl_30d || 0;
+    const simT30 = v.sim_trades_30d || 0;
+    return (
+      <React.Fragment key={k}>
+        <span>
+          <span style={{color: dotColor(sh, v.status), fontSize:11}}>●</span>
+          &nbsp;<span style={{color:'var(--text)'}}>{icon[k]} {pretty[k]}</span>
+        </span>
+        <span style={{color:'var(--text-dim)', fontSize:9}}>{v.status || '--'}</span>
+        <span style={{textAlign:'right', color:'var(--text)'}}>{sh === null || sh === undefined ? '--' : sh.toFixed(2)}</span>
+        <span style={{textAlign:'right', color: pnl7 > 0 ? 'var(--green)' : pnl7 < 0 ? 'var(--red)' : 'var(--text-dim)'}}>
+          {t7 > 0 ? pnlFmt(pnl7, 0) : '--'}
+        </span>
+        <span style={{textAlign:'right', color: pnl30 > 0 ? 'var(--green)' : pnl30 < 0 ? 'var(--red)' : 'var(--text-dim)'}}>
+          {t30 > 0 ? pnlFmt(pnl30, 0) : '--'}
+        </span>
+        <span style={{textAlign:'right', color: simT30 > 0 ? 'var(--amber)' : 'var(--text-muted)', fontSize:9}}
+              title="30-day simulated P&L (vrp_income CSP probe etc.) — research only, NOT realized return">
+          {simT30 > 0 ? pnlFmt(simPnl30, 0) : '--'}
+        </span>
+        <span style={{textAlign:'right', color:'var(--text-dim)', fontSize:9}}>{tAll}</span>
+      </React.Fragment>
+    );
+  });
+  return (
+    <div className="panel" style={{flex:'0 0 auto'}}>
+      <div className="panel-header">
+        <span className="panel-title">Strategy Health</span>
+        <span style={{fontSize:9, color:'var(--text-dim)'}}>bt 2026-04-18</span>
+      </div>
+      <div style={{fontSize:10, marginBottom:4, color:'var(--text-dim)'}}>
+        🟢 Sharpe ≥ 0.5 &nbsp;·&nbsp; 🟡 0 ≤ Sharpe &lt; 0.5 &nbsp;·&nbsp; 🔴 neg or disabled
+      </div>
+      <div style={{fontSize:10}}>
+        <div style={{display:'grid',
+                     gridTemplateColumns:'auto 1fr 44px 56px 56px 50px 34px',
+                     gap:'4px 8px', color:'var(--text-dim)'}}>
+          <span style={{fontWeight:700}}>Strategy</span>
+          <span style={{fontWeight:700}}>Status</span>
+          <span style={{fontWeight:700, textAlign:'right'}}>Sharpe</span>
+          <span style={{fontWeight:700, textAlign:'right'}}>7d P&L</span>
+          <span style={{fontWeight:700, textAlign:'right'}}>30d P&L</span>
+          <span style={{fontWeight:700, textAlign:'right', color:'var(--amber)'}} title="Simulated 30-day P&L (research only)">Sim 30d</span>
+          <span style={{fontWeight:700, textAlign:'right'}}>n</span>
+          {rows}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+function AlphaStrategies({ pnl }) {
+  const strats = [
+    {key:'sympathy_lag', name:'Sympathy Lag', icon:'⚡'},
+    {key:'gamma_pin', name:'Gamma Pin', icon:'📌'},
+    {key:'pead', name:'PEAD', icon:'📊'},
+    {key:'liquidity_vacuum', name:'Vacuum Bids', icon:'🌊'},
+    {key:'pm_arbitrage', name:'PM Arbitrage', icon:'🔄'},
+    {key:'lottery_fade', name:'Lottery Fade', icon:'🎰'},
+    {key:'pm_momentum', name:'PM Momentum', icon:'🚀'},
+    {key:'sec_8k_hunter', name:'8-K Hunter', icon:'🚨'},
+    {key:'supply_chain_ripple', name:'Ripple Engine', icon:'🔗'},
+  ];
+
+  const stats = pnl?.strategy_stats || {};
+
+  return (
+    <div className="panel" style={{flex:'0 0 auto'}}>
+      <div className="panel-header">
+        <span className="panel-title">Alpha Strategies</span>
+      </div>
+      <div style={{fontSize:10}}>
+        <div style={{display:'grid', gridTemplateColumns:'auto 1fr 40px 50px', gap:'4px 8px', color:'var(--text-dim)'}}>
+          <span style={{fontWeight:700}}>Strategy</span><span></span><span>Trades</span><span>WR</span>
+          {strats.map(s => {
+            const d = stats[s.key] || {};
+            const trades = d.count || 0;
+            const wr = d.win_rate || 0;
+            const status = trades > 0 ? 'ACTIVE' : 'ARMED';
+            const statusColor = trades > 0 ? 'var(--green)' : 'var(--text-dim)';
+            return (
+              <React.Fragment key={s.key}>
+                <span style={{color:'var(--text)'}}>{s.icon} {s.name}</span>
+                <span style={{color:statusColor, fontSize:9, fontWeight:600}}>{status}</span>
+                <span style={{textAlign:'right', color:'var(--text)'}}>{trades}</span>
+                <span style={{textAlign:'right', color: wr >= 55 ? 'var(--green)' : wr > 0 ? 'var(--amber)' : 'var(--text-dim)'}}>{trades > 0 ? wr.toFixed(0)+'%' : '--'}</span>
+              </React.Fragment>
+            );
+          })}
+          <span style={{color:'var(--text)'}}>🧠 Echo Predictor</span>
+          <span style={{color:'var(--blue)', fontSize:9, fontWeight:600}}>ACTIVE</span>
+          <span style={{textAlign:'right', color:'var(--text)', fontSize:9}}>gate</span>
+          <span style={{textAlign:'right', color:'var(--text-dim)', fontSize:9}}>—</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+/* ===== DAILY STATS BAR ===== */
+function DailyStatsBar({ pnl }) {
+  const today = pnl?.today_stats || {};
+  const trades = today.trades_today || 0;
+  const best = today.best_trade || 0;
+  const worst = today.worst_trade || 0;
+  const avgHold = today.avg_hold_hours || 0;
+
+  return (
+    <div className="panel" style={{flex:'0 0 auto', padding:'6px 14px'}}>
+      <div style={{display:'flex', justifyContent:'space-around', fontSize:10, color:'var(--text-dim)'}}>
+        <span>Trades: <b style={{color:'var(--text)'}}>{trades}</b></span>
+        <span>Best: <b style={{color: best > 0 ? 'var(--green)' : 'var(--text)'}}>{pnlFmt(best,2)}</b></span>
+        <span>Worst: <b style={{color: worst < 0 ? 'var(--red)' : 'var(--text)'}}>{pnlFmt(worst,2)}</b></span>
+        <span>Avg Hold: <b style={{color:'var(--text)'}}>{avgHold > 0 ? avgHold.toFixed(1)+'h' : '--'}</b></span>
+      </div>
+    </div>
+  );
+}
+
+
+/* ===== APP ===== */
+/* ===== TIER SUMMARY CARD (DASH-B) ===== */
+function TierSummaryCard() {
+  const [summary, setSummary] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    const load = () => {
+      fetch(`${API}/api/tier_summary`, { cache: 'no-store' })
+        .then(r => r.json())
+        .then(d => { if (alive) setSummary(d); })
+        .catch(() => {});
+    };
+    load();
+    const iv = setInterval(load, 30000);
+    return () => { alive = false; clearInterval(iv); };
+  }, []);
+
+  if (!summary) {
+    return (
+      <div className="panel" style={{flex:'0 0 auto'}}>
+        <div className="panel-header"><span className="panel-title">Firm Tier Breakdown</span></div>
+        <div style={{fontSize:10, color:'var(--text-dim)'}}>Loading…</div>
+      </div>
+    );
+  }
+
+  const rows = [
+    { key: 'live', label: 'LIVE', data: summary.live, muted: true, accent: 'accent-live' },
+    { key: 'paper', label: 'PAPER', data: summary.paper, muted: false, accent: 'accent-paper' },
+    { key: 'shadow', label: 'SHADOW', data: summary.shadow, muted: false, accent: 'accent-shadow' },
+    { key: 'historical', label: 'HISTORICAL', data: summary.historical, muted: true, accent: 'accent-hist' },
+    { key: 'transitional', label: 'TRANSITIONAL', data: summary.transitional, muted: true, accent: 'accent-trans' },
+  ];
+
+  return (
+    <div className="panel" style={{flex:'0 0 auto'}}>
+      <div className="panel-header">
+        <span className="panel-title">Firm Tier Breakdown</span>
+        <span className="panel-subtitle">live → paper → shadow</span>
+      </div>
+      <div className="tier-summary">
+        {rows.map(r => {
+          const d = r.data || {};
+          return (
+            <div key={r.key} className={`tier-row ${r.accent} ${r.muted ? 'muted' : ''}`}>
+              <span className="tier-label" style={{color:
+                r.key === 'paper' ? 'var(--blue)' :
+                r.key === 'shadow' ? 'var(--purple)' :
+                r.key === 'live' ? 'var(--gold)' : 'var(--text-dim)'}}>
+                {r.label}
+              </span>
+              <span className="tier-val">
+                <span className="tier-val-label">Base→Cur </span>
+                <span className="tier-val-num">
+                  {d.baseline == null ? '—' : fmt(d.baseline, 0) + ' → '}{fmt(d.current, 0)}
+                </span>
+                {d.note && <div style={{fontSize:8, color:'var(--text-muted)', marginTop:2}}>{d.note}</div>}
+              </span>
+              <span className="tier-val">
+                <span className="tier-val-label">P&L </span>
+                <span className="tier-val-num" style={{color: pnlColor(d.realized_pnl || 0)}}>
+                  {pnlFmt(d.realized_pnl || 0, 2)}
+                </span>
+              </span>
+              <span className="tier-val">
+                <span className="tier-val-label">Open </span>
+                <span className="tier-val-num">{d.open_positions || 0}</span>
+              </span>
+              <span />
+              <span className="tier-status-chip">{d.status || ''}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ===== TIER TOGGLE (DASH-B) ===== */
+function TierToggle({ tier, setTier }) {
+  const options = ['LIVE', 'PAPER', 'HISTORICAL', 'TRANSITIONAL', 'SHADOW', 'ALL'];
+  return (
+    <div className="tier-toggle-row">
+      {options.map(t => {
+        const active = t === tier;
+        const shadowActive = active && t === 'SHADOW';
+        const title = t === 'TRANSITIONAL'
+          ? 'TRANSITIONAL = Apr 19–25 sprint period during which fixes were deployed but not frozen.'
+          : undefined;
+        return (
+          <button
+            key={t}
+            className={`tier-pill ${active ? 'active' : ''} ${shadowActive ? 'shadow-active' : ''}`}
+            title={title}
+            onClick={() => setTier(t)}>
+            {t}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ===== TIER CONTEXT BANNER (DASH-B) ===== */
+function TierContextBanner({ tier }) {
+  const copy = {
+    LIVE: 'LIVE — not yet deployed. First tranche ≤$10K after May 3 decision. Prerequisites listed in panel below.',
+    PAPER: 'PAPER — frozen code baseline for May 3 live-deploy decision. Real paper-broker execution on fixed code.',
+    HISTORICAL: 'HISTORICAL — archive tier. 272 trades from pre-Apr-19 tier migration. Read-only.',
+    TRANSITIONAL: 'TRANSITIONAL — Apr 19–25 sprint period during which fixes were deployed but not frozen. 19 trades. Read-only.',
+    SHADOW: 'SHADOW — permanent experimentation tier. 11 strategies, $100K paper bankroll. Lenient entry criteria; identical exits.',
+    ALL: 'ALL — cross-tier aggregate. Every tier summed. Use for firm-wide audit only; do not read live decisions from this view.',
+  };
+  const cls =
+    tier === 'SHADOW' ? 'tier-banner shadow' :
+    tier === 'LIVE' ? 'tier-banner' :
+    (tier === 'HISTORICAL' || tier === 'TRANSITIONAL') ? 'tier-banner archive' :
+    'tier-banner';
+  return <div className={cls}>{copy[tier] || ''}</div>;
+}
+
+/* ===== LIVE DEPLOYMENT PANEL (DASH-B-FIX) ===== */
+function LiveDeploymentPanel({ status }) {
+  const prereqs = status?.prerequisites || [];
+  const decisionDate = status?.first_decision_date || '2026-05-03';
+  const tranche = status?.expected_first_tranche_usd || 10000;
+  return (
+    <div className="panel" style={{flex:'0 0 auto', borderLeft:'3px solid var(--gold)'}}>
+      <div className="panel-header">
+        <span className="panel-title" style={{color:'var(--gold)'}}>LIVE — Not Yet Deployed</span>
+        <span className="panel-subtitle">first-tranche ≤ {fmt(tranche, 0)}</span>
+      </div>
+      <div style={{fontSize:11, color:'var(--text-dim)', marginBottom:8}}>
+        First live-capital decision: <b style={{color:'var(--text)'}}>{decisionDate}</b><br/>
+        Expected first tranche: <b style={{color:'var(--text)'}}>{fmt(tranche, 0)} max</b>
+      </div>
+      <div style={{fontSize:10, color:'var(--text-dim)', marginBottom:4, textTransform:'uppercase', letterSpacing:1}}>
+        Prerequisites
+      </div>
+      {prereqs.length === 0 && <div style={{fontSize:10, color:'var(--text-dim)'}}>Loading…</div>}
+      {prereqs.map((p, i) => (
+        <div key={i} style={{fontSize:11, padding:'2px 0', color: p.done ? 'var(--green)' : 'var(--text-dim)'}}>
+          <span style={{display:'inline-block', width:14}}>{p.done ? '✓' : '○'}</span>
+          {p.label}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ===== SHADOW PER-STRATEGY PANEL (DASH-B + SGS-A) ===== */
+function sgsColor(sgs) {
+  if (sgs == null) return 'var(--text-dim)';
+  if (sgs >= 75) return 'var(--green)';
+  if (sgs >= 55) return 'var(--gold)';
+  if (sgs >= 25) return 'var(--amber)';
+  return 'var(--red)';
+}
+function ShadowStrategyPanel() {
+  const [rows, setRows] = useState(null);
+  const [sgsMap, setSgsMap] = useState({});  // {strategy: {sgs, recommendation, action_ready}}
+  useEffect(() => {
+    let alive = true;
+    const load = () => {
+      fetch(`${API}/api/shadow_strategies`, { cache: 'no-store' })
+        .then(r => r.json())
+        .then(d => { if (alive) setRows(d?.strategies || []); })
+        .catch(() => {});
+      fetch(`${API}/api/sgs?tier=SHADOW`, { cache: 'no-store' })
+        .then(r => r.json())
+        .then(d => {
+          if (!alive) return;
+          const m = {};
+          (d?.scores || []).forEach(s => { m[s.strategy] = s; });
+          setSgsMap(m);
+        })
+        .catch(() => {});
+    };
+    load();
+    const iv = setInterval(load, 30000);
+    return () => { alive = false; clearInterval(iv); };
+  }, []);
+
+  return (
+    <div className="panel" style={{flex:'0 0 auto'}}>
+      <div className="panel-header">
+        <span className="panel-title" style={{color:'var(--purple)'}}>Shadow Strategies (per-strategy)</span>
+        <span className="panel-subtitle">$100K total across 11 strategies · SGS live</span>
+      </div>
+      <div className="panel-body">
+        {rows == null && <div style={{fontSize:10, color:'var(--text-dim)'}}>Loading…</div>}
+        {rows != null && rows.length === 0 && (
+          <div style={{fontSize:10, color:'var(--text-dim)'}}>
+            shadow_strategy_allocations table not initialized yet.
+          </div>
+        )}
+        {rows != null && rows.length > 0 && (
+          <table className="shadow-strat-table">
+            <thead>
+              <tr>
+                <th>Strategy</th><th>Alloc</th><th>Current</th>
+                <th>P&L</th><th>Trades</th><th>WR</th>
+                <th title="Strategy Grade Score (0-100) — evidence of edge">SGS</th>
+                <th>Rec</th><th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map(r => {
+                const sg = sgsMap[r.strategy];
+                const sgsVal = sg ? sg.sgs : null;
+                const gradReady = sg && sg.recommendation === 'GRADUATE' && sg.action_ready;
+                return (
+                  <tr key={r.strategy}>
+                    <td style={{color:'var(--text)'}}>{r.strategy.replace(/_shadow$/, '')}</td>
+                    <td>{fmt(r.allocated, 0)}</td>
+                    <td>{fmt(r.current, 0)}</td>
+                    <td style={{color: pnlColor(r.realized_pnl || 0)}}>{pnlFmt(r.realized_pnl || 0, 2)}</td>
+                    <td>{r.trades || 0}</td>
+                    <td>{r.win_rate_pct == null ? '—' : r.win_rate_pct.toFixed(1) + '%'}</td>
+                    <td style={{color: sgsColor(sgsVal), fontWeight:700}}
+                        title={sg ? `components: sample=${sg.components.sample}, profit=${sg.components.profit}, risk=${sg.components.risk}, winrate=${sg.components.winrate}, drawdown=${sg.components.drawdown}, consistency=${sg.components.consistency}` : 'not scored yet'}>
+                      {sgsVal == null ? '—' : sgsVal.toFixed(1)}
+                    </td>
+                    <td>
+                      {gradReady ? (
+                        <span className="shadow-strat-status GRADUATION_READY">GRAD READY</span>
+                      ) : sg ? (
+                        <span style={{fontSize:8, color:'var(--text-dim)'}}>{sg.recommendation}</span>
+                      ) : '—'}
+                    </td>
+                    <td><span className={`shadow-strat-status ${r.status || 'ACTIVE'}`}>{r.status || 'ACTIVE'}</span></td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
       </div>
     </div>
   );
 }
 
 function App() {
-  const status = useApi('/api/status');
-  const intel = useApi('/api/intelligence');
-  const oracle = useApi('/api/oracle');
+  const [tier, setTier] = useState('PAPER');
+  const status = useApi(`/api/status?tier=${tier}`);
+  const pnl = useApi(`/api/pnl?tier=${tier}`);
   const charts = useApi('/api/charts');
+  const oracle = useApi('/api/oracle');
+  const intel = useApi('/api/intelligence');
+  const [mobileTab, setMobileTab] = useState('portfolio');
+  const [isMobile, setIsMobile] = useState(window.innerWidth < 768);
+
+  useEffect(() => {
+    const handler = () => setIsMobile(window.innerWidth < 768);
+    window.addEventListener('resize', handler);
+    return () => window.removeEventListener('resize', handler);
+  }, []);
+
+  if (isMobile) {
+    return (
+      <div style={{width:'100%', maxWidth:'100vw', overflowX:'hidden'}}>
+        <TopBar status={status} />
+        <div style={{paddingTop: 4, paddingBottom: 68, paddingLeft: 4, paddingRight: 4}}>
+          {mobileTab === 'portfolio' && (
+            <div style={{display:'flex', flexDirection:'column', gap:6}}>
+              <TierSummaryCard />
+              <TierToggle tier={tier} setTier={setTier} />
+              <TierContextBanner tier={tier} />
+              {tier === 'LIVE' ? (
+                <LiveDeploymentPanel status={status} />
+              ) : (
+                <>
+                  <PnlSummary pnl={pnl} status={status} tier={tier} />
+                  {tier === 'SHADOW' && <ShadowStrategyPanel />}
+                  <DailyStatsBar pnl={pnl} />
+                  <EquityCurve charts={charts} />
+                  <OpenPositions status={status} pnl={pnl} />
+                </>
+              )}
+            </div>
+          )}
+          {mobileTab === 'signals' && (
+            <div style={{display:'flex', flexDirection:'column', gap:6}}>
+              <StrategyHealth status={status} />
+              <OracleSignals oracle={oracle} />
+              <AlphaStrategies pnl={pnl} />
+            </div>
+          )}
+          {mobileTab === 'intel' && (
+            <div style={{display:'flex', flexDirection:'column', gap:6}}>
+              <FactorExposure />
+              <CfoAllocation />
+              <IntelFeed intel={intel} />
+            </div>
+          )}
+          {mobileTab === 'stats' && (
+            <div style={{display:'flex', flexDirection:'column', gap:6}}>
+              <DailyPnlChart pnl={pnl} />
+              <StrategyAttribution pnl={pnl} />
+              <WinRateGauge pnl={pnl} />
+              <LaunchCriteria charts={charts} />
+            </div>
+          )}
+        </div>
+        <MobileNav tab={mobileTab} setTab={setMobileTab} />
+      </div>
+    );
+  }
+
   return (
-    <div className="war-room">
+    <div>
       <TopBar status={status} />
-      <div className="charts-row" id="charts">
-        <EquityChart charts={charts} />
-        <StrategyChart charts={charts} />
-        <div style={{display:'flex',flexDirection:'column',gap:1}}>
-          <FrequencyChart charts={charts} />
-          <LaunchCriteria charts={charts} />
+      <div className="main">
+        {/* LEFT COLUMN */}
+        <div className="col">
+          <TierSummaryCard />
+          <EquityCurve charts={charts} />
+          <OpenPositions status={status} pnl={pnl} />
+        </div>
+
+        {/* CENTER COLUMN */}
+        <div className="col">
+          <TierToggle tier={tier} setTier={setTier} />
+          <TierContextBanner tier={tier} />
+          {tier === 'LIVE' ? (
+            <LiveDeploymentPanel status={status} />
+          ) : (
+            <>
+              <PnlSummary pnl={pnl} status={status} tier={tier} />
+              {tier === 'SHADOW' && <ShadowStrategyPanel />}
+              <DailyStatsBar pnl={pnl} />
+              <DailyPnlChart pnl={pnl} />
+              <StrategyHealth status={status} />
+              <StrategyAttribution pnl={pnl} />
+              <AlphaStrategies pnl={pnl} />
+              <LaunchCriteria charts={charts} />
+            </>
+          )}
+        </div>
+
+        {/* RIGHT COLUMN */}
+        <div className="col">
+          <FactorExposure />
+          <CfoAllocation />
+          <OracleSignals oracle={oracle} />
+          <IntelFeed intel={intel} />
+          <WinRateGauge pnl={pnl} />
         </div>
       </div>
-      <div className="main-panels">
-        <div id="top"><Positions status={status} /></div>
-        <div id="signals"><OracleSignals oracle={oracle} /></div>
-        <div id="intel"><IntelFeed intel={intel} /></div>
-      </div>
-      <Headlines oracle={oracle} />
-      <MobileNav />
+      <HeadlineTicker oracle={oracle} />
     </div>
   );
 }
 
 ReactDOM.createRoot(document.getElementById('root')).render(<App />);
 </script>
+<div style="text-align:center; padding:12px; font-size:10px; color:#666; border-top:1px solid #222; margin-top:20px;">
+Adjusted baseline: $18,692 (Apr 8) — excludes sizing bug + legacy prediction losses
+</div>
 </body>
 </html>
