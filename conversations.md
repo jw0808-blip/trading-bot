@@ -3730,3 +3730,8 @@ BTC: 0.014797 ($1,098.54)
 - [Crypto] ENSO $1.04 (+13.2% 24h)
 - EV: +4.0% | 188 shares @ $1.040 = $196.69
 ---
+
+## Auto-Paper Trade — 06:18 UTC
+- [Polymarket] Trump announces end of military operations against Iran by M
+- EV: +35.5% | 547 shares @ $0.355 = $195.35
+---
