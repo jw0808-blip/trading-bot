@@ -3750,3 +3750,8 @@ BTC: 0.014797 ($1,098.54)
 - [Crypto] ORCA $1.96 (+31.8% 24h)
 - EV: +9.5% | 99 shares @ $1.960 = $195.20
 ---
+
+## Auto-Paper Trade — 18:03 UTC
+- [Polymarket] US x Iran permanent peace deal by June 30, 2026?
+- EV: +36.5% | 534 shares @ $0.365 = $196.08
+---
